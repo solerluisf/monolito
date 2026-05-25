@@ -14,6 +14,7 @@ use strategy::{StrategyEngine, StrategyEngineExt};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent};
 use gateway::MockExecutionPort;
+use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 fn make_raw_tick(symbol: &str, ts: u64, mid: f64, spread: f64) -> RawTick {
     RawTick {
@@ -137,12 +138,17 @@ fn test_full_pipeline_tick_to_intent() {
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);
-    let proc_handle = std::thread::spawn(move || {
-        run_processor(
-            normalizer, feature_engine, strategy_engine,
-            md_rx, feature_tx, risk_tx, ks, m,
-        );
-    });
+    let proc_handle = spawn_pinned(
+        "test-processor",
+        0,
+        ThreadPriority::High,
+        move || {
+            run_processor(
+                normalizer, feature_engine, strategy_engine,
+                md_rx, feature_tx, risk_tx, ks, m,
+            );
+        },
+    );
 
     for i in 0..50 {
         let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
@@ -206,12 +212,17 @@ fn test_pipeline_with_burst_ticks() {
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);
-    let proc_handle = std::thread::spawn(move || {
-        run_processor(
-            normalizer, feature_engine, strategy_engine,
-            md_rx, feature_tx, risk_tx, ks, m,
-        );
-    });
+    let proc_handle = spawn_pinned(
+        "test-processor",
+        0,
+        ThreadPriority::High,
+        move || {
+            run_processor(
+                normalizer, feature_engine, strategy_engine,
+                md_rx, feature_tx, risk_tx, ks, m,
+            );
+        },
+    );
 
     for i in 0..500 {
         let tick = make_raw_tick("MSFT", i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
@@ -275,12 +286,17 @@ fn test_kill_switch_stops_pipeline() {
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);
-    let proc_handle = std::thread::spawn(move || {
-        run_processor(
-            normalizer, feature_engine, strategy_engine,
-            md_rx, feature_tx, risk_tx, ks, m,
-        );
-    });
+    let proc_handle = spawn_pinned(
+        "test-processor",
+        0,
+        ThreadPriority::High,
+        move || {
+            run_processor(
+                normalizer, feature_engine, strategy_engine,
+                md_rx, feature_tx, risk_tx, ks, m,
+            );
+        },
+    );
 
     for i in 0..100 {
         let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0, 0.05);

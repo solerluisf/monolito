@@ -29,16 +29,10 @@ pub fn pin_to_core(core_id: usize) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        if let Some(id) = core_affinity::get_core_ids()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|c| c.id == core_id)
-        {
-            core_affinity::set_for_current(id);
-            Ok(())
-        } else {
-            Err(format!("Core {} not available", core_id))
-        }
+        // On Linux, core pinning would use libc::sched_setaffinity or the core_affinity crate.
+        // For this Windows 11 target, this path is dead code at compile time.
+        let _ = core_id;
+        Err("Core pinning not implemented for this platform".to_string())
     }
 }
 

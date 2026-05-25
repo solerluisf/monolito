@@ -22,21 +22,79 @@ pub enum LargePageResult {
 /// This is required to use MEM_LARGE_PAGES.
 #[cfg(windows)]
 pub fn enable_large_pages() -> LargePageResult {
-    // Windows implementation requires SeLockMemoryPrivilege
-    // For production use, this should be enabled via Group Policy or run as Administrator
-    // 
-    // NOTE: Full implementation requires additional Windows crate features:
-    // - Win32_Security
-    // - Win32_System_Memory  
-    // - Win32_System_Threading
-    //
-    // The full implementation would call:
-    // - OpenProcessToken
-    // - LookupPrivilegeValueW
-    // - AdjustTokenPrivileges
-    //
-    // For now, return NotSupported to avoid complex feature dependencies
-    LargePageResult::NotSupported
+    use windows::Win32::Foundation::{GetLastError, CloseHandle};
+    use windows::core::PCWSTR;
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, TOKEN_ADJUST_PRIVILEGES,
+        LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_PRIVILEGES,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let process = GetCurrentProcess();
+        let mut token = std::mem::zeroed();
+        let open_result = OpenProcessToken(
+            process,
+            TOKEN_ADJUST_PRIVILEGES,
+            &mut token,
+        );
+        if open_result.is_err() {
+            return LargePageResult::Error(format!(
+                "OpenProcessToken failed: {:?}",
+                GetLastError()
+            ));
+        }
+
+        let privilege: Vec<u16> = "SeLockMemoryPrivilege\0".encode_utf16().collect();
+        let mut luid = std::mem::zeroed();
+        let lookup_result = LookupPrivilegeValueW(
+            None,
+            PCWSTR(privilege.as_ptr()),
+            &mut luid,
+        );
+        if lookup_result.is_err() {
+            let _ = CloseHandle(token);
+            return LargePageResult::PrivilegeNotHeld;
+        }
+
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        let adjust_result = AdjustTokenPrivileges(
+            token,
+            false,
+            Some(&tp),
+            0,
+            None,
+            None,
+        );
+        if adjust_result.is_err() {
+            let err = GetLastError();
+            let _ = CloseHandle(token);
+            if err.0 == windows::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED.0 {
+                return LargePageResult::PrivilegeNotHeld;
+            }
+            return LargePageResult::Error(format!(
+                "AdjustTokenPrivileges failed: {:?}",
+                err
+            ));
+        }
+
+        // Verify that the privilege was actually assigned
+        let last_err = GetLastError();
+        if last_err.0 == windows::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED.0 {
+            let _ = CloseHandle(token);
+            return LargePageResult::PrivilegeNotHeld;
+        }
+
+        let _ = CloseHandle(token);
+        LargePageResult::Enabled
+    }
 }
 
 #[cfg(not(windows))]
@@ -48,9 +106,30 @@ pub fn enable_large_pages() -> LargePageResult {
 /// Falls back to regular allocation if large pages are not available.
 #[cfg(windows)]
 pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, String> {
-    // NOTE: Full implementation would use VirtualAlloc with MEM_LARGE_PAGES
-    // For now, use standard allocation
-    allocate_standard(size)
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::Memory::{
+        VirtualAlloc, MEM_COMMIT, MEM_LARGE_PAGES, MEM_RESERVE, PAGE_READWRITE,
+    };
+
+    unsafe {
+        let ptr = VirtualAlloc(
+            None,
+            size,
+            MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+            PAGE_READWRITE,
+        );
+        if ptr.is_null() {
+            // If MEM_LARGE_PAGES fails (e.g. privilege not held), fall back to standard allocation
+            let err = GetLastError();
+            tracing::warn!(
+                "VirtualAlloc with MEM_LARGE_PAGES failed ({:?}), falling back to standard pages",
+                err
+            );
+            allocate_standard(size)
+        } else {
+            Ok(ptr)
+        }
+    }
 }
 
 #[cfg(not(windows))]

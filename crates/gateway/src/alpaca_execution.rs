@@ -97,35 +97,35 @@ pub trait IExecutionPort: Send + Sync {
 }
 
 #[derive(Debug, Serialize)]
-struct AlpacaOrderRequest {
-    symbol: String,
-    qty: f64,
-    side: String,
-    r#type: String,
-    time_in_force: String,
+pub(crate) struct AlpacaOrderRequest {
+    pub(crate) symbol: String,
+    pub(crate) qty: f64,
+    pub(crate) side: String,
+    pub(crate) r#type: String,
+    pub(crate) time_in_force: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    limit_price: Option<f64>,
+    pub(crate) limit_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    stop_price: Option<f64>,
+    pub(crate) stop_price: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AlpacaOrderResponse {
-    id: String,
-    symbol: String,
-    side: String,
-    qty: String,
-    filled_qty: String,
-    r#type: String,
-    status: String,
+pub(crate) struct AlpacaOrderResponse {
+    pub(crate) id: String,
+    pub(crate) symbol: String,
+    pub(crate) side: String,
+    pub(crate) qty: String,
+    pub(crate) filled_qty: String,
+    pub(crate) r#type: String,
+    pub(crate) status: String,
     #[serde(default)]
-    filled_avg_price: Option<String>,
+    pub(crate) filled_avg_price: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct AlpacaCancelResponse {
-    id: String,
-    status: String,
+pub(crate) struct AlpacaCancelResponse {
+    pub(crate) id: String,
+    pub(crate) status: String,
 }
 
 pub struct AlpacaExecutionPort {
