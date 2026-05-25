@@ -1,0 +1,66 @@
+max_assets = 2
+
+[[asset_configs]]
+symbol = "AAPL"
+enabled = true
+max_position = 100.0
+tick_size = 0.01
+
+[[asset_configs]]
+symbol = "MSFT"
+enabled = true
+max_position = 100.0
+tick_size = 0.01
+
+[risk_config]
+max_portfolio_exposure = 1000000.0
+max_leverage = 4.0
+max_drawdown_pct = 5.0
+max_order_rate_per_sec = 10
+max_position_per_symbol = 50000.0
+max_volatility = 0.05
+max_spread_bps = 50.0
+max_slippage_bps = 10.0
+allow_short = true
+kill_switch_on_drawdown = true
+
+[strategy_config]
+long_entry_threshold = 0.6
+short_entry_threshold = -0.6
+exit_threshold = 0.1
+confidence_minimum = 0.5
+hysteresis_deadband = 0.15
+entry_cooldown_ms = 5000
+exit_cooldown_ms = 2000
+prediction_staleness_ns = 150000000
+
+[broker_config]
+broker_type = "alpaca"
+api_key = ""
+api_secret = ""
+paper_trading = true
+ws_url = "wss://stream.data.alpaca.markets/v2/iex"
+rest_url = "https://paper-api.alpaca.markets"
+max_retries = 3
+retry_backoff_ms = 1000
+
+[feature_config]
+rsi_period = 14
+macd_fast = 12
+macd_slow = 26
+macd_signal = 9
+atr_period = 14
+ema_periods = [9, 21, 50]
+rolling_window_sizes = [5, 20]
+
+[model_config]
+model_dir = "models"
+inference_threads = 1
+max_inference_latency_ms = 5
+feature_vector_size = 128
+
+[journal_config]
+journal_dir = "journal"
+flush_interval_ms = 100
+snapshot_interval_sec = 60
+max_file_size_mb = 100

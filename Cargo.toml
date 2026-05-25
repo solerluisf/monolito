@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/gateway",
+    "crates/market-data",
+    "crates/feature",
+    "crates/model",
+    "crates/strategy",
+    "crates/risk",
+    "crates/execution",
+    "crates/engine",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Trading System"]
+
+[workspace.dependencies]
+arc-swap = "1"
+crossbeam-channel = "0.5"
+mimalloc = { version = "0.1", default-features = false }
+notify = "6"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ort = "2"
+ndarray = "0.15"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+url = "2"
+windows = { version = "0.58", features = ["Win32_System_Threading"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true

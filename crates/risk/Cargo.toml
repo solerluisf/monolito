@@ -1,0 +1,12 @@
+[package]
+name = "risk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }

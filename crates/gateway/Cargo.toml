@@ -1,0 +1,17 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+market-data = { path = "../market-data" }
+crossbeam-channel = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "feature"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+market-data = { path = "../market-data" }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+ndarray = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+feature = { path = "../feature" }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }

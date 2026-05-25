@@ -1,0 +1,23 @@
+[package]
+name = "unified-trading-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+notify = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+tower = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

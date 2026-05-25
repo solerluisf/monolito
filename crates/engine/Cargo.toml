@@ -1,0 +1,28 @@
+[package]
+name = "unified-trading-engine"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "unified-trading-engine"
+path = "src/main.rs"
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+market-data = { path = "../market-data" }
+feature = { path = "../feature" }
+model = { path = "../model" }
+strategy = { path = "../strategy" }
+risk = { path = "../risk" }
+execution = { path = "../execution" }
+gateway = { path = "../gateway" }
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+mimalloc = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+toml = { workspace = true }
+parking_lot = { workspace = true }

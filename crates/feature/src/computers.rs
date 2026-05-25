@@ -1,0 +1,272 @@
+use crate::feature_engine::{FeatureVector, FeatureSnapshot, RegimeLabel};
+use crate::window_manager::WindowManager;
+use market_data::NormalizedTick;
+
+pub struct PriceComputer;
+pub struct MicrostructureComputer;
+pub struct MomentumComputer;
+pub struct VolatilityComputer;
+pub struct VolumeComputer;
+pub struct RegimeComputer;
+
+impl PriceComputer {
+    pub fn compute(wm: &WindowManager, tick: &NormalizedTick) -> (f32, f32, f32) {
+        let mid = tick.mid_price as f32;
+        let spread_bps = tick.spread_bps as f32;
+        let spread_abs = tick.spread as f32;
+        (mid, spread_bps, spread_abs)
+    }
+}
+
+impl MomentumComputer {
+    pub fn compute(wm: &mut WindowManager) -> (f32, f32, f32, f32) {
+        let rsi = wm.rsi_14.update(wm.last_mid_price) as f32;
+        let ema_9 = wm.ema_9.value as f32;
+        let ema_21 = wm.ema_21.value as f32;
+
+        let macd_line = ema_9 - ema_21;
+        let macd_signal = macd_line * 0.8;
+        let macd_histogram = macd_line - macd_signal;
+
+        (rsi, macd_line, macd_signal, macd_histogram)
+    }
+}
+
+impl VolatilityComputer {
+    pub fn compute(wm: &mut WindowManager) -> (f32, f32) {
+        let atr = wm.atr_14.update(
+            wm.last_mid_price + wm.spread_window.last().unwrap_or(&0.01) / 2.0,
+            wm.last_mid_price - wm.spread_window.last().unwrap_or(&0.01) / 2.0,
+            wm.last_mid_price,
+        ) as f32;
+        let std_dev = wm.price_window.std_dev() as f32;
+        (atr, std_dev)
+    }
+}
+
+impl VolumeComputer {
+    pub fn compute(wm: &WindowManager, tick: &NormalizedTick) -> f32 {
+        let avg_volume = wm.volume_window.mean();
+        if avg_volume > 0.0 {
+            (tick.volume as f64 / avg_volume) as f32
+        } else {
+            1.0
+        }
+    }
+}
+
+impl RegimeComputer {
+    pub fn compute(wm: &WindowManager, atr: f32, std_dev: f32, macd_histogram: f32) -> (RegimeLabel, f32) {
+        let atr_ratio = if wm.last_mid_price > 0.0 {
+            atr as f64 / wm.last_mid_price
+        } else {
+            0.0
+        };
+
+        let trend_strength = macd_histogram.abs();
+
+        if atr_ratio > 0.02 {
+            (RegimeLabel::Volatile, (atr_ratio / 0.05).min(1.0) as f32)
+        } else if trend_strength > 0.5 {
+            (RegimeLabel::Trending, trend_strength.min(1.0))
+        } else {
+            (RegimeLabel::Ranging, (1.0 - trend_strength).min(1.0))
+        }
+    }
+}
+
+impl MicrostructureComputer {
+    pub fn compute_order_flow_imbalance(tick: &NormalizedTick) -> f32 {
+        let total = tick.bid_size + tick.ask_size;
+        if total == 0 {
+            0.0
+        } else {
+            ((tick.bid_size as f64 - tick.ask_size as f64) / total as f64) as f32
+        }
+    }
+}
+
+pub struct FeatureEngine {
+    pub symbol: String,
+    pub window_manager: WindowManager,
+    pub feature_capacity: usize,
+}
+
+impl FeatureEngine {
+    pub fn new(
+        symbol: &str,
+        rsi_period: usize,
+        atr_period: usize,
+        feature_capacity: usize,
+    ) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            window_manager: WindowManager::new(symbol, rsi_period, atr_period),
+            feature_capacity,
+        }
+    }
+
+    #[tracing::instrument(skip_all, fields(symbol = %tick.symbol, ts = tick.timestamp_ns))]
+    pub fn compute(&mut self, tick: &NormalizedTick) -> FeatureVector {
+        self.window_manager.update(
+            tick.mid_price,
+            tick.volume as f64,
+            tick.spread,
+        );
+
+        let mut fv = FeatureVector::new(&self.symbol, tick.timestamp_ns, self.feature_capacity);
+
+        let (mid, spread_bps, spread_abs) = PriceComputer::compute(&self.window_manager, tick);
+        fv.push("mid_price", mid);
+        fv.push("spread_bps", spread_bps);
+        fv.push("spread_abs", spread_abs);
+
+        let (rsi, macd_line, macd_signal, macd_histogram) =
+            MomentumComputer::compute(&mut self.window_manager);
+        fv.push("rsi_14", rsi);
+        fv.push("macd_line", macd_line);
+        fv.push("macd_signal", macd_signal);
+        fv.push("macd_histogram", macd_histogram);
+
+        let (atr, std_dev) = VolatilityComputer::compute(&mut self.window_manager);
+        fv.push("atr_14", atr);
+        fv.push("rolling_std", std_dev);
+
+        let volume_ratio = VolumeComputer::compute(&self.window_manager, tick);
+        fv.push("volume_ratio", volume_ratio);
+
+        let ofi = MicrostructureComputer::compute_order_flow_imbalance(tick);
+        fv.push("order_flow_imbalance", ofi);
+
+        let (regime, regime_strength) = RegimeComputer::compute(
+            &self.window_manager,
+            atr,
+            std_dev,
+            macd_histogram,
+        );
+        fv.push("regime", regime as i32 as f32);
+        fv.push("regime_strength", regime_strength);
+
+        fv.push("ema_9", self.window_manager.ema_9.value as f32);
+        fv.push("ema_21", self.window_manager.ema_21.value as f32);
+        fv.push("ema_50", self.window_manager.ema_50.value as f32);
+
+        fv
+    }
+
+    pub fn compute_snapshot(&mut self, tick: &NormalizedTick) -> FeatureSnapshot {
+        let fv = self.compute(tick);
+
+        FeatureSnapshot {
+            symbol: self.symbol.clone(),
+            timestamp_ns: tick.timestamp_ns,
+            mid_price: fv.get("mid_price").unwrap_or(0.0),
+            spread_bps: fv.get("spread_bps").unwrap_or(0.0),
+            rsi_14: fv.get("rsi_14").unwrap_or(50.0),
+            macd_line: fv.get("macd_line").unwrap_or(0.0),
+            macd_signal: fv.get("macd_signal").unwrap_or(0.0),
+            macd_histogram: fv.get("macd_histogram").unwrap_or(0.0),
+            atr_14: fv.get("atr_14").unwrap_or(0.0),
+            ema_9: fv.get("ema_9").unwrap_or(0.0),
+            ema_21: fv.get("ema_21").unwrap_or(0.0),
+            ema_50: fv.get("ema_50").unwrap_or(0.0),
+            volume_ratio: fv.get("volume_ratio").unwrap_or(1.0),
+            order_flow_imbalance: fv.get("order_flow_imbalance").unwrap_or(0.0),
+            regime: match fv.get("regime").unwrap_or(0.0) as i32 {
+                0 => RegimeLabel::Ranging,
+                1 => RegimeLabel::Trending,
+                _ => RegimeLabel::Volatile,
+            },
+            regime_strength: fv.get("regime_strength").unwrap_or(0.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use market_data::NormalizedTick;
+
+    fn make_tick(symbol: &str, ts: u64, mid: f64, spread: f64) -> NormalizedTick {
+        NormalizedTick {
+            symbol: symbol.to_string(),
+            timestamp_ns: ts,
+            mid_price: mid,
+            spread,
+            spread_bps: (spread / mid) * 10_000.0,
+            bid: mid - spread / 2.0,
+            ask: mid + spread / 2.0,
+            bid_size: 100,
+            ask_size: 200,
+            volume: 50,
+        }
+    }
+
+    #[test]
+    fn test_feature_engine_compute() {
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 20);
+        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let fv = engine.compute(&tick);
+        assert!(fv.len() > 10);
+        assert!(fv.get("mid_price").is_some());
+        assert!(fv.get("rsi_14").is_some());
+    }
+
+    #[test]
+    fn test_feature_engine_snapshot() {
+        let mut engine = FeatureEngine::new("MSFT", 14, 14, 20);
+        let tick = make_tick("MSFT", 2000, 400.0, 0.04);
+        let snap = engine.compute_snapshot(&tick);
+        assert_eq!(snap.symbol, "MSFT");
+        assert!((snap.mid_price - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_feature_engine_multiple_ticks() {
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 20);
+        for i in 0..20 {
+            let tick = make_tick("AAPL", i * 1000, 150.0 + (i as f64 * 0.01), 0.05);
+            engine.compute(&tick);
+        }
+        let tick = make_tick("AAPL", 20000, 150.2, 0.05);
+        let fv = engine.compute(&tick);
+        assert!(fv.get("ema_9").is_some());
+        assert!(fv.get("atr_14").is_some());
+    }
+
+    #[test]
+    fn test_price_computer() {
+        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let wm = WindowManager::new("AAPL", 14, 14);
+        let (mid, spread_bps, spread_abs) = PriceComputer::compute(&wm, &tick);
+        assert!((mid - 150.0).abs() < 0.001);
+        assert!((spread_bps - 3.33).abs() < 0.1);
+        assert!((spread_abs - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_volume_computer() {
+        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let mut wm = WindowManager::new("AAPL", 14, 14);
+        wm.volume_window.push(1000.0);
+        let ratio = VolumeComputer::compute(&wm, &tick);
+        assert!((ratio - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_regime_computer_volatile() {
+        let mut wm = WindowManager::new("AAPL", 14, 14);
+        wm.last_mid_price = 100.0;
+        let (regime, strength) = RegimeComputer::compute(&wm, 3.0, 1.0, 0.1);
+        assert!(matches!(regime, RegimeLabel::Volatile));
+        assert!(strength > 0.0);
+    }
+
+    #[test]
+    fn test_regime_computer_ranging() {
+        let mut wm = WindowManager::new("AAPL", 14, 14);
+        wm.last_mid_price = 100.0;
+        let (regime, strength) = RegimeComputer::compute(&wm, 0.001, 0.001, 0.01);
+        assert!(matches!(regime, RegimeLabel::Ranging));
+    }
+}

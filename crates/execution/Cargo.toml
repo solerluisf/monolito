@@ -1,0 +1,14 @@
+[package]
+name = "execution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unified-trading-core = { path = "../core" }
+risk = { path = "../risk" }
+gateway = { path = "../gateway" }
+crossbeam-channel = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
