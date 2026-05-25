@@ -96,10 +96,11 @@ impl RateLimiter {
     }
 
     pub fn set_symbol_rate(&mut self, symbol: &str, rate: f64) {
-        if let Some(bucket) = self.per_symbol.get_mut(symbol) {
-            bucket.max_tokens = rate;
-            bucket.refill_rate = rate;
-        }
+        let bucket = self.per_symbol
+            .entry(symbol.to_string())
+            .or_insert_with(|| TokenBucket::new(rate, rate));
+        bucket.max_tokens = rate;
+        bucket.refill_rate = rate;
     }
 
     pub fn get_back_pressure_status(&self, symbol: &str, threshold_percent: f64) -> Option<(f64, f64, bool)> {

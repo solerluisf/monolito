@@ -381,6 +381,7 @@ mod tests {
         assert!(manager.circuit_breaker.is_open.load(Ordering::Relaxed));
 
         dec_tx.send(make_approved_decision()).unwrap();
+        drop(dec_tx); // drop sender so recv_timeout gets Disconnected and loop exits
         manager.run_loop();
 
         assert!(metrics.circuit_breaker_trips.load(Ordering::Relaxed) > 0);
