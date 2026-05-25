@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use feature::FeatureVector;
+use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 #[derive(Debug, Clone)]
 pub struct Prediction {
@@ -96,7 +97,7 @@ impl PredictionEngine {
         }
     }
 
-    pub fn start<F>(&self, infer_fn: F) -> std::thread::JoinHandle<()>
+    pub fn start<F>(&self, infer_fn: F, core_id: usize) -> std::thread::JoinHandle<()>
     where
         F: FnMut(&FeatureVector) -> Prediction + Send + 'static,
     {
@@ -107,9 +108,14 @@ impl PredictionEngine {
             running: Arc::clone(&self.running),
         };
 
-        std::thread::spawn(move || {
-            engine.run_loop(infer_fn);
-        })
+        spawn_pinned(
+            &format!("prediction-{}", self.symbol),
+            core_id,
+            ThreadPriority::BelowNormal,
+            move || {
+                engine.run_loop(infer_fn);
+            },
+        )
     }
 
     pub fn stop(&self) {
@@ -191,7 +197,7 @@ mod tests {
                     .unwrap_or_default()
                     .as_nanos() as u64,
             }
-        });
+        }, 0);
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         engine.stop();

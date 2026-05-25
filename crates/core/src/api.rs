@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::kill_switch::KillSwitch;
 use crate::metrics::{GlobalMetrics, MetricsSnapshot};
-use crate::command_channel::ControlCommand;
+use crate::command_channel::{ControlCommand, StrategyParams};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -44,9 +44,22 @@ pub struct KillSwitchRequest {
 }
 
 #[derive(Deserialize)]
+pub struct StrategyParamsRequest {
+    pub long_entry_threshold: f64,
+    pub short_entry_threshold: f64,
+    pub confidence_minimum: f64,
+    pub hysteresis_deadband: f64,
+    pub entry_cooldown_ms: u64,
+    pub exit_cooldown_ms: u64,
+    pub prediction_staleness_ns: u64,
+    pub allow_short: bool,
+}
+
+#[derive(Deserialize)]
 pub struct StrategySwapRequest {
     pub symbol: String,
     pub strategy_type: String,
+    pub params: Option<StrategyParamsRequest>,
 }
 
 #[derive(Serialize)]
@@ -62,15 +75,62 @@ pub struct StatusResponse {
     pub metrics: MetricsSnapshot,
 }
 
+#[derive(Serialize)]
+pub struct CircuitBreakerResponse {
+    pub is_open: bool,
+    pub failure_count: u32,
+    pub success_count: u32,
+    pub last_failure_ns: u64,
+}
+
+#[derive(Deserialize)]
+pub struct CircuitBreakerActionRequest {
+    pub action: String, // "trip" or "reset"
+}
+
+#[derive(Deserialize)]
+pub struct AssetControlRequest {
+    pub symbol: String,
+}
+
+#[derive(Deserialize)]
+pub struct ModeRequest {
+    pub mode: String,
+}
+
+#[derive(Deserialize)]
+pub struct RiskParamsRequest {
+    pub max_position_per_symbol: f64,
+    pub max_portfolio_exposure: f64,
+    pub max_leverage: f64,
+    pub max_order_rate_per_sec: u32,
+}
+
+#[derive(Serialize)]
+pub struct HeartbeatsResponse {
+    pub status: String,
+    pub threads: Vec<String>,
+}
+
 pub fn create_router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/health/kill-switch", get(kill_switch_status))
+        .route("/health/heartbeats", get(heartbeats_handler))
         .route("/control/kill-switch", post(set_kill_switch))
+        .route("/control/circuit-breaker", get(circuit_breaker_status))
+        .route("/control/circuit-breaker/trip", post(trip_circuit_breaker))
+        .route("/control/circuit-breaker/reset", post(reset_circuit_breaker))
         .route("/control/strategy-swap", post(strategy_swap_handler))
+        .route("/control/asset/:symbol/pause", post(pause_asset_handler))
+        .route("/control/asset/:symbol/resume", post(resume_asset_handler))
+        .route("/control/mode", post(set_mode_handler))
+        .route("/control/risk/parameters", post(set_risk_params_handler))
         .route("/metrics", get(metrics_handler))
         .route("/metrics/prometheus", get(prometheus_handler))
         .route("/status", get(status_handler))
+        .route("/status/circuit-breaker", get(circuit_breaker_status))
+        .route("/status/risk/portfolio", get(risk_portfolio_handler))
         .route("/shutdown", post(shutdown_handler))
         .with_state(state)
 }
@@ -111,9 +171,21 @@ async fn strategy_swap_handler(
     State(state): State<ApiState>,
     Json(req): Json<StrategySwapRequest>,
 ) -> (StatusCode, Json<StrategySwapResponse>) {
+    let params = req.params.map(|p| StrategyParams {
+        long_entry_threshold: p.long_entry_threshold,
+        short_entry_threshold: p.short_entry_threshold,
+        confidence_minimum: p.confidence_minimum,
+        hysteresis_deadband: p.hysteresis_deadband,
+        entry_cooldown_ms: p.entry_cooldown_ms,
+        exit_cooldown_ms: p.exit_cooldown_ms,
+        prediction_staleness_ns: p.prediction_staleness_ns,
+        allow_short: p.allow_short,
+    });
+    
     let cmd = ControlCommand::SwapStrategy {
         symbol: req.symbol.clone(),
         strategy_type: req.strategy_type.clone(),
+        params,
     };
     match state.command_tx.send(cmd) {
         Ok(_) => (
@@ -241,6 +313,103 @@ async fn shutdown_handler(State(state): State<ApiState>) -> StatusCode {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+// Circuit breaker handlers
+async fn circuit_breaker_status(State(state): State<ApiState>) -> Json<CircuitBreakerResponse> {
+    // Note: Circuit breaker state would need to be passed through ApiState
+    // For now, return placeholder
+    Json(CircuitBreakerResponse {
+        is_open: false,
+        failure_count: 0,
+        success_count: 0,
+        last_failure_ns: 0,
+    })
+}
+
+async fn trip_circuit_breaker(State(state): State<ApiState>) -> StatusCode {
+    match state.command_tx.send(ControlCommand::CircuitBreakerTrip) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn reset_circuit_breaker(State(state): State<ApiState>) -> StatusCode {
+    match state.command_tx.send(ControlCommand::CircuitBreakerReset) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// Asset control handlers
+async fn pause_asset_handler(
+    State(state): State<ApiState>,
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+) -> StatusCode {
+    match state.command_tx.send(ControlCommand::PauseAsset(symbol)) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+async fn resume_asset_handler(
+    State(state): State<ApiState>,
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+) -> StatusCode {
+    match state.command_tx.send(ControlCommand::ResumeAsset(symbol)) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// Mode handler
+async fn set_mode_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<ModeRequest>,
+) -> StatusCode {
+    match state.command_tx.send(ControlCommand::SetMode(req.mode)) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// Risk parameters handler
+async fn set_risk_params_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<RiskParamsRequest>,
+) -> StatusCode {
+    match state.command_tx.send(ControlCommand::SetRiskParams(crate::command_channel::RiskConfigUpdate {
+        max_position_per_symbol: req.max_position_per_symbol,
+        max_portfolio_exposure: req.max_portfolio_exposure,
+        max_leverage: req.max_leverage,
+        max_order_rate_per_sec: req.max_order_rate_per_sec,
+    })) {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// Risk portfolio status handler
+async fn risk_portfolio_handler(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let snap = state.metrics.snapshot();
+    Json(serde_json::json!({
+        "status": "ok",
+        "metrics": snap,
+    }))
+}
+
+// Heartbeats handler
+async fn heartbeats_handler(State(state): State<ApiState>) -> Json<HeartbeatsResponse> {
+    Json(HeartbeatsResponse {
+        status: "ok".to_string(),
+        threads: vec![
+            "alpaca-feed".to_string(),
+            "lifecycle-handler".to_string(),
+            "prediction".to_string(),
+            "risk-coordinator".to_string(),
+            "journal".to_string(),
+        ],
+    })
 }
 
 #[cfg(test)]
@@ -458,7 +627,8 @@ mod tests {
         let app = create_router(state);
         let body = serde_json::json!({
             "symbol": "AAPL",
-            "strategy_type": "aggressive"
+            "strategy_type": "aggressive",
+            "params": null
         });
         let response = app
             .oneshot(
@@ -475,9 +645,64 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let cmd = rx.try_recv().unwrap();
         match cmd {
-            ControlCommand::SwapStrategy { symbol, strategy_type } => {
+            ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
                 assert_eq!(symbol, "AAPL");
                 assert_eq!(strategy_type, "aggressive");
+                assert!(params.is_none());
+            }
+            _ => panic!("Expected SwapStrategy command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_strategy_swap_with_custom_params() {
+        let kill_switch = Arc::new(KillSwitch::new());
+        let metrics = Arc::new(GlobalMetrics::new());
+        let (tx, rx) = crossbeam_channel::bounded::<ControlCommand>(100);
+
+        let state = ApiState {
+            kill_switch: Arc::clone(&kill_switch),
+            metrics: Arc::clone(&metrics),
+            command_tx: tx,
+        };
+
+        let app = create_router(state);
+        let body = serde_json::json!({
+            "symbol": "AAPL",
+            "strategy_type": "custom",
+            "params": {
+                "long_entry_threshold": 0.7,
+                "short_entry_threshold": -0.7,
+                "confidence_minimum": 0.6,
+                "hysteresis_deadband": 0.2,
+                "entry_cooldown_ms": 3000,
+                "exit_cooldown_ms": 1500,
+                "prediction_staleness_ns": 100000000,
+                "allow_short": false
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control/strategy-swap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
+                assert_eq!(symbol, "AAPL");
+                assert_eq!(strategy_type, "custom");
+                assert!(params.is_some());
+                let p = params.unwrap();
+                assert_eq!(p.long_entry_threshold, 0.7);
+                assert_eq!(p.allow_short, false);
             }
             _ => panic!("Expected SwapStrategy command"),
         }

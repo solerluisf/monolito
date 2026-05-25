@@ -2,13 +2,41 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use std::thread;
 
 #[derive(Debug, Clone)]
+pub struct StrategyParams {
+    pub long_entry_threshold: f64,
+    pub short_entry_threshold: f64,
+    pub confidence_minimum: f64,
+    pub hysteresis_deadband: f64,
+    pub entry_cooldown_ms: u64,
+    pub exit_cooldown_ms: u64,
+    pub prediction_staleness_ns: u64,
+    pub allow_short: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskConfigUpdate {
+    pub max_position_per_symbol: f64,
+    pub max_portfolio_exposure: f64,
+    pub max_leverage: f64,
+    pub max_order_rate_per_sec: u32,
+}
+
+#[derive(Debug, Clone)]
 pub enum ControlCommand {
     SetKillSwitch(bool),
     UpdateConfig(String),
     PauseAsset(String),
     ResumeAsset(String),
     SetMode(String),
-    SwapStrategy { symbol: String, strategy_type: String },
+    SwapStrategy { 
+        symbol: String, 
+        strategy_type: String,
+        params: Option<StrategyParams>, // If None, use default params for the strategy type
+    },
+    CircuitBreakerTrip,
+    CircuitBreakerReset,
+    SetRiskParams(RiskConfigUpdate),
+    ModelSwap(String),
     GetStatus,
     Shutdown,
 }

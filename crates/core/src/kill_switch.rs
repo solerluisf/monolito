@@ -7,6 +7,7 @@ pub struct KillSwitch {
     activated_at_ns: AtomicU64,
     activation_count: AtomicU64,
     open_orders: Arc<Mutex<HashSet<String>>>,
+    activation_latency_ns: AtomicU64,  // Time from activate() call to store completion
 }
 
 impl KillSwitch {
@@ -16,10 +17,15 @@ impl KillSwitch {
             activated_at_ns: AtomicU64::new(0),
             activation_count: AtomicU64::new(0),
             open_orders: Arc::new(Mutex::new(HashSet::new())),
+            activation_latency_ns: AtomicU64::new(0),
         }
     }
 
+    /// Activates the kill switch and returns the number of open orders.
+    /// Measures the time taken for the atomic store operation.
     pub fn activate(&self) -> usize {
+        let start = std::time::Instant::now();
+        
         let order_count = {
             let orders = self.open_orders.lock().unwrap();
             orders.len()
@@ -34,6 +40,10 @@ impl KillSwitch {
             self.activation_count.fetch_add(1, Ordering::Relaxed);
         }
         self.active.store(true, Ordering::SeqCst);
+        
+        // Measure activation latency
+        let latency = start.elapsed().as_nanos() as u64;
+        self.activation_latency_ns.store(latency, Ordering::Relaxed);
 
         if order_count > 0 {
             tracing::error!("KILL SWITCH ACTIVATED - {} open orders tracked for cancellation", order_count);
@@ -45,6 +55,10 @@ impl KillSwitch {
     pub fn clear(&self) {
         self.active.store(false, Ordering::SeqCst);
         tracing::info!("Kill switch deactivated - new orders will be accepted");
+    }
+
+    pub fn activation_latency_ns(&self) -> u64 {
+        self.activation_latency_ns.load(Ordering::Relaxed)
     }
 
     pub fn is_active(&self) -> bool {

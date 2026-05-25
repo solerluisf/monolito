@@ -123,7 +123,7 @@ impl ExecutionManager {
         let cmd = OrderCommand {
             order_id: order_id.clone(),
             symbol: symbol.clone(),
-            side,
+            side: side.clone(),
             quantity: 1.0,
             order_type: OrderType::Market,
             limit_price: None,
@@ -131,6 +131,27 @@ impl ExecutionManager {
             time_in_force: TimeInForce::Day,
             correlation_id: decision.request_id.clone(),
         };
+
+        // Persist to journal BEFORE submitting to broker for critical commands
+        // This ensures we can replay/recover if needed
+        if let Some(ref journal) = self.journal {
+            let entry = JournalEntry::Order {
+                symbol: symbol.clone(),
+                timestamp_ns: now,
+                data: format!("order_id={},side={:?},qty=1.0,decision={}", order_id, side, decision.request_id),
+            };
+            
+            // Write to journal first
+            if let Err(e) = journal.write(entry) {
+                tracing::error!("Failed to write to journal: {}", e);
+                // Continue anyway - journal failure shouldn't block trading
+            } else {
+                // Sync flush for critical orders to ensure durability
+                if let Err(e) = journal.flush_sync() {
+                    tracing::error!("Failed to flush journal: {}", e);
+                }
+            }
+        }
 
         match self.execution_port.submit_order(&cmd) {
             Ok(execution_id) => {
@@ -149,14 +170,6 @@ impl ExecutionManager {
 
                 tracing::info!(order_id = %execution_id, symbol = %symbol, "Order submitted to broker");
 
-                if let Some(ref journal) = self.journal {
-                    let _ = journal.write(JournalEntry::Order {
-                        symbol,
-                        timestamp_ns: now,
-                        data: format!("execution_id={},decision={}", execution_id, decision.request_id),
-                    });
-                }
-
                 self.idempotency_store.mark_processed(idempotency_key, execution_id);
                 self.circuit_breaker.record_success();
             }
@@ -164,6 +177,15 @@ impl ExecutionManager {
                 self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
                 self.circuit_breaker.record_failure();
                 tracing::warn!(symbol = %symbol, error = %e, "Order submission failed");
+                
+                // Write failure to journal
+                if let Some(ref journal) = self.journal {
+                    let _ = journal.write(JournalEntry::Event {
+                        event_type: "ORDER_FAILED".to_string(),
+                        timestamp_ns: now,
+                        data: format!("symbol={},error={}", symbol, e),
+                    });
+                }
             }
         }
     }

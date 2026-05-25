@@ -1,5 +1,50 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Histogram buckets for latency measurements (in nanoseconds)
+/// Buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms
+pub const LATENCY_BUCKETS: [u64; 6] = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, u64::MAX];
+
+pub struct LatencyHistogram {
+    pub buckets: [AtomicU64; 6],
+}
+
+impl LatencyHistogram {
+    pub fn new() -> Self {
+        Self {
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+
+    pub fn record(&self, latency_ns: u64) {
+        for (i, &threshold) in LATENCY_BUCKETS.iter().enumerate() {
+            if latency_ns < threshold {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // If none matched, it goes in the last bucket (>10ms)
+        self.buckets[5].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> [u64; 6] {
+        [
+            self.buckets[0].load(Ordering::Relaxed),
+            self.buckets[1].load(Ordering::Relaxed),
+            self.buckets[2].load(Ordering::Relaxed),
+            self.buckets[3].load(Ordering::Relaxed),
+            self.buckets[4].load(Ordering::Relaxed),
+            self.buckets[5].load(Ordering::Relaxed),
+        ]
+    }
+}
+
 pub struct GlobalMetrics {
     pub ticks_processed: AtomicU64,
     pub features_computed: AtomicU64,
@@ -20,6 +65,11 @@ pub struct GlobalMetrics {
     pub journal_writes: AtomicU64,
     pub heartbeat_misses: AtomicU64,
     pub errors: AtomicU64,
+    // Latency histograms
+    pub tick_to_intent_latency: LatencyHistogram,
+    pub risk_check_latency: LatencyHistogram,
+    pub journal_flush_latency: LatencyHistogram,
+    pub broker_send_latency: LatencyHistogram,
 }
 
 impl GlobalMetrics {
@@ -44,6 +94,10 @@ impl GlobalMetrics {
             journal_writes: AtomicU64::new(0),
             heartbeat_misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            tick_to_intent_latency: LatencyHistogram::new(),
+            risk_check_latency: LatencyHistogram::new(),
+            journal_flush_latency: LatencyHistogram::new(),
+            broker_send_latency: LatencyHistogram::new(),
         }
     }
 
@@ -90,6 +144,10 @@ impl GlobalMetrics {
             journal_writes: self.journal_writes.load(Ordering::Relaxed),
             heartbeat_misses: self.heartbeat_misses.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            tick_to_intent_latency: self.tick_to_intent_latency.snapshot(),
+            risk_check_latency: self.risk_check_latency.snapshot(),
+            journal_flush_latency: self.journal_flush_latency.snapshot(),
+            broker_send_latency: self.broker_send_latency.snapshot(),
         }
     }
 }
@@ -115,6 +173,11 @@ pub struct MetricsSnapshot {
     pub journal_writes: u64,
     pub heartbeat_misses: u64,
     pub errors: u64,
+    // Latency histograms (buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms)
+    pub tick_to_intent_latency: [u64; 6],
+    pub risk_check_latency: [u64; 6],
+    pub journal_flush_latency: [u64; 6],
+    pub broker_send_latency: [u64; 6],
 }
 
 impl Default for GlobalMetrics {

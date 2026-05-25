@@ -43,23 +43,29 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use model::Prediction;
+
 type StrategySwapRef = Arc<ArcSwap<Box<dyn strategy::Strategy>>>;
+type PredictionRef = Arc<ArcSwap<Prediction>>;
 
 pub struct AssetProcessor {
     pub symbol: String,
     pub normalizer: Normalizer,
     pub feature_engine: FeatureEngine,
     pub strategy: StrategySwapRef,
+    pub latest_pred: PredictionRef,
     pub signal_ctx: strategy::SignalContext,
     pub coordinator_tx: Sender<RiskCheckRequest>,
     pub feature_tx: Sender<FeatureVector>,
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
+    pub prediction_staleness_ns: u64,
 }
 
 impl AssetProcessor {
     pub fn run_loop(&mut self, md_rx: &Receiver<RawTick>) {
         let mut batch = Vec::with_capacity(32);
+        let mut current_spread_bps = 0.0;
 
         while !self.kill_switch.is_active() {
             let _count = recv_batch(md_rx, &mut batch, 32);
@@ -71,15 +77,27 @@ impl AssetProcessor {
 
                 self.signal_ctx.update_price(normalized.mid_price);
                 if normalized.mid_price > 0.0 {
-                    let spread = (normalized.ask - normalized.bid) / normalized.mid_price * 10000.0;
-                    self.signal_ctx.update_spread(spread.max(0.0));
+                    current_spread_bps = (normalized.ask - normalized.bid) / normalized.mid_price * 10000.0;
+                    self.signal_ctx.update_spread(current_spread_bps.max(0.0));
                 }
 
-                let prediction = model::Prediction::from_features(&features, &self.symbol);
+                // Read prediction from ArcSwap (set by PredictionEngine)
+                let prediction = self.latest_pred.load_full();
+                
+                // Check if prediction is stale
+                if prediction.is_stale(self.prediction_staleness_ns) {
+                    self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Fast precheck: reject obviously invalid intents
+                if self.kill_switch.is_active() {
+                    continue;
+                }
 
                 let strat = self.strategy.load_full();
                 if let Some(signal) = strat.evaluate(&prediction, &self.signal_ctx) {
-                    let request = self.build_risk_request(&signal);
+                    let request = self.build_risk_request(&signal, &prediction, current_spread_bps);
                     match self.coordinator_tx.try_send(request) {
                         Ok(()) => {
                             self.metrics.intents_generated.fetch_add(1, Ordering::Relaxed);
@@ -108,11 +126,14 @@ impl AssetProcessor {
         self.strategy.store(Arc::new(new_strategy));
     }
 
-    pub fn build_risk_request(&self, signal: &TradeIntent) -> RiskCheckRequest {
+    pub fn build_risk_request(&self, signal: &TradeIntent, prediction: &Prediction, current_spread_bps: f64) -> RiskCheckRequest {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+
+        // Calculate implied volatility from prediction confidence (simplified)
+        let current_volatility = (1.0 - prediction.confidence as f64).max(0.0);
 
         RiskCheckRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -122,6 +143,8 @@ impl AssetProcessor {
             quantity: 1.0,
             price: 150.0,
             timestamp_ns: now,
+            current_volatility,
+            current_spread_bps,
         }
     }
 }
@@ -163,29 +186,34 @@ impl UnifiedEngine {
         tracing::info!("Unified Trading Engine starting...");
 
         let config = self.config.read();
+        let threading_config = config.threading_config.clone();
+        
         let journal = JournalWriter::new(
             &config.journal_config.journal_dir,
             config.journal_config.flush_interval_ms,
             Arc::clone(&self.metrics),
+            threading_config.journal_core_id,
         );
-        drop(config);
         self.journal = Some(journal);
 
         let heartbeat_monitor = ThreadHeartbeatMonitor::new(
             Arc::clone(&self.kill_switch),
             Arc::clone(&self.metrics),
-            2_000_000_000,
-            500,
+            threading_config.heartbeat_timeout_ns,
+            threading_config.heartbeat_check_interval_ms,
         );
         self.heartbeat_monitor = Some(heartbeat_monitor);
 
-        let symbols: Vec<String> = self.config.read().asset_configs
+        let symbols: Vec<String> = config.asset_configs
             .iter()
             .filter(|c| c.enabled)
             .map(|c| c.symbol.clone())
             .collect();
+        
+        let alpaca_core_id = threading_config.alpaca_feed_core_id;
+        drop(config);
 
-        let feed_rx = self.start_alpaca_feed(&symbols);
+        let feed_rx = self.start_alpaca_feed(&symbols, alpaca_core_id);
 
         self.start_assets(feed_rx);
         self.start_config_watcher();
@@ -194,7 +222,7 @@ impl UnifiedEngine {
         tracing::info!("Unified Trading Engine running");
     }
 
-    fn start_alpaca_feed(&self, symbols: &[String]) -> Option<Receiver<RawTick>> {
+    fn start_alpaca_feed(&self, symbols: &[String], core_id: usize) -> Option<Receiver<RawTick>> {
         if symbols.is_empty() {
             return None;
         }
@@ -221,10 +249,13 @@ impl UnifiedEngine {
         let feed = AlpacaWebSocketFeed::new(feed_config, feed_tx);
 
         let ks = Arc::clone(&self.kill_switch);
+        let hb_monitor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread("alpaca-feed"));
 
-        std::thread::Builder::new()
-            .name("alpaca-feed".to_string())
-            .spawn(move || {
+        spawn_pinned(
+            "alpaca-feed",
+            core_id,
+            ThreadPriority::Normal,
+            move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -233,16 +264,19 @@ impl UnifiedEngine {
                 rt.block_on(async {
                     let handle = feed.start();
                     while !ks.is_active() {
+                        if let Some(ref hb) = hb_monitor {
+                            hb.pulse();
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                     feed.stop();
                     let _ = handle.await;
                     tracing::info!("Alpaca feed stopped");
                 });
-            })
-            .expect("Failed to spawn Alpaca feed thread");
+            },
+        );
 
-        tracing::info!("Alpaca WebSocket feed started for {:?}", symbols);
+        tracing::info!("Alpaca WebSocket feed started for {:?} on core {}", symbols, core_id);
         Some(feed_rx)
     }
 
@@ -251,7 +285,9 @@ impl UnifiedEngine {
         let position_manager = Arc::new(PositionManager::new());
         let (lifecycle_tx, lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
-        let broker = &self.config.read().broker_config;
+        let config = self.config.read();
+        let threading_config = config.threading_config.clone();
+        let broker = &config.broker_config;
         let execution_port: Arc<dyn IExecutionPort> = if !broker.api_key.is_empty() && !broker.api_secret.is_empty() {
             match AlpacaExecutionPort::new(&broker.api_key, &broker.api_secret, broker.paper_trading) {
                 Ok(port) => {
@@ -268,14 +304,21 @@ impl UnifiedEngine {
             Arc::new(MockExecutionPort)
         };
 
+        // Start lifecycle handler with heartbeat
         let pm_clone = Arc::clone(&position_manager);
         let ks = Arc::clone(&self.kill_switch);
         let metrics = Arc::clone(&self.metrics);
-        std::thread::Builder::new()
-            .name("lifecycle-handler".to_string())
-            .spawn(move || {
+        let hb_lifecycle = self.heartbeat_monitor.as_ref().map(|m| m.register_thread("lifecycle-handler"));
+        spawn_pinned(
+            "lifecycle-handler",
+            0, // Use core 0 for lifecycle handler
+            ThreadPriority::Normal,
+            move || {
                 tracing::info!("Order lifecycle handler started");
                 while !ks.is_active() {
+                    if let Some(ref hb) = hb_lifecycle {
+                        hb.pulse();
+                    }
                     match lifecycle_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(event) => {
                             tracing::info!(
@@ -291,10 +334,10 @@ impl UnifiedEngine {
                     }
                 }
                 tracing::info!("Order lifecycle handler stopped");
-            })
-            .expect("Failed to spawn lifecycle handler");
+            },
+        );
 
-        for asset_config in &self.config.read().asset_configs {
+        for asset_config in &config.asset_configs {
             if !asset_config.enabled {
                 continue;
             }
@@ -317,7 +360,6 @@ impl UnifiedEngine {
             let metrics = Arc::clone(&self.metrics);
             let pm = Arc::clone(&position_manager);
 
-            let config = self.config.read();
             let strategy = StrategyEngine::new(
                 &asset_config.symbol,
                 config.strategy_config.long_entry_threshold,
@@ -339,6 +381,10 @@ impl UnifiedEngine {
 
             let signal_ctx = strategy::SignalContext::new(&asset_config.symbol);
 
+            // Create prediction engine first to get the ArcSwap
+            let pred_engine = PredictionEngine::new(feature_rx, &asset_config.symbol);
+            let latest_pred = Arc::clone(&pred_engine.latest_pred);
+
             let processor = AssetProcessor {
                 symbol: asset_config.symbol.clone(),
                 normalizer: Normalizer::new(&asset_config.symbol),
@@ -349,19 +395,20 @@ impl UnifiedEngine {
                     20,
                 ),
                 strategy: strategy_arc,
+                latest_pred,
                 signal_ctx,
                 coordinator_tx: risk_tx,
                 feature_tx: feature_tx.clone(),
                 kill_switch: Arc::clone(&ks),
                 metrics: Arc::clone(&metrics),
+                prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
             };
 
-            let pred_engine = PredictionEngine::new(feature_rx, &asset_config.symbol);
             let inference_engine = InferenceEngine::new(config.model_config.feature_vector_size);
-
+            let pred_core_id = threading_config.prediction_core_id;
             let _pred_handle = pred_engine.start(move |features| {
                 inference_engine.predict(features)
-            });
+            }, pred_core_id);
 
             let risk_coordinator = RiskCoordinator::new(
                 risk_rx,
@@ -371,7 +418,8 @@ impl UnifiedEngine {
                 Arc::clone(&ks),
                 Arc::clone(&metrics),
             );
-            let _risk_handle = risk_coordinator.start();
+            let risk_core_id = threading_config.risk_core_id;
+            let _risk_handle = risk_coordinator.start(risk_core_id);
 
             let exec_manager = ExecutionManager::new(
                 decision_rx,
@@ -383,10 +431,11 @@ impl UnifiedEngine {
                 Arc::clone(&ks),
                 pm,
             );
-            drop(config);
             let _exec_handle = exec_manager.start();
 
+            // Start asset processor with heartbeat
             let sym = asset_config.symbol.clone();
+            let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", sym)));
             spawn_pinned(
                 &format!("asset-{}", sym),
                 core_id,
@@ -398,8 +447,12 @@ impl UnifiedEngine {
                 },
             );
 
-            tracing::info!("Started asset processor for {} on core {}", asset_config.symbol, core_id);
+            tracing::info!(
+                "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH)",
+                asset_config.symbol, core_id, pred_core_id, risk_core_id
+            );
         }
+        drop(config);
 
         if let Some(feed_rx) = feed_rx {
             let (reactor_tx, reactor_handle) = spawn_reactor(
@@ -450,24 +503,38 @@ impl UnifiedEngine {
                     kill_switch.activate();
                     ControlResponse::Ok
                 }
-                ControlCommand::SwapStrategy { symbol, strategy_type } => {
+                ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
                     let registry = strategy_registry.lock().unwrap();
                     if let Some(strategy_ref) = registry.get(&symbol) {
                         let old_name = strategy_ref.load().name().to_string();
-                        let new_strategy: Box<dyn strategy::Strategy> = match strategy_type.as_str() {
-                            "hysteresis" => {
-                                Box::new(StrategyEngine::new(&symbol, 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true))
-                            }
-                            "conservative" => {
-                                Box::new(StrategyEngine::new(&symbol, 0.8, -0.8, 0.6, 0.2, 10000, 5000, 200_000_000, false))
-                            }
-                            "aggressive" => {
-                                Box::new(StrategyEngine::new(&symbol, 0.4, -0.4, 0.3, 0.1, 2000, 1000, 100_000_000, true))
-                            }
-                            _ => {
-                                return ControlResponse::Error(format!("Unknown strategy type: {}", strategy_type));
-                            }
-                        };
+                        
+                        // Use provided params or defaults based on strategy type
+                        let (long_entry, short_entry, confidence, deadband, entry_cooldown, exit_cooldown, staleness, allow_short) = 
+                            match params {
+                                Some(p) => (
+                                    p.long_entry_threshold,
+                                    p.short_entry_threshold,
+                                    p.confidence_minimum,
+                                    p.hysteresis_deadband,
+                                    p.entry_cooldown_ms,
+                                    p.exit_cooldown_ms,
+                                    p.prediction_staleness_ns,
+                                    p.allow_short,
+                                ),
+                                None => match strategy_type.as_str() {
+                                    "hysteresis" => (0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true),
+                                    "conservative" => (0.8, -0.8, 0.6, 0.2, 10000, 5000, 200_000_000, false),
+                                    "aggressive" => (0.4, -0.4, 0.3, 0.1, 2000, 1000, 100_000_000, true),
+                                    _ => {
+                                        return ControlResponse::Error(format!("Unknown strategy type: {}", strategy_type));
+                                    }
+                                }
+                            };
+                        
+                        let new_strategy: Box<dyn strategy::Strategy> = Box::new(
+                            StrategyEngine::new(&symbol, long_entry, short_entry, confidence, deadband, 
+                                entry_cooldown, exit_cooldown, staleness, allow_short)
+                        );
                         strategy_ref.store(Arc::new(new_strategy));
                         tracing::info!(symbol = %symbol, from = %old_name, to = %strategy_type, "Strategy swapped");
                         ControlResponse::Ok

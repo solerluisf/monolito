@@ -73,6 +73,8 @@ fn run_processor(
                     quantity: 1.0,
                     price: 150.0,
                     timestamp_ns: now,
+                    current_volatility: 0.01,
+                    current_spread_bps: 10.0,
                 };
                 match risk_tx.try_send(request) {
                     Ok(()) => {
@@ -109,7 +111,7 @@ fn test_full_pipeline_tick_to_intent() {
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
-    });
+    }, 0);
 
     let risk_coordinator = RiskCoordinator::new(
         risk_rx,
@@ -119,7 +121,7 @@ fn test_full_pipeline_tick_to_intent() {
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
-    let _risk_handle = risk_coordinator.start();
+    let _risk_handle = risk_coordinator.start(0);
 
     let exec_manager = ExecutionManager::new(
         decision_rx,
@@ -178,7 +180,7 @@ fn test_pipeline_with_burst_ticks() {
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
-    });
+    }, 0);
 
     let risk_coordinator = RiskCoordinator::new(
         risk_rx,
@@ -188,7 +190,7 @@ fn test_pipeline_with_burst_ticks() {
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
-    let _risk_handle = risk_coordinator.start();
+    let _risk_handle = risk_coordinator.start(0);
 
     let exec_manager = ExecutionManager::new(
         decision_rx,
@@ -247,7 +249,7 @@ fn test_kill_switch_stops_pipeline() {
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
-    });
+    }, 0);
 
     let risk_coordinator = RiskCoordinator::new(
         risk_rx,
@@ -257,7 +259,7 @@ fn test_kill_switch_stops_pipeline() {
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
-    let _risk_handle = risk_coordinator.start();
+    let _risk_handle = risk_coordinator.start(0);
 
     let exec_manager = ExecutionManager::new(
         decision_rx,

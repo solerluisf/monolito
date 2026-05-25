@@ -12,6 +12,8 @@ pub struct RiskCheckRequest {
     pub quantity: f64,
     pub price: f64,
     pub timestamp_ns: u64,
+    pub current_volatility: f64,
+    pub current_spread_bps: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -226,11 +228,25 @@ impl RiskEngine {
         None
     }
 
-    fn check_volatility(&self, _request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_volatility(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+        if request.current_volatility > self.config.max_volatility {
+            return Some(RiskDecision::rejected(
+                &request.request_id,
+                &format!("Volatility too high: {:.4} > {:.4}", request.current_volatility, self.config.max_volatility),
+                8,
+            ));
+        }
         None
     }
 
-    fn check_spread(&self, _request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_spread(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+        if request.current_spread_bps > self.config.max_spread_bps {
+            return Some(RiskDecision::rejected(
+                &request.request_id,
+                &format!("Spread too wide: {:.2} bps > {:.2} bps", request.current_spread_bps, self.config.max_spread_bps),
+                9,
+            ));
+        }
         None
     }
 
@@ -261,6 +277,8 @@ mod tests {
             quantity,
             price,
             timestamp_ns: now,
+            current_volatility: 0.01,
+            current_spread_bps: 10.0,
         }
     }
 
@@ -330,5 +348,59 @@ mod tests {
         let request = make_request("AAPL", 100.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
+    }
+
+    #[test]
+    fn test_risk_engine_volatility_limit() {
+        let mut config = RiskConfig::default();
+        config.max_volatility = 0.02;
+        let mut engine = RiskEngine::new(config, 100_000.0);
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_volatility = 0.05; // Above threshold
+        
+        let decision = engine.check(&request, false);
+        assert!(!decision.approved);
+        assert!(decision.rejection_reason.unwrap().contains("Volatility"));
+    }
+
+    #[test]
+    fn test_risk_engine_spread_limit() {
+        let mut config = RiskConfig::default();
+        config.max_spread_bps = 20.0;
+        let mut engine = RiskEngine::new(config, 100_000.0);
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_spread_bps = 50.0; // Above threshold
+        
+        let decision = engine.check(&request, false);
+        assert!(!decision.approved);
+        assert!(decision.rejection_reason.unwrap().contains("Spread"));
+    }
+
+    #[test]
+    fn test_risk_engine_volatility_passes() {
+        let mut config = RiskConfig::default();
+        config.max_volatility = 0.05;
+        let mut engine = RiskEngine::new(config, 100_000.0);
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_volatility = 0.01; // Below threshold
+        
+        let decision = engine.check(&request, false);
+        assert!(decision.approved);
+    }
+
+    #[test]
+    fn test_risk_engine_spread_passes() {
+        let mut config = RiskConfig::default();
+        config.max_spread_bps = 50.0;
+        let mut engine = RiskEngine::new(config, 100_000.0);
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_spread_bps = 10.0; // Below threshold
+        
+        let decision = engine.check(&request, false);
+        assert!(decision.approved);
     }
 }

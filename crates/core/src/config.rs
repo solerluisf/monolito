@@ -10,6 +10,7 @@ pub struct EngineConfig {
     pub feature_config: FeatureConfig,
     pub model_config: ModelConfig,
     pub journal_config: JournalConfig,
+    pub threading_config: ThreadingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,16 @@ pub struct JournalConfig {
     pub max_file_size_mb: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadingConfig {
+    pub prediction_core_id: usize,
+    pub risk_core_id: usize,
+    pub journal_core_id: usize,
+    pub alpaca_feed_core_id: usize,
+    pub heartbeat_timeout_ns: u64,
+    pub heartbeat_check_interval_ms: u64,
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +120,7 @@ impl Default for EngineConfig {
             feature_config: FeatureConfig::default(),
             model_config: ModelConfig::default(),
             journal_config: JournalConfig::default(),
+            threading_config: ThreadingConfig::default(),
         }
     }
 }
@@ -192,6 +204,19 @@ impl Default for JournalConfig {
             flush_interval_ms: 100,
             snapshot_interval_sec: 60,
             max_file_size_mb: 100,
+        }
+    }
+}
+
+impl Default for ThreadingConfig {
+    fn default() -> Self {
+        Self {
+            prediction_core_id: 3,
+            risk_core_id: 2,
+            journal_core_id: 0,
+            alpaca_feed_core_id: 0,
+            heartbeat_timeout_ns: 2_000_000_000, // 2 seconds
+            heartbeat_check_interval_ms: 500,
         }
     }
 }

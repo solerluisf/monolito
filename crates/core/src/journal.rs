@@ -9,6 +9,7 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::metrics::GlobalMetrics;
+use crate::threading::{spawn_pinned, ThreadPriority};
 
 #[derive(Debug, Clone)]
 pub enum JournalEntry {
@@ -20,8 +21,14 @@ pub enum JournalEntry {
     Event { event_type: String, timestamp_ns: u64, data: String },
 }
 
+#[derive(Debug)]
+pub enum JournalCommand {
+    Write(JournalEntry),
+    Flush { ack: Sender<()> },
+}
+
 pub struct JournalWriter {
-    tx: Sender<JournalEntry>,
+    tx: Sender<JournalCommand>,
     handle: Option<thread::JoinHandle<()>>,
     write_count: Arc<AtomicU64>,
 }
@@ -31,8 +38,9 @@ impl JournalWriter {
         journal_dir: &str,
         flush_interval_ms: u64,
         metrics: Arc<GlobalMetrics>,
+        core_id: usize,
     ) -> Self {
-        let (tx, rx) = bounded::<JournalEntry>(10_000);
+        let (tx, rx) = bounded::<JournalCommand>(10_000);
         let write_count = Arc::new(AtomicU64::new(0));
 
         let path = PathBuf::from(journal_dir);
@@ -43,9 +51,14 @@ impl JournalWriter {
         ));
 
         let wc = Arc::clone(&write_count);
-        let handle = thread::spawn(move || {
-            Self::run_loop(rx, &file_path, flush_interval_ms, &metrics, &wc);
-        });
+        let handle = spawn_pinned(
+            "journal",
+            core_id,
+            ThreadPriority::Normal,
+            move || {
+                Self::run_loop(rx, &file_path, flush_interval_ms, &metrics, &wc);
+            },
+        );
 
         Self {
             tx,
@@ -55,7 +68,7 @@ impl JournalWriter {
     }
 
     fn run_loop(
-        rx: Receiver<JournalEntry>,
+        rx: Receiver<JournalCommand>,
         file_path: &PathBuf,
         flush_interval_ms: u64,
         metrics: &GlobalMetrics,
@@ -73,7 +86,7 @@ impl JournalWriter {
 
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(entry) => {
+                Ok(JournalCommand::Write(entry)) => {
                     let line = format_entry(&entry);
                     if let Err(e) = writeln!(writer, "{}", line) {
                         eprintln!("Journal write error: {}", e);
@@ -87,6 +100,11 @@ impl JournalWriter {
                         let _ = writer.flush();
                         last_flush = std::time::Instant::now();
                     }
+                }
+                Ok(JournalCommand::Flush { ack }) => {
+                    let _ = writer.flush();
+                    let _ = ack.send(());
+                    last_flush = std::time::Instant::now();
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if last_flush.elapsed() >= flush_dur {
@@ -103,7 +121,21 @@ impl JournalWriter {
     }
 
     pub fn write(&self, entry: JournalEntry) -> Result<(), &'static str> {
-        self.tx.send(entry).map_err(|_| "Journal channel closed")
+        self.tx
+            .send(JournalCommand::Write(entry))
+            .map_err(|_| "Journal channel closed")
+    }
+
+    /// Synchronously flush the journal to disk.
+    /// Blocks until the flush is complete.
+    pub fn flush_sync(&self) -> Result<(), &'static str> {
+        let (ack_tx, ack_rx) = bounded::<()>(1);
+        self.tx
+            .send(JournalCommand::Flush { ack: ack_tx })
+            .map_err(|_| "Journal channel closed")?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "Flush timeout")
     }
 
     pub fn write_count(&self) -> u64 {
@@ -155,6 +187,7 @@ mod tests {
             tmp_dir.to_str().unwrap(),
             50,
             Arc::clone(&metrics),
+            0, // core_id
         );
 
         let entry = JournalEntry::Tick {
@@ -192,6 +225,7 @@ mod tests {
             tmp_dir.to_str().unwrap(),
             10,
             Arc::clone(&metrics),
+            0, // core_id
         );
 
         for i in 0..10 {
@@ -206,6 +240,35 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let count = writer.write_count();
         assert_eq!(count, 10);
+
+        writer.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_journal_flush_sync() {
+        let metrics = Arc::new(GlobalMetrics::new());
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("journal_test3_{}", std::process::id()));
+        let writer = JournalWriter::new(
+            tmp_dir.to_str().unwrap(),
+            5000, // Long flush interval to ensure sync flush works
+            Arc::clone(&metrics),
+            0, // core_id
+        );
+
+        let entry = JournalEntry::Tick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 12345,
+            data: "price=150.0".to_string(),
+        };
+        assert!(writer.write(entry).is_ok());
+        
+        // Sync flush should complete without error
+        assert!(writer.flush_sync().is_ok());
+
+        let count = writer.write_count();
+        assert_eq!(count, 1);
 
         writer.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);

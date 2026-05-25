@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use unified_trading_core::kill_switch::KillSwitch;
-
 use unified_trading_core::config::RiskConfig;
 use unified_trading_core::metrics::GlobalMetrics;
+use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use crate::risk_checks::{RiskCheckRequest, RiskDecision, RiskEngine};
 use crate::portfolio_manager::PortfolioManager;
@@ -61,10 +61,15 @@ impl RiskCoordinator {
         }
     }
 
-    pub fn start(mut self) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            self.run_loop();
-        })
+    pub fn start(mut self, core_id: usize) -> std::thread::JoinHandle<()> {
+        spawn_pinned(
+            "risk-coordinator",
+            core_id,
+            ThreadPriority::High,
+            move || {
+                self.run_loop();
+            },
+        )
     }
 
     pub fn stop(&self) {
@@ -98,6 +103,8 @@ mod tests {
             quantity: 10.0,
             price: 150.0,
             timestamp_ns: now,
+            current_volatility: 0.01,
+            current_spread_bps: 10.0,
         }
     }
 
@@ -120,7 +127,7 @@ mod tests {
         req_tx.send(make_request("AAPL")).unwrap();
         drop(req_tx);
 
-        let handle = coordinator.start();
+        let handle = coordinator.start(0);
         let decision = dec_rx.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
         assert!(decision.approved);
         let _ = handle.join();
@@ -146,7 +153,7 @@ mod tests {
         req_tx.send(make_request("AAPL")).unwrap();
         drop(req_tx);
 
-        let handle = coordinator.start();
+        let handle = coordinator.start(0);
         let decision = dec_rx.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
         assert!(!decision.approved);
         let _ = handle.join();
