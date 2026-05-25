@@ -92,6 +92,10 @@ pub struct ThreadingConfig {
     pub risk_core_id: usize,
     pub journal_core_id: usize,
     pub alpaca_feed_core_id: usize,
+    pub tick_reactor_core_id: usize,
+    pub execution_core_id: usize,
+    pub heartbeat_core_id: usize,
+    pub command_core_id: usize,
     pub heartbeat_timeout_ns: u64,
     pub heartbeat_check_interval_ms: u64,
 }
@@ -215,6 +219,10 @@ impl Default for ThreadingConfig {
             risk_core_id: 2,
             journal_core_id: 0,
             alpaca_feed_core_id: 0,
+            tick_reactor_core_id: 0,
+            execution_core_id: 0,
+            heartbeat_core_id: 0,
+            command_core_id: 0,
             heartbeat_timeout_ns: 2_000_000_000, // 2 seconds
             heartbeat_check_interval_ms: 500,
         }

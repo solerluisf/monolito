@@ -25,7 +25,8 @@ impl MomentumComputer {
         let ema_21 = wm.ema_21.value as f32;
 
         let macd_line = ema_9 - ema_21;
-        let macd_signal = macd_line * 0.8;
+        // Proper EMA-based signal line instead of hardcoded factor
+        let macd_signal = wm.macd_signal_ema.value as f32;
         let macd_histogram = macd_line - macd_signal;
 
         (rsi, macd_line, macd_signal, macd_histogram)
@@ -97,11 +98,12 @@ impl FeatureEngine {
         symbol: &str,
         rsi_period: usize,
         atr_period: usize,
+        macd_signal_period: usize,
         feature_capacity: usize,
     ) -> Self {
         Self {
             symbol: symbol.to_string(),
-            window_manager: WindowManager::new(symbol, rsi_period, atr_period),
+            window_manager: WindowManager::new(symbol, rsi_period, atr_period, macd_signal_period),
             feature_capacity,
         }
     }
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_compute() {
-        let mut engine = FeatureEngine::new("AAPL", 14, 14, 20);
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
         let fv = engine.compute(&tick);
         assert!(fv.len() > 10);
@@ -214,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_snapshot() {
-        let mut engine = FeatureEngine::new("MSFT", 14, 14, 20);
+        let mut engine = FeatureEngine::new("MSFT", 14, 14, 9, 20);
         let tick = make_tick("MSFT", 2000, 400.0, 0.04);
         let snap = engine.compute_snapshot(&tick);
         assert_eq!(snap.symbol, "MSFT");
@@ -223,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_multiple_ticks() {
-        let mut engine = FeatureEngine::new("AAPL", 14, 14, 20);
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
         for i in 0..20 {
             let tick = make_tick("AAPL", i * 1000, 150.0 + (i as f64 * 0.01), 0.05);
             engine.compute(&tick);
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn test_price_computer() {
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
-        let wm = WindowManager::new("AAPL", 14, 14);
+        let wm = WindowManager::new("AAPL", 14, 14, 9);
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&wm, &tick);
         assert!((mid - 150.0).abs() < 0.001);
         assert!((spread_bps - 3.33).abs() < 0.1);
@@ -247,7 +249,7 @@ mod tests {
     #[test]
     fn test_volume_computer() {
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
-        let mut wm = WindowManager::new("AAPL", 14, 14);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
         wm.volume_window.push(1000.0);
         let ratio = VolumeComputer::compute(&wm, &tick);
         assert!((ratio - 0.05).abs() < 0.001);
@@ -255,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_regime_computer_volatile() {
-        let mut wm = WindowManager::new("AAPL", 14, 14);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
         wm.last_mid_price = 100.0;
         let (regime, strength) = RegimeComputer::compute(&wm, 3.0, 1.0, 0.1);
         assert!(matches!(regime, RegimeLabel::Volatile));
@@ -264,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_regime_computer_ranging() {
-        let mut wm = WindowManager::new("AAPL", 14, 14);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
         wm.last_mid_price = 100.0;
         let (regime, strength) = RegimeComputer::compute(&wm, 0.001, 0.001, 0.01);
         assert!(matches!(regime, RegimeLabel::Ranging));

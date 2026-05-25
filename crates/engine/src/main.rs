@@ -5,6 +5,7 @@ use std::sync::Arc;
 use unified_trading_core::config::EngineConfig;
 use unified_trading_core::api::{create_router, ApiState};
 use unified_trading_core::ws::{create_ws_router, WsState};
+use unified_trading_core::large_pages::{enable_large_pages, log_large_page_result};
 use unified_trading_engine::UnifiedEngine;
 
 fn load_config() -> EngineConfig {
@@ -59,8 +60,7 @@ fn load_config() -> EngineConfig {
     config
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let log_level = std::env::var("RUST_LOG")
         .unwrap_or_else(|_| "info".to_string());
 
@@ -70,6 +70,10 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .init();
+
+    // Attempt to enable large pages before any heavy allocation
+    let lp_result = enable_large_pages();
+    log_large_page_result(&lp_result);
 
     tracing::info!("Unified Trading Engine starting");
 
@@ -82,66 +86,73 @@ async fn main() {
 
     engine.start();
 
-    let api_state = ApiState {
-        kill_switch: Arc::clone(&kill_switch),
-        metrics: Arc::clone(&metrics),
-        command_tx: command_tx.clone(),
-    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
 
-    let ws_state = WsState {
-        metrics: Arc::clone(&metrics),
-        kill_switch: Arc::clone(&kill_switch),
-    };
+    rt.block_on(async {
+        let api_state = ApiState {
+            kill_switch: Arc::clone(&kill_switch),
+            metrics: Arc::clone(&metrics),
+            command_tx: command_tx.clone(),
+        };
 
-    let api_app = create_router(api_state);
-    let ws_app = create_ws_router(ws_state);
+        let ws_state = WsState {
+            metrics: Arc::clone(&metrics),
+            kill_switch: Arc::clone(&kill_switch),
+        };
 
-    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:9090")
-        .await
-        .expect("Failed to bind API port");
-    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:9091")
-        .await
-        .expect("Failed to bind WebSocket port");
+        let api_app = create_router(api_state);
+        let ws_app = create_ws_router(ws_state);
 
-    tracing::info!("REST API listening on http://127.0.0.1:9090");
-    tracing::info!("WebSocket telemetry on ws://127.0.0.1:9091/ws/telemetry");
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:9090")
+            .await
+            .expect("Failed to bind API port");
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:9091")
+            .await
+            .expect("Failed to bind WebSocket port");
 
-    let mut api_handle = tokio::spawn(async move {
-        axum::serve(api_listener, api_app).await.unwrap();
-    });
+        tracing::info!("REST API listening on http://127.0.0.1:9090");
+        tracing::info!("WebSocket telemetry on ws://127.0.0.1:9091/ws/telemetry");
 
-    let mut ws_handle = tokio::spawn(async move {
-        axum::serve(ws_listener, ws_app).await.unwrap();
-    });
+        let mut api_handle = tokio::spawn(async move {
+            axum::serve(api_listener, api_app).await.unwrap();
+        });
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl+C received, initiating graceful shutdown...");
-                kill_switch.activate();
-                break;
-            }
-            _ = &mut api_handle => {
-                tracing::warn!("API server exited unexpectedly");
-                break;
-            }
-            _ = &mut ws_handle => {
-                tracing::warn!("WebSocket server exited unexpectedly");
-                break;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                if kill_switch.is_active() {
-                    tracing::info!("Kill switch active, shutting down");
+        let mut ws_handle = tokio::spawn(async move {
+            axum::serve(ws_listener, ws_app).await.unwrap();
+        });
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C received, initiating graceful shutdown...");
+                    kill_switch.activate();
                     break;
+                }
+                _ = &mut api_handle => {
+                    tracing::warn!("API server exited unexpectedly");
+                    break;
+                }
+                _ = &mut ws_handle => {
+                    tracing::warn!("WebSocket server exited unexpectedly");
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if kill_switch.is_active() {
+                        tracing::info!("Kill switch active, shutting down");
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    engine.shutdown();
+        engine.shutdown();
 
-    api_handle.abort();
-    ws_handle.abort();
+        api_handle.abort();
+        ws_handle.abort();
 
-    tracing::info!("Unified Trading Engine stopped");
+        tracing::info!("Unified Trading Engine stopped");
+    });
 }

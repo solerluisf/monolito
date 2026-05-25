@@ -101,7 +101,7 @@ fn test_full_pipeline_tick_to_intent() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("AAPL");
-    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 20);
+    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
     let strategy_engine = StrategyEngine::new(
         "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
     );
@@ -133,7 +133,7 @@ fn test_full_pipeline_tick_to_intent() {
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
     );
-    let _exec_handle = exec_manager.start();
+    let _exec_handle = exec_manager.start(0);
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);
@@ -170,7 +170,7 @@ fn test_pipeline_with_burst_ticks() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("MSFT");
-    let feature_engine = FeatureEngine::new("MSFT", 14, 14, 20);
+    let feature_engine = FeatureEngine::new("MSFT", 14, 14, 9, 20);
     let strategy_engine = StrategyEngine::new(
         "MSFT", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
     );
@@ -202,7 +202,7 @@ fn test_pipeline_with_burst_ticks() {
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
     );
-    let _exec_handle = exec_manager.start();
+    let _exec_handle = exec_manager.start(0);
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);
@@ -239,7 +239,7 @@ fn test_kill_switch_stops_pipeline() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("AAPL");
-    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 20);
+    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
     let strategy_engine = StrategyEngine::new(
         "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
     );
@@ -271,7 +271,7 @@ fn test_kill_switch_stops_pipeline() {
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
     );
-    let _exec_handle = exec_manager.start();
+    let _exec_handle = exec_manager.start(0);
 
     let ks = Arc::clone(&kill_switch);
     let m = Arc::clone(&metrics);

@@ -168,4 +168,52 @@ mod tests {
         let count = ks.activate();
         assert_eq!(count, 2);
     }
+
+    /// Benchmark-style test measuring KillSwitch activation latency under concurrent reads.
+    /// Spawns 8 reader threads hammering is_active() while the main thread triggers activate().
+    #[test]
+    fn test_kill_switch_latency_under_contention() {
+        use std::time::{Duration, Instant};
+        use std::sync::atomic::AtomicBool;
+
+        let ks = Arc::new(KillSwitch::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let ks_clone = Arc::clone(&ks);
+            let r_clone = Arc::clone(&running);
+            handles.push(std::thread::spawn(move || {
+                while r_clone.load(Ordering::Relaxed) {
+                    let _ = ks_clone.is_active();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Warm-up
+        std::thread::sleep(Duration::from_millis(10));
+
+        let before = Instant::now();
+        ks.activate();
+        let after = Instant::now();
+
+        let latency = after.duration_since(before);
+
+        // Stop readers
+        running.store(false, Ordering::Relaxed);
+        for h in handles {
+            let _ = h.join();
+        }
+
+        // Assert reasonable latency (should be < 1us on modern hardware, but we allow 100us in CI)
+        assert!(
+            latency < Duration::from_micros(100),
+            "KillSwitch activation latency too high: {:?}",
+            latency
+        );
+
+        // Also verify all threads eventually see it
+        assert!(ks.is_active());
+    }
 }

@@ -63,6 +63,20 @@ pub struct AssetProcessor {
 }
 
 impl AssetProcessor {
+    /// Fast precheck on the hot path: returns `true` if the intent should proceed to the channel.
+    /// Combines kill-switch and staleness checks to avoid wasted channel bandwidth.
+    #[inline]
+    fn fast_precheck(&self, prediction: &Prediction) -> bool {
+        if self.kill_switch.is_active() {
+            return false;
+        }
+        if prediction.is_stale(self.prediction_staleness_ns) {
+            self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
     pub fn run_loop(&mut self, md_rx: &Receiver<RawTick>) {
         let mut batch = Vec::with_capacity(32);
         let mut current_spread_bps = 0.0;
@@ -84,14 +98,8 @@ impl AssetProcessor {
                 // Read prediction from ArcSwap (set by PredictionEngine)
                 let prediction = self.latest_pred.load_full();
                 
-                // Check if prediction is stale
-                if prediction.is_stale(self.prediction_staleness_ns) {
-                    self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Fast precheck: reject obviously invalid intents
-                if self.kill_switch.is_active() {
+                // Fast precheck before channel send
+                if !self.fast_precheck(&prediction) {
                     continue;
                 }
 
@@ -201,6 +209,7 @@ impl UnifiedEngine {
             Arc::clone(&self.metrics),
             threading_config.heartbeat_timeout_ns,
             threading_config.heartbeat_check_interval_ms,
+            threading_config.heartbeat_core_id,
         );
         self.heartbeat_monitor = Some(heartbeat_monitor);
 
@@ -337,6 +346,7 @@ impl UnifiedEngine {
             },
         );
 
+        let mut asset_idx = 0;
         for asset_config in &config.asset_configs {
             if !asset_config.enabled {
                 continue;
@@ -347,6 +357,12 @@ impl UnifiedEngine {
             if self.next_asset_core > 3 {
                 self.next_asset_core = 1;
             }
+
+            // Distribute per-asset threads across cores to avoid collision
+            let pred_core_id = (threading_config.prediction_core_id + asset_idx) % 4;
+            let risk_core_id = (threading_config.risk_core_id + asset_idx) % 4;
+            let exec_core_id = (threading_config.execution_core_id + asset_idx) % 4;
+            asset_idx += 1;
 
             let (md_tx, md_rx) = bounded::<RawTick>(10_000);
             let (feature_tx, feature_rx) = bounded::<FeatureVector>(1000);
@@ -392,6 +408,7 @@ impl UnifiedEngine {
                     &asset_config.symbol,
                     config.feature_config.rsi_period,
                     config.feature_config.atr_period,
+                    config.feature_config.macd_signal,
                     20,
                 ),
                 strategy: strategy_arc,
@@ -405,7 +422,6 @@ impl UnifiedEngine {
             };
 
             let inference_engine = InferenceEngine::new(config.model_config.feature_vector_size);
-            let pred_core_id = threading_config.prediction_core_id;
             let _pred_handle = pred_engine.start(move |features| {
                 inference_engine.predict(features)
             }, pred_core_id);
@@ -418,7 +434,6 @@ impl UnifiedEngine {
                 Arc::clone(&ks),
                 Arc::clone(&metrics),
             );
-            let risk_core_id = threading_config.risk_core_id;
             let _risk_handle = risk_coordinator.start(risk_core_id);
 
             let exec_manager = ExecutionManager::new(
@@ -431,7 +446,7 @@ impl UnifiedEngine {
                 Arc::clone(&ks),
                 pm,
             );
-            let _exec_handle = exec_manager.start();
+            let _exec_handle = exec_manager.start(exec_core_id);
 
             // Start asset processor with heartbeat
             let sym = asset_config.symbol.clone();
@@ -448,17 +463,19 @@ impl UnifiedEngine {
             );
 
             tracing::info!(
-                "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH)",
-                asset_config.symbol, core_id, pred_core_id, risk_core_id
+                "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH, exec on core {} HIGH)",
+                asset_config.symbol, core_id, pred_core_id, risk_core_id, exec_core_id
             );
         }
         drop(config);
 
         if let Some(feed_rx) = feed_rx {
+            let tick_reactor_core_id = threading_config.tick_reactor_core_id;
             let (reactor_tx, reactor_handle) = spawn_reactor(
                 feed_rx,
                 Arc::clone(&self.kill_switch),
                 Arc::clone(&self.metrics),
+                tick_reactor_core_id,
             );
 
             for (symbol, tx) in &md_tx_list {
@@ -481,6 +498,10 @@ impl UnifiedEngine {
     }
 
     fn start_command_actor(&self) {
+        let config = self.config.read();
+        let command_core_id = config.threading_config.command_core_id;
+        drop(config);
+
         let metrics = Arc::clone(&self.metrics);
         let kill_switch = Arc::clone(&self.kill_switch);
         let strategy_registry = Arc::clone(&self.strategy_registry);
@@ -544,7 +565,7 @@ impl UnifiedEngine {
                 }
                 _ => ControlResponse::Ok,
             }
-        });
+        }, command_core_id);
     }
 
     pub fn shutdown(&mut self) {

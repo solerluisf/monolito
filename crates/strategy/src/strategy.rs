@@ -52,10 +52,6 @@ impl Clone for Box<dyn Strategy> {
     }
 }
 
-fn compute_action_score(directional_exposure: f32, regime_confidence: f32) -> f32 {
-    directional_exposure.abs() * regime_confidence
-}
-
 fn urgency_from_score(score: f32) -> Urgency {
     if score > 0.85 {
         Urgency::Aggressive
@@ -106,12 +102,6 @@ pub fn build_exit_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_compute_action_score() {
-        assert!((compute_action_score(0.9, 0.8) - 0.72).abs() < 0.001);
-        assert!((compute_action_score(-0.5, 0.6) - 0.30).abs() < 0.001);
-    }
 
     #[test]
     fn test_urgency_from_score() {

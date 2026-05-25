@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::kill_switch::KillSwitch;
 use crate::metrics::GlobalMetrics;
+use crate::threading::{spawn_pinned, ThreadPriority};
 
 pub struct HeartbeatHandle {
     timestamp_ns: Arc<AtomicU64>,
@@ -36,6 +37,7 @@ impl ThreadHeartbeatMonitor {
         metrics: Arc<GlobalMetrics>,
         timeout_ns: u64,
         check_interval_ms: u64,
+        core_id: usize,
     ) -> Self {
         let heartbeats = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
@@ -45,9 +47,14 @@ impl ThreadHeartbeatMonitor {
         let m = Arc::clone(&metrics);
         let r = Arc::clone(&running);
 
-        let handle = thread::spawn(move || {
-            Self::run_loop(&hb, &ks, &m, timeout_ns, check_interval_ms, &r);
-        });
+        let handle = spawn_pinned(
+            "heartbeat-monitor",
+            core_id,
+            ThreadPriority::Normal,
+            move || {
+                Self::run_loop(&hb, &ks, &m, timeout_ns, check_interval_ms, &r);
+            },
+        );
 
         Self {
             heartbeats,
@@ -121,7 +128,7 @@ mod tests {
     fn test_monitor_register_thread() {
         let ks = Arc::new(KillSwitch::new());
         let metrics = Arc::new(GlobalMetrics::new());
-        let monitor = ThreadHeartbeatMonitor::new(ks, metrics, 2_000_000_000, 100);
+        let monitor = ThreadHeartbeatMonitor::new(ks, metrics, 2_000_000_000, 100, 0);
 
         let handle = monitor.register_thread("test_thread");
         handle.pulse();
@@ -139,6 +146,7 @@ mod tests {
             Arc::clone(&metrics),
             50_000_000, // 50ms timeout
             20,         // check every 20ms
+            0,
         );
 
         let handle = monitor.register_thread("stale_thread");

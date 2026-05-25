@@ -8,6 +8,7 @@ pub struct WindowManager {
     pub ema_9: EMAState,
     pub ema_21: EMAState,
     pub ema_50: EMAState,
+    pub macd_signal_ema: EMAState,
     pub rsi_14: RSIState,
     pub atr_14: ATRState,
     pub return_1: RollingWindow<f64>,
@@ -21,6 +22,7 @@ impl WindowManager {
         symbol: &str,
         rsi_period: usize,
         atr_period: usize,
+        macd_signal_period: usize,
     ) -> Self {
         Self {
             symbol: symbol.to_string(),
@@ -30,6 +32,7 @@ impl WindowManager {
             ema_9: EMAState::new(9),
             ema_21: EMAState::new(21),
             ema_50: EMAState::new(50),
+            macd_signal_ema: EMAState::new(macd_signal_period),
             rsi_14: RSIState::new(rsi_period),
             atr_14: ATRState::new(atr_period),
             return_1: RollingWindow::new(1),
@@ -47,6 +50,9 @@ impl WindowManager {
         self.ema_9.update(mid_price);
         self.ema_21.update(mid_price);
         self.ema_50.update(mid_price);
+
+        let macd_line = self.ema_9.value - self.ema_21.value;
+        self.macd_signal_ema.update(macd_line);
 
         self.rsi_14.update(mid_price);
 
@@ -70,7 +76,7 @@ mod tests {
 
     #[test]
     fn test_window_manager_update() {
-        let mut wm = WindowManager::new("AAPL", 14, 14);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
         wm.update(150.0, 1000.0, 0.05);
         wm.update(150.1, 1200.0, 0.04);
         wm.update(150.2, 800.0, 0.06);
@@ -82,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_window_manager_returns() {
-        let mut wm = WindowManager::new("MSFT", 14, 14);
+        let mut wm = WindowManager::new("MSFT", 14, 14, 9);
         wm.last_mid_price = 400.0;
         wm.update(401.0, 500.0, 0.04);
         assert!(wm.return_1.len() == 1);

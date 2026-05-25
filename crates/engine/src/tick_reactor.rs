@@ -8,6 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::symbol_registry::{SymbolRegistry, SymbolIdArray};
+use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use market_data::RawTick;
 
@@ -212,15 +213,18 @@ pub fn spawn_reactor(
     tick_rx: Receiver<RawTick>,
     kill_switch: Arc<KillSwitch>,
     metrics: Arc<GlobalMetrics>,
+    core_id: usize,
 ) -> (Sender<ReactorCommand>, std::thread::JoinHandle<()>) {
     let (mut reactor, control_tx) = TickReactor::new(tick_rx, kill_switch, metrics);
 
-    let handle = std::thread::Builder::new()
-        .name("tick-reactor".to_string())
-        .spawn(move || {
+    let handle = spawn_pinned(
+        "tick-reactor",
+        core_id,
+        ThreadPriority::High,
+        move || {
             reactor.run();
-        })
-        .expect("Failed to spawn tick reactor");
+        },
+    );
 
     (control_tx, handle)
 }

@@ -1,4 +1,3 @@
-pub mod system_state;
 pub mod kill_switch;
 pub mod config;
 pub mod metrics;
@@ -18,7 +17,6 @@ pub mod large_pages;
 
 pub use kill_switch::KillSwitch;
 pub use metrics::GlobalMetrics;
-pub use system_state::SystemState;
 pub use config::EngineConfig;
 pub use journal::JournalWriter;
 pub use journal::JournalEntry;

@@ -8,6 +8,7 @@ use unified_trading_core::journal::{JournalWriter, JournalEntry};
 use unified_trading_core::validator::RequestValidator;
 use unified_trading_core::idempotency::IdempotencyStore;
 use unified_trading_core::position_manager::PositionManager;
+use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use crate::order_tracker::{OrderTracker, OrderStatus};
 use crate::rate_limiter::RateLimiter;
@@ -259,10 +260,15 @@ impl ExecutionManager {
         let _ = self.lifecycle_tx.send(lifecycle_event);
     }
 
-    pub fn start(mut self) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            self.run_loop();
-        })
+    pub fn start(mut self, core_id: usize) -> std::thread::JoinHandle<()> {
+        spawn_pinned(
+            "execution-manager",
+            core_id,
+            ThreadPriority::High,
+            move || {
+                self.run_loop();
+            },
+        )
     }
 
     pub fn stop(&self) {
@@ -315,7 +321,7 @@ mod tests {
         dec_tx.send(make_approved_decision()).unwrap();
         drop(dec_tx);
 
-        let handle = manager.start();
+        let handle = manager.start(0);
         let event = lifecycle_rx.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
         assert!(matches!(event.event_type, OrderLifecycleEventType::Submitted));
         let _ = handle.join();
@@ -344,7 +350,7 @@ mod tests {
         dec_tx.send(make_approved_decision()).unwrap();
         drop(dec_tx);
 
-        let handle = manager.start();
+        let handle = manager.start(0);
         assert!(lifecycle_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
         let _ = handle.join();
     }

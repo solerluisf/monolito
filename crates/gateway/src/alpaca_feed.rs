@@ -174,6 +174,9 @@ pub struct AlpacaWebSocketFeed {
     pub connected: Arc<AtomicBool>,
     pub reconnect_delay_ms: u64,
     pub max_reconnect_attempts: u32,
+    /// Buffer of recent ticks for replay on reconnect
+    pub replay_buffer: std::sync::Mutex<std::collections::VecDeque<RawTick>>,
+    pub max_replay_ticks: usize,
 }
 
 impl AlpacaWebSocketFeed {
@@ -188,6 +191,8 @@ impl AlpacaWebSocketFeed {
             connected: Arc::new(AtomicBool::new(false)),
             reconnect_delay_ms: 1000,
             max_reconnect_attempts: 10,
+            replay_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            max_replay_ticks: 1000,
         }
     }
 
@@ -292,6 +297,9 @@ impl AlpacaWebSocketFeed {
             .map_err(|e| format!("Subscribe send failed: {}", e))?;
         tracing::info!("Sent subscription for {:?}", channels);
 
+        // Replay buffered ticks from previous session so downstream processors don't miss data
+        self.replay_ticks();
+
         while self.running.load(Ordering::Relaxed) {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -352,6 +360,27 @@ impl AlpacaWebSocketFeed {
         Ok(false)
     }
 
+    fn buffer_tick(&self, tick: RawTick) {
+        let mut buf = self.replay_buffer.lock().unwrap();
+        if buf.len() >= self.max_replay_ticks {
+            buf.pop_front();
+        }
+        buf.push_back(tick);
+    }
+
+    fn replay_ticks(&self) {
+        let ticks: Vec<RawTick> = {
+            let mut buf = self.replay_buffer.lock().unwrap();
+            buf.drain(..).collect()
+        };
+        if !ticks.is_empty() {
+            tracing::info!("Replaying {} buffered ticks post-reconnect", ticks.len());
+            for tick in ticks {
+                let _ = self.tick_tx.try_send(tick);
+            }
+        }
+    }
+
     async fn handle_market_data(&self, text: &str) -> Result<(), String> {
         let messages: Vec<serde_json::Value> = serde_json::from_str(text)
             .map_err(|e| format!("JSON parse error: {}", e))?;
@@ -364,6 +393,7 @@ impl AlpacaWebSocketFeed {
                             "t" => {
                                 if let Ok(trade) = serde_json::from_value::<AlpacaTrade>(item.clone()) {
                                     if let Some(tick) = trade.to_raw_tick() {
+                                        self.buffer_tick(tick.clone());
                                         let _ = self.tick_tx.try_send(tick);
                                     }
                                 }
@@ -371,6 +401,7 @@ impl AlpacaWebSocketFeed {
                             "q" => {
                                 if let Ok(quote) = serde_json::from_value::<AlpacaQuote>(item.clone()) {
                                     if let Some(tick) = quote.to_raw_tick() {
+                                        self.buffer_tick(tick.clone());
                                         let _ = self.tick_tx.try_send(tick);
                                     }
                                 }
@@ -388,6 +419,7 @@ impl AlpacaWebSocketFeed {
                                         last_size: bar.v,
                                         exchange: "BAR".to_string(),
                                     };
+                                    self.buffer_tick(tick.clone());
                                     let _ = self.tick_tx.try_send(tick);
                                 }
                             }
@@ -409,6 +441,8 @@ impl AlpacaWebSocketFeed {
             connected: Arc::clone(&self.connected),
             reconnect_delay_ms: self.reconnect_delay_ms,
             max_reconnect_attempts: self.max_reconnect_attempts,
+            replay_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            max_replay_ticks: self.max_replay_ticks,
         };
 
         tokio::spawn(async move {

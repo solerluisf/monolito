@@ -1,6 +1,8 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::thread;
 
+use crate::threading::{spawn_pinned, ThreadPriority};
+
 #[derive(Debug, Clone)]
 pub struct StrategyParams {
     pub long_entry_threshold: f64,
@@ -66,24 +68,29 @@ pub struct CommandActor {
 }
 
 impl CommandActor {
-    pub fn new<F>(rx: Receiver<ControlCommand>, mut handler: F) -> Self
+    pub fn new<F>(rx: Receiver<ControlCommand>, mut handler: F, core_id: usize) -> Self
     where
         F: FnMut(ControlCommand) -> ControlResponse + Send + 'static,
     {
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let r = Arc::clone(&running);
 
-        let handle = thread::spawn(move || {
-            while r.load(std::sync::atomic::Ordering::Relaxed) {
-                match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                    Ok(cmd) => {
-                        let _resp = handler(cmd);
+        let handle = spawn_pinned(
+            "command-actor",
+            core_id,
+            ThreadPriority::Normal,
+            move || {
+                while r.load(std::sync::atomic::Ordering::Relaxed) {
+                    match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                        Ok(cmd) => {
+                            let _resp = handler(cmd);
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
-            }
-        });
+            },
+        );
 
         Self {
             handle: Some(handle),
@@ -128,7 +135,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }
             ControlResponse::Ok
-        });
+        }, 0);
 
         channel
             .tx
