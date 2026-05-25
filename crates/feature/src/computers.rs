@@ -57,7 +57,15 @@ impl VolumeComputer {
 }
 
 impl RegimeComputer {
-    pub fn compute(wm: &WindowManager, atr: f32, std_dev: f32, macd_histogram: f32) -> (RegimeLabel, f32) {
+    pub fn compute(
+        wm: &WindowManager,
+        atr: f32,
+        _std_dev: f32,
+        macd_histogram: f32,
+        volatile_atr_threshold: f64,
+        strength_atr_divisor: f64,
+        trending_threshold: f64,
+    ) -> (RegimeLabel, f32) {
         let atr_ratio = if wm.last_mid_price > 0.0 {
             atr as f64 / wm.last_mid_price
         } else {
@@ -66,9 +74,9 @@ impl RegimeComputer {
 
         let trend_strength = macd_histogram.abs();
 
-        if atr_ratio > 0.02 {
-            (RegimeLabel::Volatile, (atr_ratio / 0.05).min(1.0) as f32)
-        } else if trend_strength > 0.5 {
+        if atr_ratio > volatile_atr_threshold {
+            (RegimeLabel::Volatile, (atr_ratio / strength_atr_divisor).min(1.0) as f32)
+        } else if trend_strength > trending_threshold as f32 {
             (RegimeLabel::Trending, trend_strength.min(1.0))
         } else {
             (RegimeLabel::Ranging, (1.0 - trend_strength).min(1.0))
@@ -91,6 +99,10 @@ pub struct FeatureEngine {
     pub symbol: String,
     pub window_manager: WindowManager,
     pub feature_capacity: usize,
+    pub volume_ratio_clamp: f64,
+    pub regime_volatile_atr_threshold: f64,
+    pub regime_strength_atr_divisor: f64,
+    pub regime_trending_threshold: f64,
 }
 
 impl FeatureEngine {
@@ -100,11 +112,29 @@ impl FeatureEngine {
         atr_period: usize,
         macd_signal_period: usize,
         feature_capacity: usize,
+        price_window_size: usize,
+        volume_window_size: usize,
+        spread_window_size: usize,
+        return_1_window: usize,
+        return_5_window: usize,
+        return_20_window: usize,
+        volume_ratio_clamp: f64,
+        regime_volatile_atr_threshold: f64,
+        regime_strength_atr_divisor: f64,
+        regime_trending_threshold: f64,
     ) -> Self {
         Self {
             symbol: symbol.to_string(),
-            window_manager: WindowManager::new(symbol, rsi_period, atr_period, macd_signal_period),
+            window_manager: WindowManager::new(
+                symbol, rsi_period, atr_period, macd_signal_period,
+                price_window_size, volume_window_size, spread_window_size,
+                return_1_window, return_5_window, return_20_window,
+            ),
             feature_capacity,
+            volume_ratio_clamp,
+            regime_volatile_atr_threshold,
+            regime_strength_atr_divisor,
+            regime_trending_threshold,
         }
     }
 
@@ -145,6 +175,9 @@ impl FeatureEngine {
             atr,
             std_dev,
             macd_histogram,
+            self.regime_volatile_atr_threshold,
+            self.regime_strength_atr_divisor,
+            self.regime_trending_threshold,
         );
         fv.push("regime", regime as i32 as f32);
         fv.push("regime_strength", regime_strength);
@@ -206,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_compute() {
-        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
         let fv = engine.compute(&tick);
         assert!(fv.len() > 10);
@@ -216,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_snapshot() {
-        let mut engine = FeatureEngine::new("MSFT", 14, 14, 9, 20);
+        let mut engine = FeatureEngine::new("MSFT", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
         let tick = make_tick("MSFT", 2000, 400.0, 0.04);
         let snap = engine.compute_snapshot(&tick);
         assert_eq!(snap.symbol, "MSFT");
@@ -225,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_feature_engine_multiple_ticks() {
-        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
+        let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
         for i in 0..20 {
             let tick = make_tick("AAPL", i * 1000, 150.0 + (i as f64 * 0.01), 0.05);
             engine.compute(&tick);
@@ -239,7 +272,7 @@ mod tests {
     #[test]
     fn test_price_computer() {
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
-        let wm = WindowManager::new("AAPL", 14, 14, 9);
+        let wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&wm, &tick);
         assert!((mid - 150.0).abs() < 0.001);
         assert!((spread_bps - 3.33).abs() < 0.1);
@@ -249,7 +282,7 @@ mod tests {
     #[test]
     fn test_volume_computer() {
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
-        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.volume_window.push(1000.0);
         let ratio = VolumeComputer::compute(&wm, &tick);
         assert!((ratio - 0.05).abs() < 0.001);
@@ -257,18 +290,18 @@ mod tests {
 
     #[test]
     fn test_regime_computer_volatile() {
-        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.last_mid_price = 100.0;
-        let (regime, strength) = RegimeComputer::compute(&wm, 3.0, 1.0, 0.1);
+        let (regime, strength) = RegimeComputer::compute(&wm, 3.0, 1.0, 0.1, 0.02, 0.05, 0.5);
         assert!(matches!(regime, RegimeLabel::Volatile));
         assert!(strength > 0.0);
     }
 
     #[test]
     fn test_regime_computer_ranging() {
-        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.last_mid_price = 100.0;
-        let (regime, strength) = RegimeComputer::compute(&wm, 0.001, 0.001, 0.01);
+        let (regime, strength) = RegimeComputer::compute(&wm, 0.001, 0.001, 0.01, 0.02, 0.05, 0.5);
         assert!(matches!(regime, RegimeLabel::Ranging));
     }
 }

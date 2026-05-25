@@ -20,14 +20,15 @@ pub struct ExecutionManager {
     pub decision_rx: Receiver<RiskDecision>,
     pub lifecycle_tx: Sender<OrderLifecycleEvent>,
     pub execution_port: Arc<dyn IExecutionPort>,
-    pub order_tracker: OrderTracker,
-    pub rate_limiter: RateLimiter,
-    pub circuit_breaker: CircuitBreaker,
-    pub idempotency_store: IdempotencyStore,
+    pub order_tracker: Arc<std::sync::Mutex<OrderTracker>>,
+    pub rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
+    pub idempotency_store: Arc<IdempotencyStore>,
     pub position_manager: Arc<PositionManager>,
     pub metrics: Arc<GlobalMetrics>,
     pub journal: Option<Arc<JournalWriter>>,
     pub kill_switch: Arc<KillSwitch>,
+    pub validator: RequestValidator,
     running: Arc<AtomicBool>,
 }
 
@@ -41,19 +42,25 @@ impl ExecutionManager {
         metrics: Arc<GlobalMetrics>,
         kill_switch: Arc<KillSwitch>,
         position_manager: Arc<PositionManager>,
+        order_tracker: Arc<std::sync::Mutex<OrderTracker>>,
+        rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+        circuit_breaker: Arc<CircuitBreaker>,
+        idempotency_store: Arc<IdempotencyStore>,
+        validator: RequestValidator,
     ) -> Self {
         Self {
             decision_rx,
             lifecycle_tx,
             execution_port,
-            order_tracker: OrderTracker::new(),
-            rate_limiter: RateLimiter::new(global_rate, per_symbol_rate),
-            circuit_breaker: CircuitBreaker::new(5, 30_000),
-            idempotency_store: IdempotencyStore::new(),
+            order_tracker,
+            rate_limiter,
+            circuit_breaker,
+            idempotency_store,
             position_manager,
             metrics,
             journal: None,
             kill_switch,
+            validator,
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -95,16 +102,19 @@ impl ExecutionManager {
 
         let symbol = decision.request_id.chars().take(4).collect::<String>();
 
-        if let Err(e) = RequestValidator::validate_symbol(&symbol) {
+        if let Err(e) = self.validator.validate_symbol(&symbol) {
             tracing::warn!("Validation failed for {}: {}", symbol, e);
             self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
-        if !self.rate_limiter.try_consume(&symbol, 1.0) {
-            self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(symbol = %symbol, "Rate limit exceeded");
-            return;
+        {
+            let mut rate_limiter = self.rate_limiter.lock().unwrap();
+            if !rate_limiter.try_consume(&symbol, 1.0) {
+                self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(symbol = %symbol, "Rate limit exceeded");
+                return;
+            }
         }
 
         let idempotency_key = format!("{}-{}", symbol, decision.request_id);
@@ -154,8 +164,21 @@ impl ExecutionManager {
             }
         }
 
+        let broker_start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
         match self.execution_port.submit_order(&cmd) {
             Ok(execution_id) => {
+                let broker_end = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let rtt_ns = broker_end.saturating_sub(broker_start);
+                self.metrics.broker_round_trip_latency.record(rtt_ns);
+                self.metrics.broker_send_latency.record(rtt_ns);
+
                 self.metrics.orders_submitted.fetch_add(1, Ordering::Relaxed);
                 self.kill_switch.track_open_order(&execution_id);
 
@@ -167,6 +190,7 @@ impl ExecutionManager {
                 )
                 .with_status("submitted".to_string());
 
+                self.metrics.lifecycle_channel_depth.fetch_add(1, Ordering::Relaxed);
                 let _ = self.lifecycle_tx.send(lifecycle_event);
 
                 tracing::info!(order_id = %execution_id, symbol = %symbol, "Order submitted to broker");
@@ -197,7 +221,10 @@ impl ExecutionManager {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        self.order_tracker.update_fill(order_id, filled_qty);
+        {
+            let mut tracker = self.order_tracker.lock().unwrap();
+            tracker.update_fill(order_id, filled_qty);
+        }
         self.kill_switch.remove_open_order(order_id);
         self.metrics.orders_filled.fetch_add(1, Ordering::Relaxed);
         self.circuit_breaker.record_success();
@@ -245,7 +272,10 @@ impl ExecutionManager {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        self.order_tracker.update_status(order_id, OrderStatus::Cancelled);
+        {
+            let mut tracker = self.order_tracker.lock().unwrap();
+            tracker.update_status(order_id, OrderStatus::Cancelled);
+        }
         self.kill_switch.remove_open_order(order_id);
         self.metrics.orders_cancelled.fetch_add(1, Ordering::Relaxed);
 
@@ -299,6 +329,36 @@ mod tests {
         }
     }
 
+    fn make_manager(
+        dec_rx: Receiver<RiskDecision>,
+        lifecycle_tx: Sender<OrderLifecycleEvent>,
+        global_rate: f64,
+        per_symbol_rate: f64,
+        metrics: Arc<GlobalMetrics>,
+        kill_switch: Arc<KillSwitch>,
+        position_manager: Arc<PositionManager>,
+    ) -> ExecutionManager {
+        let order_tracker = Arc::new(std::sync::Mutex::new(OrderTracker::new()));
+        let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
+        let circuit_breaker = Arc::new(CircuitBreaker::new(5, 30_000));
+        let idempotency_store = Arc::new(IdempotencyStore::new());
+        ExecutionManager::new(
+            dec_rx,
+            lifecycle_tx,
+            Arc::new(MockExecutionPort),
+            global_rate,
+            per_symbol_rate,
+            metrics,
+            kill_switch,
+            position_manager,
+            order_tracker,
+            rate_limiter,
+            circuit_breaker,
+            idempotency_store,
+            RequestValidator::default(),
+        )
+    }
+
     #[test]
     fn test_execution_manager_processes_approved() {
         let (dec_tx, dec_rx) = bounded::<RiskDecision>(100);
@@ -307,10 +367,9 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let position_manager = Arc::new(PositionManager::new());
 
-        let manager = ExecutionManager::new(
+        let manager = make_manager(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort),
             10.0,
             5.0,
             Arc::clone(&metrics),
@@ -336,10 +395,9 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let position_manager = Arc::new(PositionManager::new());
 
-        let manager = ExecutionManager::new(
+        let manager = make_manager(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort),
             10.0,
             5.0,
             Arc::clone(&metrics),
@@ -363,10 +421,9 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let position_manager = Arc::new(PositionManager::new());
 
-        let mut manager = ExecutionManager::new(
+        let mut manager = make_manager(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort),
             10.0,
             5.0,
             Arc::clone(&metrics),
@@ -374,7 +431,10 @@ mod tests {
             Arc::clone(&position_manager),
         );
 
-        let order_id = manager.order_tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
+        let order_id = {
+            let mut tracker = manager.order_tracker.lock().unwrap();
+            tracker.create_order("AAPL", "buy", 10.0, None, "corr-1")
+        };
         manager.on_fill(&order_id, "AAPL", 10.0, 150.0);
         assert_eq!(metrics.orders_filled.load(Ordering::Relaxed), 1);
 
@@ -392,10 +452,9 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let position_manager = Arc::new(PositionManager::new());
 
-        let mut manager = ExecutionManager::new(
+        let mut manager = make_manager(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort),
             100.0,
             100.0,
             Arc::clone(&metrics),

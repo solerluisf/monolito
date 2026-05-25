@@ -17,8 +17,8 @@ struct Inner {
 
 pub struct CircuitBreaker {
     inner: Mutex<Inner>,
-    failure_threshold: u64,
-    cooldown_ms: u64,
+    failure_threshold: AtomicU64,
+    cooldown_ms: AtomicU64,
     pub is_open: AtomicBool,
 }
 
@@ -30,10 +30,18 @@ impl CircuitBreaker {
                 failures: 0,
                 tripped_at_ns: 0,
             }),
-            failure_threshold,
-            cooldown_ms,
+            failure_threshold: AtomicU64::new(failure_threshold),
+            cooldown_ms: AtomicU64::new(cooldown_ms),
             is_open: AtomicBool::new(false),
         }
+    }
+
+    fn failure_threshold_val(&self) -> u64 {
+        self.failure_threshold.load(Ordering::Relaxed)
+    }
+
+    fn cooldown_ms_val(&self) -> u64 {
+        self.cooldown_ms.load(Ordering::Relaxed)
     }
 
     pub fn record_success(&self) {
@@ -51,8 +59,9 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.failures += 1;
+        let threshold = self.failure_threshold_val();
 
-        if inner.failures >= self.failure_threshold || inner.state == State::HalfOpen {
+        if inner.failures >= threshold || inner.state == State::HalfOpen {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -62,7 +71,7 @@ impl CircuitBreaker {
             self.is_open.store(true, Ordering::SeqCst);
             tracing::error!("Circuit breaker opened after {} failures", inner.failures);
         } else {
-            tracing::warn!("Circuit breaker failure {}/{}", inner.failures, self.failure_threshold);
+            tracing::warn!("Circuit breaker failure {}/{}", inner.failures, threshold);
         }
     }
 
@@ -74,7 +83,7 @@ impl CircuitBreaker {
             .as_nanos() as u64;
         inner.tripped_at_ns = now;
         inner.state = State::Open;
-        inner.failures = self.failure_threshold;
+        inner.failures = self.failure_threshold_val();
         self.is_open.store(true, Ordering::SeqCst);
         tracing::error!("Circuit breaker manually tripped");
     }
@@ -91,7 +100,7 @@ impl CircuitBreaker {
                     .as_nanos() as u64;
                 let elapsed_ms = now.saturating_sub(inner.tripped_at_ns) / 1_000_000;
 
-                if elapsed_ms > self.cooldown_ms {
+                if elapsed_ms > self.cooldown_ms_val() {
                     inner.state = State::HalfOpen;
                     self.is_open.store(false, Ordering::SeqCst);
                     tracing::info!("Circuit breaker half-open (probing)");
@@ -109,6 +118,16 @@ impl CircuitBreaker {
         inner.failures = 0;
         inner.state = State::Closed;
         self.is_open.store(false, Ordering::SeqCst);
+    }
+
+    pub fn set_failure_threshold(&self, threshold: u64) {
+        self.failure_threshold.store(threshold, Ordering::Relaxed);
+        tracing::info!(threshold = threshold, "Circuit breaker failure threshold updated");
+    }
+
+    pub fn set_cooldown_ms(&self, cooldown_ms: u64) {
+        self.cooldown_ms.store(cooldown_ms, Ordering::Relaxed);
+        tracing::info!(cooldown_ms = cooldown_ms, "Circuit breaker cooldown updated");
     }
 
     pub fn failure_count(&self) -> u64 {

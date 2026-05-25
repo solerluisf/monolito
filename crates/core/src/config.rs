@@ -11,6 +11,11 @@ pub struct EngineConfig {
     pub model_config: ModelConfig,
     pub journal_config: JournalConfig,
     pub threading_config: ThreadingConfig,
+    pub execution_defaults: ExecutionDefaults,
+    pub circuit_breaker_config: CircuitBreakerConfig,
+    pub channel_config: ChannelConfig,
+    pub reactor_config: ReactorConfig,
+    pub validator_config: ValidatorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +38,9 @@ pub struct RiskConfig {
     pub max_slippage_bps: f64,
     pub allow_short: bool,
     pub kill_switch_on_drawdown: bool,
+    pub risk_intent_staleness_ns: u64,
+    pub portfolio_flat_threshold: f64,
+    pub initial_equity: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +53,11 @@ pub struct StrategyConfig {
     pub entry_cooldown_ms: u64,
     pub exit_cooldown_ms: u64,
     pub prediction_staleness_ns: u64,
+    pub trade_intent_ttl_ns: u64,
+    pub max_long_units: f64,
+    pub max_short_units: f64,
+    pub urgency_aggressive_threshold: f64,
+    pub urgency_normal_threshold: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +81,17 @@ pub struct FeatureConfig {
     pub atr_period: usize,
     pub ema_periods: Vec<usize>,
     pub rolling_window_sizes: Vec<usize>,
+    pub volume_ratio_clamp: f64,
+    pub regime_volatile_atr_threshold: f64,
+    pub regime_strength_atr_divisor: f64,
+    pub regime_trending_threshold: f64,
+    pub price_window_size: usize,
+    pub volume_window_size: usize,
+    pub spread_window_size: usize,
+    pub return_1_window: usize,
+    pub return_5_window: usize,
+    pub return_20_window: usize,
+    pub feature_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +100,21 @@ pub struct ModelConfig {
     pub inference_threads: usize,
     pub max_inference_latency_ms: u64,
     pub feature_vector_size: usize,
+    pub action_score_rsi_weight: f64,
+    pub action_score_macd_weight: f64,
+    pub action_score_volatility_weight: f64,
+    pub atr_penalty_threshold: f64,
+    pub atr_penalty_value: f64,
+    pub rsi_overbought: f64,
+    pub rsi_oversold: f64,
+    pub rsi_neutral: f64,
+    pub forecast_trend_weight: f64,
+    pub forecast_momentum_weight: f64,
+    pub forecast_volume_weight: f64,
+    pub confidence_rsi_weight: f64,
+    pub confidence_macd_weight: f64,
+    pub confidence_regime_weight: f64,
+    pub volume_confirmation_threshold: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +137,45 @@ pub struct ThreadingConfig {
     pub command_core_id: usize,
     pub heartbeat_timeout_ns: u64,
     pub heartbeat_check_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionDefaults {
+    pub default_order_quantity: f64,
+    pub default_order_price: f64,
+    pub execution_per_symbol_rate_divisor: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: u64,
+    pub cooldown_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelConfig {
+    pub per_asset_tick_channel_capacity: usize,
+    pub feature_channel_capacity: usize,
+    pub risk_channel_capacity: usize,
+    pub decision_channel_capacity: usize,
+    pub lifecycle_channel_capacity: usize,
+    pub command_channel_capacity: usize,
+    pub journal_channel_capacity: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactorConfig {
+    pub max_batch_size: usize,
+    pub control_batch_size: usize,
+    pub sleep_on_empty_us: u64,
+    pub backpressure_log_interval: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorConfig {
+    pub max_symbol_length: usize,
+    pub max_quantity: f64,
+    pub max_order_id_length: usize,
 }
 
 impl Default for EngineConfig {
@@ -125,6 +203,11 @@ impl Default for EngineConfig {
             model_config: ModelConfig::default(),
             journal_config: JournalConfig::default(),
             threading_config: ThreadingConfig::default(),
+            execution_defaults: ExecutionDefaults::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            channel_config: ChannelConfig::default(),
+            reactor_config: ReactorConfig::default(),
+            validator_config: ValidatorConfig::default(),
         }
     }
 }
@@ -142,6 +225,9 @@ impl Default for RiskConfig {
             max_slippage_bps: 10.0,
             allow_short: true,
             kill_switch_on_drawdown: true,
+            risk_intent_staleness_ns: 2_000_000_000,
+            portfolio_flat_threshold: 0.001,
+            initial_equity: 100_000.0,
         }
     }
 }
@@ -157,6 +243,11 @@ impl Default for StrategyConfig {
             entry_cooldown_ms: 5000,
             exit_cooldown_ms: 2000,
             prediction_staleness_ns: 150_000_000, // 150ms
+            trade_intent_ttl_ns: 30_000_000_000,
+            max_long_units: 100.0,
+            max_short_units: 100.0,
+            urgency_aggressive_threshold: 0.85,
+            urgency_normal_threshold: 0.5,
         }
     }
 }
@@ -186,6 +277,17 @@ impl Default for FeatureConfig {
             atr_period: 14,
             ema_periods: vec![9, 21, 50],
             rolling_window_sizes: vec![5, 20],
+            volume_ratio_clamp: 0.3,
+            regime_volatile_atr_threshold: 0.02,
+            regime_strength_atr_divisor: 0.05,
+            regime_trending_threshold: 0.5,
+            price_window_size: 50,
+            volume_window_size: 20,
+            spread_window_size: 20,
+            return_1_window: 1,
+            return_5_window: 5,
+            return_20_window: 20,
+            feature_capacity: 20,
         }
     }
 }
@@ -197,6 +299,21 @@ impl Default for ModelConfig {
             inference_threads: 1,
             max_inference_latency_ms: 5,
             feature_vector_size: 128,
+            action_score_rsi_weight: 0.4,
+            action_score_macd_weight: 0.4,
+            action_score_volatility_weight: 0.2,
+            atr_penalty_threshold: 2.0,
+            atr_penalty_value: -0.2,
+            rsi_overbought: 70.0,
+            rsi_oversold: 30.0,
+            rsi_neutral: 50.0,
+            forecast_trend_weight: 1.0,
+            forecast_momentum_weight: 0.3,
+            forecast_volume_weight: 0.2,
+            confidence_rsi_weight: 0.3,
+            confidence_macd_weight: 0.4,
+            confidence_regime_weight: 0.3,
+            volume_confirmation_threshold: 1.2,
         }
     }
 }
@@ -225,6 +342,60 @@ impl Default for ThreadingConfig {
             command_core_id: 0,
             heartbeat_timeout_ns: 2_000_000_000, // 2 seconds
             heartbeat_check_interval_ms: 500,
+        }
+    }
+}
+
+impl Default for ExecutionDefaults {
+    fn default() -> Self {
+        Self {
+            default_order_quantity: 1.0,
+            default_order_price: 150.0,
+            execution_per_symbol_rate_divisor: 2.0,
+        }
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            cooldown_ms: 30_000,
+        }
+    }
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            per_asset_tick_channel_capacity: 10_000,
+            feature_channel_capacity: 1_000,
+            risk_channel_capacity: 1_000,
+            decision_channel_capacity: 1_000,
+            lifecycle_channel_capacity: 1_000,
+            command_channel_capacity: 1_000,
+            journal_channel_capacity: 10_000,
+        }
+    }
+}
+
+impl Default for ReactorConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 64,
+            control_batch_size: 16,
+            sleep_on_empty_us: 10,
+            backpressure_log_interval: 1000,
+        }
+    }
+}
+
+impl Default for ValidatorConfig {
+    fn default() -> Self {
+        Self {
+            max_symbol_length: 20,
+            max_quantity: 1_000_000.0,
+            max_order_id_length: 100,
         }
     }
 }

@@ -52,10 +52,10 @@ impl Clone for Box<dyn Strategy> {
     }
 }
 
-fn urgency_from_score(score: f32) -> Urgency {
-    if score > 0.85 {
+pub fn urgency_from_score(score: f32, aggressive_threshold: f32, normal_threshold: f32) -> Urgency {
+    if score > aggressive_threshold {
         Urgency::Aggressive
-    } else if score > 0.5 {
+    } else if score > normal_threshold {
         Urgency::Normal
     } else {
         Urgency::Passive
@@ -68,6 +68,9 @@ pub fn build_entry_intent(
     confidence: f64,
     action_score: f64,
     units: u64,
+    ttl_ns: u64,
+    aggressive_threshold: f32,
+    normal_threshold: f32,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
         symbol,
@@ -76,8 +79,9 @@ pub fn build_entry_intent(
         IntentType::Entry,
         confidence,
         action_score,
+        ttl_ns,
     );
-    intent.urgency = urgency_from_score(action_score as f32);
+    intent.urgency = urgency_from_score(action_score as f32, aggressive_threshold, normal_threshold);
     intent
 }
 
@@ -86,6 +90,9 @@ pub fn build_exit_intent(
     side: SignalSide,
     confidence: f64,
     action_score: f64,
+    ttl_ns: u64,
+    aggressive_threshold: f32,
+    normal_threshold: f32,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
         symbol,
@@ -94,8 +101,9 @@ pub fn build_exit_intent(
         IntentType::Exit,
         confidence,
         action_score,
+        ttl_ns,
     );
-    intent.urgency = urgency_from_score(action_score as f32);
+    intent.urgency = urgency_from_score(action_score as f32, aggressive_threshold, normal_threshold);
     intent
 }
 
@@ -105,14 +113,14 @@ mod tests {
 
     #[test]
     fn test_urgency_from_score() {
-        assert!(matches!(urgency_from_score(0.9), Urgency::Aggressive));
-        assert!(matches!(urgency_from_score(0.7), Urgency::Normal));
-        assert!(matches!(urgency_from_score(0.2), Urgency::Passive));
+        assert!(matches!(urgency_from_score(0.9, 0.85, 0.5), Urgency::Aggressive));
+        assert!(matches!(urgency_from_score(0.7, 0.85, 0.5), Urgency::Normal));
+        assert!(matches!(urgency_from_score(0.2, 0.85, 0.5), Urgency::Passive));
     }
 
     #[test]
     fn test_build_entry_intent() {
-        let intent = build_entry_intent("TSLA", SignalSide::Long, 0.75, 0.67, 100);
+        let intent = build_entry_intent("TSLA", SignalSide::Long, 0.75, 0.67, 100, 30_000_000_000, 0.85, 0.5);
         assert_eq!(intent.symbol, "TSLA");
         assert!(matches!(intent.side, SignalSide::Long));
         assert!(matches!(intent.size_hint, SizeHint::Units(100)));
@@ -121,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_build_exit_intent() {
-        let intent = build_exit_intent("NFLX", SignalSide::Flatten, 0.90, 0.90);
+        let intent = build_exit_intent("NFLX", SignalSide::Flatten, 0.90, 0.90, 30_000_000_000, 0.85, 0.5);
         assert_eq!(intent.symbol, "NFLX");
         assert!(matches!(intent.side, SignalSide::Flatten));
         assert!(matches!(intent.intent_type, IntentType::Exit));

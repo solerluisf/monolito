@@ -28,10 +28,11 @@ impl RiskCoordinator {
         kill_switch: Arc<KillSwitch>,
         metrics: Arc<GlobalMetrics>,
     ) -> Self {
+        let flat_threshold = config.portfolio_flat_threshold;
         Self {
             request_rx,
             decision_tx,
-            engine: RiskEngine::new(config, initial_equity),
+            engine: RiskEngine::new(config, initial_equity, flat_threshold),
             kill_switch,
             metrics,
             running: Arc::new(AtomicBool::new(true)),
@@ -42,18 +43,25 @@ impl RiskCoordinator {
         while self.running.load(Ordering::Relaxed) {
             match self.request_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(request) => {
+                    let check_start = std::time::Instant::now();
+                    self.metrics.risk_channel_depth.fetch_sub(1, Ordering::Relaxed);
                     let ks_active = self.kill_switch.is_active();
                     let decision = self.engine.check(&request, ks_active);
 
                     if decision.approved {
                         self.metrics.intents_approved.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.increment_per_symbol_intent_approved(&request.symbol);
                     } else {
                         self.metrics.intents_rejected.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.increment_per_symbol_intent_rejected(&request.symbol);
                     }
 
                     if self.decision_tx.send(decision).is_err() {
                         break;
                     }
+                    self.metrics.decision_channel_depth.fetch_add(1, Ordering::Relaxed);
+                    let elapsed_ns = check_start.elapsed().as_nanos() as u64;
+                    self.metrics.risk_check_latency.record(elapsed_ns);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

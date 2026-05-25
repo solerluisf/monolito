@@ -23,21 +23,27 @@ impl WindowManager {
         rsi_period: usize,
         atr_period: usize,
         macd_signal_period: usize,
+        price_window_size: usize,
+        volume_window_size: usize,
+        spread_window_size: usize,
+        return_1_window: usize,
+        return_5_window: usize,
+        return_20_window: usize,
     ) -> Self {
         Self {
             symbol: symbol.to_string(),
-            price_window: RollingWindow::new(50),
-            volume_window: RollingWindow::new(20),
-            spread_window: RollingWindow::new(20),
+            price_window: RollingWindow::new(price_window_size),
+            volume_window: RollingWindow::new(volume_window_size),
+            spread_window: RollingWindow::new(spread_window_size),
             ema_9: EMAState::new(9),
             ema_21: EMAState::new(21),
             ema_50: EMAState::new(50),
             macd_signal_ema: EMAState::new(macd_signal_period),
             rsi_14: RSIState::new(rsi_period),
             atr_14: ATRState::new(atr_period),
-            return_1: RollingWindow::new(1),
-            return_5: RollingWindow::new(5),
-            return_20: RollingWindow::new(20),
+            return_1: RollingWindow::new(return_1_window),
+            return_5: RollingWindow::new(return_5_window),
+            return_20: RollingWindow::new(return_20_window),
             last_mid_price: 0.0,
         }
     }
@@ -76,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_window_manager_update() {
-        let mut wm = WindowManager::new("AAPL", 14, 14, 9);
+        let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.update(150.0, 1000.0, 0.05);
         wm.update(150.1, 1200.0, 0.04);
         wm.update(150.2, 800.0, 0.06);
@@ -88,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_window_manager_returns() {
-        let mut wm = WindowManager::new("MSFT", 14, 14, 9);
+        let mut wm = WindowManager::new("MSFT", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.last_mid_price = 400.0;
         wm.update(401.0, 500.0, 0.04);
         assert!(wm.return_1.len() == 1);

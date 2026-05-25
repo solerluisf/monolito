@@ -39,6 +39,9 @@ pub struct TickReactor {
     total_ticks: Arc<AtomicU64>,
     total_dropped: Arc<AtomicU64>,
     max_batch_size: usize,
+    control_batch_size: usize,
+    sleep_on_empty_us: u64,
+    backpressure_log_interval: u64,
 }
 
 impl TickReactor {
@@ -46,6 +49,10 @@ impl TickReactor {
         tick_rx: Receiver<RawTick>,
         kill_switch: Arc<KillSwitch>,
         metrics: Arc<GlobalMetrics>,
+        max_batch_size: usize,
+        control_batch_size: usize,
+        sleep_on_empty_us: u64,
+        backpressure_log_interval: u64,
     ) -> (Self, Sender<ReactorCommand>) {
         let (control_tx, control_rx) = bounded::<ReactorCommand>(256);
 
@@ -61,7 +68,10 @@ impl TickReactor {
             running: Arc::new(AtomicBool::new(true)),
             total_ticks: Arc::new(AtomicU64::new(0)),
             total_dropped: Arc::new(AtomicU64::new(0)),
-            max_batch_size: 64,
+            max_batch_size,
+            control_batch_size,
+            sleep_on_empty_us,
+            backpressure_log_interval,
         };
 
         (reactor, control_tx)
@@ -110,7 +120,7 @@ impl TickReactor {
     }
 
     fn process_control_batch(&mut self) {
-        for _ in 0..16 {
+        for _ in 0..self.control_batch_size {
             match self.control_rx.try_recv() {
                 Ok(ReactorCommand::Subscribe { symbol, tx }) => {
                     self.subscribe(symbol, tx);
@@ -138,7 +148,7 @@ impl TickReactor {
         }
 
         if batch.is_empty() {
-            std::thread::sleep(std::time::Duration::from_micros(10));
+            std::thread::sleep(std::time::Duration::from_micros(self.sleep_on_empty_us));
             return;
         }
 
@@ -165,7 +175,7 @@ impl TickReactor {
                             self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
                             if let Some(handler) = self.handlers.get_mut(&symbol) {
                                 handler.dropped_count += 1;
-                                if handler.dropped_count % 1000 == 0 {
+                                if handler.dropped_count % self.backpressure_log_interval == 0 {
                                     tracing::warn!(
                                         symbol = %symbol,
                                         dropped = handler.dropped_count,
@@ -214,8 +224,15 @@ pub fn spawn_reactor(
     kill_switch: Arc<KillSwitch>,
     metrics: Arc<GlobalMetrics>,
     core_id: usize,
+    max_batch_size: usize,
+    control_batch_size: usize,
+    sleep_on_empty_us: u64,
+    backpressure_log_interval: u64,
 ) -> (Sender<ReactorCommand>, std::thread::JoinHandle<()>) {
-    let (mut reactor, control_tx) = TickReactor::new(tick_rx, kill_switch, metrics);
+    let (mut reactor, control_tx) = TickReactor::new(
+        tick_rx, kill_switch, metrics,
+        max_batch_size, control_batch_size, sleep_on_empty_us, backpressure_log_interval,
+    );
 
     let handle = spawn_pinned(
         "tick-reactor",
@@ -233,13 +250,17 @@ pub fn spawn_reactor(
 mod tests {
     use super::*;
 
+    fn make_reactor(tick_rx: Receiver<RawTick>) -> (TickReactor, Sender<ReactorCommand>) {
+        let kill_switch = Arc::new(KillSwitch::new());
+        let metrics = Arc::new(GlobalMetrics::new());
+        TickReactor::new(tick_rx, kill_switch, metrics, 64, 16, 10, 1000)
+    }
+
     #[test]
     fn test_reactor_subscribe_and_dispatch() {
         let (tick_tx, tick_rx) = bounded::<RawTick>(1000);
-        let kill_switch = Arc::new(KillSwitch::new());
-        let metrics = Arc::new(GlobalMetrics::new());
 
-        let (mut reactor, control_tx) = TickReactor::new(tick_rx, kill_switch, metrics);
+        let (mut reactor, control_tx) = make_reactor(tick_rx);
 
         let (handler_tx, handler_rx) = bounded::<RawTick>(100);
         reactor.subscribe("AAPL".to_string(), handler_tx);
@@ -267,10 +288,8 @@ mod tests {
     #[test]
     fn test_reactor_unsubscribe() {
         let (tick_tx, tick_rx) = bounded::<RawTick>(1000);
-        let kill_switch = Arc::new(KillSwitch::new());
-        let metrics = Arc::new(GlobalMetrics::new());
 
-        let (mut reactor, _control_tx) = TickReactor::new(tick_rx, kill_switch, metrics);
+        let (mut reactor, _control_tx) = make_reactor(tick_rx);
 
         let (handler_tx, _handler_rx) = bounded::<RawTick>(100);
         reactor.subscribe("AAPL".to_string(), handler_tx);
@@ -299,10 +318,8 @@ mod tests {
     #[test]
     fn test_reactor_back_pressure() {
         let (tick_tx, tick_rx) = bounded::<RawTick>(1000);
-        let kill_switch = Arc::new(KillSwitch::new());
-        let metrics = Arc::new(GlobalMetrics::new());
 
-        let (mut reactor, _control_tx) = TickReactor::new(tick_rx, kill_switch, metrics);
+        let (mut reactor, _control_tx) = make_reactor(tick_rx);
 
         let (handler_tx, _handler_rx) = bounded::<RawTick>(1);
         reactor.subscribe("AAPL".to_string(), handler_tx);

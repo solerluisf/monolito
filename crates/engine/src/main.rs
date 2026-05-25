@@ -3,10 +3,9 @@ mod allocator;
 use std::sync::Arc;
 
 use unified_trading_core::config::EngineConfig;
-use unified_trading_core::api::{create_router, ApiState};
 use unified_trading_core::ws::{create_ws_router, WsState};
 use unified_trading_core::large_pages::{enable_large_pages, log_large_page_result};
-use unified_trading_engine::UnifiedEngine;
+use unified_trading_engine::{UnifiedEngine, ApiState, create_router};
 
 fn load_config() -> EngineConfig {
     let config_path = std::env::var("TRADING_CONFIG")
@@ -83,8 +82,17 @@ fn main() {
     let kill_switch = Arc::clone(&engine.kill_switch);
     let metrics = Arc::clone(&engine.metrics);
     let command_tx = engine.command_channel.tx.clone();
+    let config = Arc::clone(&engine.config);
+    let position_manager = Arc::clone(&engine.position_manager);
+    let strategy_registry = Arc::clone(&engine.strategy_registry);
 
     engine.start();
+
+    let heartbeats = engine.heartbeats.clone();
+    let execution_states = {
+        let states = engine.execution_states.clone();
+        Arc::new(std::sync::Mutex::new(states))
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -96,6 +104,11 @@ fn main() {
             kill_switch: Arc::clone(&kill_switch),
             metrics: Arc::clone(&metrics),
             command_tx: command_tx.clone(),
+            config: Arc::clone(&config),
+            position_manager: Arc::clone(&position_manager),
+            heartbeats: heartbeats.clone(),
+            execution_states: Arc::clone(&execution_states),
+            strategy_registry: Arc::clone(&strategy_registry),
         };
 
         let ws_state = WsState {

@@ -122,6 +122,14 @@ impl RateLimiter {
     pub fn global_tokens_remaining(&self) -> f64 {
         self.global.tokens
     }
+
+    pub fn set_global_rate(&mut self, rate: f64) {
+        self.global = TokenBucket::new(rate, rate);
+    }
+
+    pub fn set_default_per_symbol_rate(&mut self, rate: f64) {
+        self.default_per_symbol_rate = rate;
+    }
 }
 
 #[cfg(test)]

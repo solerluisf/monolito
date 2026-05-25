@@ -60,6 +60,7 @@ impl TradeIntent {
         intent_type: IntentType,
         confidence: f64,
         action_score: f64,
+        ttl_ns: u64,
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -76,7 +77,7 @@ impl TradeIntent {
             confidence,
             action_score,
             timestamp_ns: now,
-            expires_ns: now + 30_000_000_000,
+            expires_ns: now + ttl_ns,
             trace_id: String::new(),
         }
     }
@@ -100,13 +101,28 @@ pub struct StrategyEngine {
     pub entry_cooldown_ms: u64,
     pub exit_cooldown_ms: u64,
     pub prediction_staleness_ns: u64,
+    pub trade_intent_ttl_ns: u64,
     hysteresis_state: AtomicI32,
     last_entry_ns: AtomicU64,
     last_exit_ns: AtomicU64,
     net_position: AtomicU64,
-    max_long_units: f64,
-    max_short_units: f64,
+    pub max_long_units: f64,
+    pub max_short_units: f64,
     pub allow_short: bool,
+    pub urgency_aggressive_threshold: f64,
+    pub urgency_normal_threshold: f64,
+    pub action_score_rsi_weight: f64,
+    pub action_score_macd_weight: f64,
+    pub action_score_volatility_weight: f64,
+    pub atr_penalty_threshold: f64,
+    pub atr_penalty_value: f64,
+    pub rsi_overbought: f64,
+    pub rsi_oversold: f64,
+    pub rsi_neutral: f64,
+    pub confidence_rsi_weight: f64,
+    pub confidence_macd_weight: f64,
+    pub confidence_regime_weight: f64,
+    pub volume_ratio_clamp: f64,
 }
 
 fn f64_to_atomic(val: f64) -> AtomicU64 {
@@ -128,6 +144,23 @@ impl StrategyEngine {
         exit_cooldown_ms: u64,
         prediction_staleness_ns: u64,
         allow_short: bool,
+        trade_intent_ttl_ns: u64,
+        max_long_units: f64,
+        max_short_units: f64,
+        urgency_aggressive_threshold: f64,
+        urgency_normal_threshold: f64,
+        action_score_rsi_weight: f64,
+        action_score_macd_weight: f64,
+        action_score_volatility_weight: f64,
+        atr_penalty_threshold: f64,
+        atr_penalty_value: f64,
+        rsi_overbought: f64,
+        rsi_oversold: f64,
+        rsi_neutral: f64,
+        confidence_rsi_weight: f64,
+        confidence_macd_weight: f64,
+        confidence_regime_weight: f64,
+        volume_ratio_clamp: f64,
     ) -> Self {
         Self {
             symbol: symbol.to_string(),
@@ -139,13 +172,28 @@ impl StrategyEngine {
             entry_cooldown_ms,
             exit_cooldown_ms,
             prediction_staleness_ns,
+            trade_intent_ttl_ns,
             hysteresis_state: AtomicI32::new(0),
             last_entry_ns: AtomicU64::new(0),
             last_exit_ns: AtomicU64::new(0),
             net_position: f64_to_atomic(0.0),
-            max_long_units: 100.0,
-            max_short_units: 100.0,
+            max_long_units,
+            max_short_units,
             allow_short,
+            urgency_aggressive_threshold,
+            urgency_normal_threshold,
+            action_score_rsi_weight,
+            action_score_macd_weight,
+            action_score_volatility_weight,
+            atr_penalty_threshold,
+            atr_penalty_value,
+            rsi_overbought,
+            rsi_oversold,
+            rsi_neutral,
+            confidence_rsi_weight,
+            confidence_macd_weight,
+            confidence_regime_weight,
+            volume_ratio_clamp,
         }
     }
 
@@ -206,6 +254,7 @@ impl StrategyEngine {
                         IntentType::Entry,
                         0.5,
                         score,
+                        self.trade_intent_ttl_ns,
                     ))
                 } else if score < self.short_entry_threshold && self.allow_short {
                     self.hysteresis_state.store(-1, Ordering::Relaxed);
@@ -217,6 +266,7 @@ impl StrategyEngine {
                         IntentType::Entry,
                         0.5,
                         score,
+                        self.trade_intent_ttl_ns,
                     ))
                 } else {
                     None
@@ -233,6 +283,7 @@ impl StrategyEngine {
                         IntentType::Exit,
                         0.5,
                         score,
+                        self.trade_intent_ttl_ns,
                     ))
                 } else {
                     None
@@ -249,6 +300,7 @@ impl StrategyEngine {
                         IntentType::Exit,
                         0.5,
                         score,
+                        self.trade_intent_ttl_ns,
                     ))
                 } else {
                     None
@@ -327,6 +379,7 @@ impl Strategy for StrategyEngine {
             entry_cooldown_ms: self.entry_cooldown_ms,
             exit_cooldown_ms: self.exit_cooldown_ms,
             prediction_staleness_ns: self.prediction_staleness_ns,
+            trade_intent_ttl_ns: self.trade_intent_ttl_ns,
             hysteresis_state: AtomicI32::new(self.hysteresis_state.load(Ordering::Relaxed)),
             last_entry_ns: AtomicU64::new(self.last_entry_ns.load(Ordering::Relaxed)),
             last_exit_ns: AtomicU64::new(self.last_exit_ns.load(Ordering::Relaxed)),
@@ -334,6 +387,20 @@ impl Strategy for StrategyEngine {
             max_long_units: self.max_long_units,
             max_short_units: self.max_short_units,
             allow_short: self.allow_short,
+            urgency_aggressive_threshold: self.urgency_aggressive_threshold,
+            urgency_normal_threshold: self.urgency_normal_threshold,
+            action_score_rsi_weight: self.action_score_rsi_weight,
+            action_score_macd_weight: self.action_score_macd_weight,
+            action_score_volatility_weight: self.action_score_volatility_weight,
+            atr_penalty_threshold: self.atr_penalty_threshold,
+            atr_penalty_value: self.atr_penalty_value,
+            rsi_overbought: self.rsi_overbought,
+            rsi_oversold: self.rsi_oversold,
+            rsi_neutral: self.rsi_neutral,
+            confidence_rsi_weight: self.confidence_rsi_weight,
+            confidence_macd_weight: self.confidence_macd_weight,
+            confidence_regime_weight: self.confidence_regime_weight,
+            volume_ratio_clamp: self.volume_ratio_clamp,
         })
     }
 }
@@ -343,6 +410,15 @@ mod tests {
     use super::*;
     use model::Prediction;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_engine() -> StrategyEngine {
+        StrategyEngine::new(
+            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
+            30_000_000_000, 100.0, 100.0, 0.85, 0.5,
+            0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
+            0.3, 0.4, 0.3, 0.3,
+        )
+    }
 
     fn make_pred(score: f64, confidence: f64) -> Prediction {
         let now = SystemTime::now()
@@ -362,9 +438,7 @@ mod tests {
 
     #[test]
     fn test_strategy_long_entry() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-        );
+        let engine = make_engine();
         let pred = make_pred(0.8, 0.9);
         let intent = engine.evaluate(&pred);
         assert!(intent.is_some());
@@ -374,9 +448,7 @@ mod tests {
 
     #[test]
     fn test_strategy_no_signal_below_threshold() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-        );
+        let engine = make_engine();
         let pred = make_pred(0.3, 0.9);
         let intent = engine.evaluate(&pred);
         assert!(intent.is_none());
@@ -384,9 +456,7 @@ mod tests {
 
     #[test]
     fn test_strategy_low_confidence_rejected() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-        );
+        let engine = make_engine();
         let pred = make_pred(0.8, 0.3);
         let intent = engine.evaluate(&pred);
         assert!(intent.is_none());
@@ -394,9 +464,7 @@ mod tests {
 
     #[test]
     fn test_strategy_hysteresis_prevents_flip() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-        );
+        let engine = make_engine();
         let pred_long = make_pred(0.8, 0.9);
         engine.evaluate(&pred_long);
         assert_eq!(engine.hysteresis_state.load(Ordering::Relaxed), 1);
@@ -408,9 +476,7 @@ mod tests {
 
     #[test]
     fn test_strategy_cooldown() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-        );
+        let engine = make_engine();
         let pred = make_pred(0.8, 0.9);
         engine.evaluate(&pred);
 
@@ -421,9 +487,7 @@ mod tests {
 
     #[test]
     fn test_strategy_position_gate() {
-        let engine = StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
-        );
+        let engine = make_engine();
         engine.update_position(101.0);
         let pred = make_pred(0.8, 0.9);
         let intent = engine.evaluate(&pred);

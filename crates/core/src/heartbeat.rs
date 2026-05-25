@@ -103,6 +103,10 @@ impl ThreadHeartbeatMonitor {
         HeartbeatHandle { timestamp_ns: ts }
     }
 
+    pub fn heartbeats(&self) -> Arc<parking_lot::RwLock<HashMap<String, Arc<AtomicU64>>>> {
+        Arc::clone(&self.heartbeats)
+    }
+
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {

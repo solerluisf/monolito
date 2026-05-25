@@ -28,9 +28,10 @@ pub enum JournalCommand {
 }
 
 pub struct JournalWriter {
-    tx: Sender<JournalCommand>,
+    pub tx: Sender<JournalCommand>,
     handle: Option<thread::JoinHandle<()>>,
     write_count: Arc<AtomicU64>,
+    metrics: Arc<GlobalMetrics>,
 }
 
 impl JournalWriter {
@@ -51,12 +52,13 @@ impl JournalWriter {
         ));
 
         let wc = Arc::clone(&write_count);
+        let metrics_clone = Arc::clone(&metrics);
         let handle = spawn_pinned(
             "journal",
             core_id,
             ThreadPriority::Normal,
             move || {
-                Self::run_loop(rx, &file_path, flush_interval_ms, &metrics, &wc);
+                Self::run_loop(rx, &file_path, flush_interval_ms, &metrics_clone, &wc);
             },
         );
 
@@ -64,6 +66,7 @@ impl JournalWriter {
             tx,
             handle: Some(handle),
             write_count,
+            metrics,
         }
     }
 
@@ -87,6 +90,7 @@ impl JournalWriter {
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(JournalCommand::Write(entry)) => {
+                    metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
                     let line = format_entry(&entry);
                     if let Err(e) = writeln!(writer, "{}", line) {
                         eprintln!("Journal write error: {}", e);
@@ -102,6 +106,7 @@ impl JournalWriter {
                     }
                 }
                 Ok(JournalCommand::Flush { ack }) => {
+                    metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
                     let _ = writer.flush();
                     let _ = ack.send(());
                     last_flush = std::time::Instant::now();
@@ -121,6 +126,7 @@ impl JournalWriter {
     }
 
     pub fn write(&self, entry: JournalEntry) -> Result<(), &'static str> {
+        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
         self.tx
             .send(JournalCommand::Write(entry))
             .map_err(|_| "Journal channel closed")
@@ -130,12 +136,17 @@ impl JournalWriter {
     /// Blocks until the flush is complete.
     pub fn flush_sync(&self) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = bounded::<()>(1);
+        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
+        let flush_start = std::time::Instant::now();
         self.tx
             .send(JournalCommand::Flush { ack: ack_tx })
             .map_err(|_| "Journal channel closed")?;
-        ack_rx
+        let result = ack_rx
             .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Flush timeout")
+            .map_err(|_| "Flush timeout");
+        let elapsed_ns = flush_start.elapsed().as_nanos() as u64;
+        self.metrics.journal_flush_latency.record(elapsed_ns);
+        result
     }
 
     pub fn write_count(&self) -> u64 {

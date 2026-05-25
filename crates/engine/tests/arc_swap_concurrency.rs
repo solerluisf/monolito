@@ -95,6 +95,7 @@ fn test_arc_swap_strategy_hot_swap() {
                     strategy::IntentType::Entry,
                     0.8,
                     prediction.action_score as f64,
+                    30_000_000_000,
                 ))
             } else {
                 None

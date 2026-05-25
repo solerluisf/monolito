@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::collections::HashMap;
 
 /// Histogram buckets for latency measurements (in nanoseconds)
 /// Buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms
@@ -43,6 +44,12 @@ impl LatencyHistogram {
             self.buckets[5].load(Ordering::Relaxed),
         ]
     }
+
+    pub fn reset(&self) {
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct GlobalMetrics {
@@ -70,6 +77,20 @@ pub struct GlobalMetrics {
     pub risk_check_latency: LatencyHistogram,
     pub journal_flush_latency: LatencyHistogram,
     pub broker_send_latency: LatencyHistogram,
+    pub feed_latency: LatencyHistogram,
+    pub broker_round_trip_latency: LatencyHistogram,
+    // Channel depth gauges (approximate, since crossbeam doesn't expose len())
+    pub feature_channel_depth: AtomicI64,
+    pub risk_channel_depth: AtomicI64,
+    pub decision_channel_depth: AtomicI64,
+    pub lifecycle_channel_depth: AtomicI64,
+    pub command_channel_depth: AtomicI64,
+    pub journal_channel_depth: AtomicI64,
+    // Per-symbol counters
+    pub per_symbol_ticks: std::sync::Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_features: std::sync::Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_intents_approved: std::sync::Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_intents_rejected: std::sync::Mutex<HashMap<String, AtomicU64>>,
 }
 
 impl GlobalMetrics {
@@ -98,6 +119,18 @@ impl GlobalMetrics {
             risk_check_latency: LatencyHistogram::new(),
             journal_flush_latency: LatencyHistogram::new(),
             broker_send_latency: LatencyHistogram::new(),
+            feed_latency: LatencyHistogram::new(),
+            broker_round_trip_latency: LatencyHistogram::new(),
+            feature_channel_depth: AtomicI64::new(0),
+            risk_channel_depth: AtomicI64::new(0),
+            decision_channel_depth: AtomicI64::new(0),
+            lifecycle_channel_depth: AtomicI64::new(0),
+            command_channel_depth: AtomicI64::new(0),
+            journal_channel_depth: AtomicI64::new(0),
+            per_symbol_ticks: std::sync::Mutex::new(HashMap::new()),
+            per_symbol_features: std::sync::Mutex::new(HashMap::new()),
+            per_symbol_intents_approved: std::sync::Mutex::new(HashMap::new()),
+            per_symbol_intents_rejected: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,9 +154,49 @@ impl GlobalMetrics {
         self.journal_writes.store(0, Ordering::Relaxed);
         self.heartbeat_misses.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
+        self.tick_to_intent_latency.reset();
+        self.risk_check_latency.reset();
+        self.journal_flush_latency.reset();
+        self.broker_send_latency.reset();
+        self.feed_latency.reset();
+        self.broker_round_trip_latency.reset();
+        self.feature_channel_depth.store(0, Ordering::Relaxed);
+        self.risk_channel_depth.store(0, Ordering::Relaxed);
+        self.decision_channel_depth.store(0, Ordering::Relaxed);
+        self.lifecycle_channel_depth.store(0, Ordering::Relaxed);
+        self.command_channel_depth.store(0, Ordering::Relaxed);
+        self.journal_channel_depth.store(0, Ordering::Relaxed);
+        self.per_symbol_ticks.lock().unwrap().clear();
+        self.per_symbol_features.lock().unwrap().clear();
+        self.per_symbol_intents_approved.lock().unwrap().clear();
+        self.per_symbol_intents_rejected.lock().unwrap().clear();
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let per_symbol_ticks = {
+            let map = self.per_symbol_ticks.lock().unwrap();
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
+        let per_symbol_features = {
+            let map = self.per_symbol_features.lock().unwrap();
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
+        let per_symbol_intents_approved = {
+            let map = self.per_symbol_intents_approved.lock().unwrap();
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
+        let per_symbol_intents_rejected = {
+            let map = self.per_symbol_intents_rejected.lock().unwrap();
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
         MetricsSnapshot {
             ticks_processed: self.ticks_processed.load(Ordering::Relaxed),
             features_computed: self.features_computed.load(Ordering::Relaxed),
@@ -148,7 +221,47 @@ impl GlobalMetrics {
             risk_check_latency: self.risk_check_latency.snapshot(),
             journal_flush_latency: self.journal_flush_latency.snapshot(),
             broker_send_latency: self.broker_send_latency.snapshot(),
+            feed_latency: self.feed_latency.snapshot(),
+            broker_round_trip_latency: self.broker_round_trip_latency.snapshot(),
+            feature_channel_depth: self.feature_channel_depth.load(Ordering::Relaxed),
+            risk_channel_depth: self.risk_channel_depth.load(Ordering::Relaxed),
+            decision_channel_depth: self.decision_channel_depth.load(Ordering::Relaxed),
+            lifecycle_channel_depth: self.lifecycle_channel_depth.load(Ordering::Relaxed),
+            command_channel_depth: self.command_channel_depth.load(Ordering::Relaxed),
+            journal_channel_depth: self.journal_channel_depth.load(Ordering::Relaxed),
+            per_symbol_ticks,
+            per_symbol_features,
+            per_symbol_intents_approved,
+            per_symbol_intents_rejected,
         }
+    }
+
+    pub fn increment_per_symbol_tick(&self, symbol: &str) {
+        let mut map = self.per_symbol_ticks.lock().unwrap();
+        map.entry(symbol.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_per_symbol_feature(&self, symbol: &str) {
+        let mut map = self.per_symbol_features.lock().unwrap();
+        map.entry(symbol.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_per_symbol_intent_approved(&self, symbol: &str) {
+        let mut map = self.per_symbol_intents_approved.lock().unwrap();
+        map.entry(symbol.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_per_symbol_intent_rejected(&self, symbol: &str) {
+        let mut map = self.per_symbol_intents_rejected.lock().unwrap();
+        map.entry(symbol.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -178,6 +291,20 @@ pub struct MetricsSnapshot {
     pub risk_check_latency: [u64; 6],
     pub journal_flush_latency: [u64; 6],
     pub broker_send_latency: [u64; 6],
+    pub feed_latency: [u64; 6],
+    pub broker_round_trip_latency: [u64; 6],
+    // Channel depth gauges
+    pub feature_channel_depth: i64,
+    pub risk_channel_depth: i64,
+    pub decision_channel_depth: i64,
+    pub lifecycle_channel_depth: i64,
+    pub command_channel_depth: i64,
+    pub journal_channel_depth: i64,
+    // Per-symbol counters
+    pub per_symbol_ticks: std::collections::HashMap<String, u64>,
+    pub per_symbol_features: std::collections::HashMap<String, u64>,
+    pub per_symbol_intents_approved: std::collections::HashMap<String, u64>,
+    pub per_symbol_intents_rejected: std::collections::HashMap<String, u64>,
 }
 
 impl Default for GlobalMetrics {

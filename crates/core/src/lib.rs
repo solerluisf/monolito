@@ -5,7 +5,6 @@ pub mod journal;
 pub mod heartbeat;
 pub mod command_channel;
 pub mod config_watcher;
-pub mod api;
 pub mod ws;
 pub mod threading;
 pub mod validator;
@@ -16,15 +15,18 @@ pub mod channel_utils;
 pub mod large_pages;
 
 pub use kill_switch::KillSwitch;
-pub use metrics::GlobalMetrics;
+pub use metrics::{GlobalMetrics, MetricsSnapshot};
 pub use config::EngineConfig;
 pub use journal::JournalWriter;
 pub use journal::JournalEntry;
 pub use journal::JournalCommand;
 pub use heartbeat::ThreadHeartbeatMonitor;
-pub use command_channel::{CommandChannel, CommandActor, ControlCommand, ControlResponse, StrategyParams};
+pub use command_channel::{CommandChannel, CommandActor, ControlCommand, ControlResponse, StrategyParams,
+    RiskConfigUpdate, BrokerConfigUpdate, FeatureConfigUpdate, ModelConfigUpdate, JournalConfigUpdate,
+    AssetConfigUpdate, ExecutionDefaultsUpdate, CircuitBreakerConfigUpdate, RateLimitConfigUpdate,
+    ChannelConfigUpdate, ReactorConfigUpdate, ValidatorConfigUpdate
+};
 pub use config_watcher::ConfigWatcher;
-pub use api::{create_router, ApiState};
 pub use ws::{create_ws_router, WsState};
 pub use threading::{pin_to_core, set_thread_priority, spawn_pinned, ThreadPriority};
 pub use validator::RequestValidator;

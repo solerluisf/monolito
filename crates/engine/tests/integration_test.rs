@@ -102,13 +102,18 @@ fn test_full_pipeline_tick_to_intent() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("AAPL");
-    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
+    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
         "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
+        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
+        0.3, 0.4, 0.3, 0.3,
     );
 
     let pred_engine = PredictionEngine::new(feature_rx, "AAPL");
-    let inference_engine = InferenceEngine::new(128);
+    let inference_engine = InferenceEngine::new(
+        128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+    );
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
@@ -133,6 +138,11 @@ fn test_full_pipeline_tick_to_intent() {
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
+        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
+        Arc::new(unified_trading_core::IdempotencyStore::new()),
+        unified_trading_core::validator::RequestValidator::default(),
     );
     let _exec_handle = exec_manager.start(0);
 
@@ -176,13 +186,18 @@ fn test_pipeline_with_burst_ticks() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("MSFT");
-    let feature_engine = FeatureEngine::new("MSFT", 14, 14, 9, 20);
+    let feature_engine = FeatureEngine::new("MSFT", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
         "MSFT", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
+        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
+        0.3, 0.4, 0.3, 0.3,
     );
 
     let pred_engine = PredictionEngine::new(feature_rx, "MSFT");
-    let inference_engine = InferenceEngine::new(128);
+    let inference_engine = InferenceEngine::new(
+        128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+    );
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
@@ -202,11 +217,16 @@ fn test_pipeline_with_burst_ticks() {
         decision_rx,
         lifecycle_tx,
         Arc::new(MockExecutionPort),
-        100.0,
-        50.0,
+        10.0,
+        5.0,
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
+        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
+        Arc::new(unified_trading_core::IdempotencyStore::new()),
+        unified_trading_core::validator::RequestValidator::default(),
     );
     let _exec_handle = exec_manager.start(0);
 
@@ -250,13 +270,18 @@ fn test_kill_switch_stops_pipeline() {
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
     let normalizer = Normalizer::new("AAPL");
-    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20);
+    let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
         "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
+        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
+        0.3, 0.4, 0.3, 0.3,
     );
 
     let pred_engine = PredictionEngine::new(feature_rx, "AAPL");
-    let inference_engine = InferenceEngine::new(128);
+    let inference_engine = InferenceEngine::new(
+        128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+    );
 
     let _pred_handle = pred_engine.start(move |features| {
         inference_engine.predict(features)
@@ -281,6 +306,11 @@ fn test_kill_switch_stops_pipeline() {
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
         Arc::new(PositionManager::new()),
+        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
+        Arc::new(unified_trading_core::IdempotencyStore::new()),
+        unified_trading_core::validator::RequestValidator::default(),
     );
     let _exec_handle = exec_manager.start(0);
 

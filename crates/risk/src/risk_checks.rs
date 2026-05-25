@@ -62,11 +62,11 @@ pub struct RiskEngine {
 }
 
 impl RiskEngine {
-    pub fn new(config: RiskConfig, initial_equity: f64) -> Self {
+    pub fn new(config: RiskConfig, initial_equity: f64, flat_threshold: f64) -> Self {
         let max_order_rate = config.max_order_rate_per_sec as f64;
         Self {
             config,
-            portfolio: PortfolioManager::new(initial_equity),
+            portfolio: PortfolioManager::new(initial_equity, flat_threshold),
             idempotency_store: std::collections::HashSet::new(),
             order_rate_tokens: max_order_rate,
             order_rate_last_refill: 0,
@@ -138,7 +138,7 @@ impl RiskEngine {
             .unwrap_or_default()
             .as_nanos() as u64;
         let age_ns = now.saturating_sub(request.timestamp_ns);
-        if age_ns > 2_000_000_000 {
+        if age_ns > self.config.risk_intent_staleness_ns {
             return Some(RiskDecision::rejected(
                 &request.request_id,
                 "Intent expired",
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn test_risk_engine_approve() {
         let config = RiskConfig::default();
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
         let request = make_request("AAPL", 10.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(decision.approved);
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn test_risk_engine_kill_switch() {
         let config = RiskConfig::default();
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
         let request = make_request("AAPL", 10.0, 150.0);
         let decision = engine.check(&request, true);
         assert!(!decision.approved);
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_risk_engine_idempotency() {
         let config = RiskConfig::default();
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
         let request = make_request("AAPL", 10.0, 150.0);
         let id = request.intent_id.clone();
 
@@ -321,7 +321,7 @@ mod tests {
     fn test_risk_engine_position_limit() {
         let mut config = RiskConfig::default();
         config.max_position_per_symbol = 100.0;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let request = make_request("AAPL", 100.0, 150.0);
         let decision = engine.check(&request, false);
@@ -332,7 +332,7 @@ mod tests {
     fn test_risk_engine_exposure_limit() {
         let mut config = RiskConfig::default();
         config.max_portfolio_exposure = 100.0;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let request = make_request("AAPL", 10.0, 150.0);
         let decision = engine.check(&request, false);
@@ -343,7 +343,7 @@ mod tests {
     fn test_risk_engine_leverage_limit() {
         let mut config = RiskConfig::default();
         config.max_leverage = 0.001;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let request = make_request("AAPL", 100.0, 150.0);
         let decision = engine.check(&request, false);
@@ -354,7 +354,7 @@ mod tests {
     fn test_risk_engine_volatility_limit() {
         let mut config = RiskConfig::default();
         config.max_volatility = 0.02;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let mut request = make_request("AAPL", 10.0, 150.0);
         request.current_volatility = 0.05; // Above threshold
@@ -368,7 +368,7 @@ mod tests {
     fn test_risk_engine_spread_limit() {
         let mut config = RiskConfig::default();
         config.max_spread_bps = 20.0;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let mut request = make_request("AAPL", 10.0, 150.0);
         request.current_spread_bps = 50.0; // Above threshold
@@ -382,7 +382,7 @@ mod tests {
     fn test_risk_engine_volatility_passes() {
         let mut config = RiskConfig::default();
         config.max_volatility = 0.05;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let mut request = make_request("AAPL", 10.0, 150.0);
         request.current_volatility = 0.01; // Below threshold
@@ -395,7 +395,7 @@ mod tests {
     fn test_risk_engine_spread_passes() {
         let mut config = RiskConfig::default();
         config.max_spread_bps = 50.0;
-        let mut engine = RiskEngine::new(config, 100_000.0);
+        let mut engine = RiskEngine::new(config, 100_000.0, 0.001);
 
         let mut request = make_request("AAPL", 10.0, 150.0);
         request.current_spread_bps = 10.0; // Below threshold

@@ -42,16 +42,18 @@ pub struct PortfolioManager {
     pub peak_equity: f64,
     pub current_equity: f64,
     pub initial_equity: f64,
+    pub flat_threshold: f64,
 }
 
 impl PortfolioManager {
-    pub fn new(initial_equity: f64) -> Self {
+    pub fn new(initial_equity: f64, flat_threshold: f64) -> Self {
         Self {
             positions: HashMap::new(),
             open_orders: HashMap::new(),
             peak_equity: initial_equity,
             current_equity: initial_equity,
             initial_equity,
+            flat_threshold,
         }
     }
 
@@ -79,7 +81,7 @@ impl PortfolioManager {
         pos.net_position += delta;
         pos.current_price = fill_price;
 
-        if pos.net_position.abs() < 0.001 {
+        if pos.net_position.abs() < self.flat_threshold {
             pos.avg_entry_price = 0.0;
         }
 
@@ -153,14 +155,14 @@ mod tests {
 
     #[test]
     fn test_portfolio_manager_initial() {
-        let pm = PortfolioManager::new(100_000.0);
+        let pm = PortfolioManager::new(100_000.0, 0.001);
         assert_eq!(pm.current_equity, 100_000.0);
         assert_eq!(pm.peak_equity, 100_000.0);
     }
 
     #[test]
     fn test_portfolio_manager_buy_position() {
-        let mut pm = PortfolioManager::new(100_000.0);
+        let mut pm = PortfolioManager::new(100_000.0, 0.001);
         pm.update_position("AAPL", 150.0, 10.0, true);
         let pos = pm.get_position("AAPL").unwrap();
         assert_eq!(pos.net_position, 10.0);
@@ -169,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_portfolio_manager_sell_position() {
-        let mut pm = PortfolioManager::new(100_000.0);
+        let mut pm = PortfolioManager::new(100_000.0, 0.001);
         pm.update_position("AAPL", 150.0, 10.0, true);
         pm.update_position("AAPL", 155.0, 10.0, false);
         let pos = pm.get_position("AAPL").unwrap();
@@ -179,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_portfolio_manager_drawdown() {
-        let mut pm = PortfolioManager::new(100_000.0);
+        let mut pm = PortfolioManager::new(100_000.0, 0.001);
         pm.update_position("AAPL", 150.0, 100.0, true);
         pm.update_market_price("AAPL", 140.0);
         let metrics = pm.get_metrics();
@@ -188,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_portfolio_manager_metrics() {
-        let mut pm = PortfolioManager::new(100_000.0);
+        let mut pm = PortfolioManager::new(100_000.0, 0.001);
         pm.update_position("AAPL", 150.0, 10.0, true);
         let metrics = pm.get_metrics();
         assert!(metrics.gross_exposure > 0.0);
@@ -197,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_portfolio_manager_net_position() {
-        let mut pm = PortfolioManager::new(100_000.0);
+        let mut pm = PortfolioManager::new(100_000.0, 0.001);
         pm.update_position("AAPL", 150.0, 10.0, true);
         pm.update_position("AAPL", 152.0, 5.0, true);
         assert_eq!(pm.net_position("AAPL"), 15.0);
