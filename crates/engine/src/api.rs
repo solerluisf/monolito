@@ -1,13 +1,16 @@
 use axum::{
     extract::State,
+    extract::Request,
     http::StatusCode,
-    response::{Json, Response},
+    middleware::Next,
+    response::{Json, Response, IntoResponse},
     routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use unified_trading_core::KillSwitch;
 use unified_trading_core::GlobalMetrics;
@@ -27,6 +30,40 @@ use gateway::CircuitBreaker;
 use model::ModelRegistry;
 
 #[derive(Clone)]
+pub struct SimpleRateLimiter {
+    inner: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    max_requests: u32,
+    window_secs: u64,
+}
+
+impl SimpleRateLimiter {
+    pub fn new(max_requests: u32, window_secs: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            max_requests,
+            window_secs,
+        }
+    }
+
+    pub fn check(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(self.window_secs);
+        let mut map = self.inner.lock().unwrap();
+        let entry = map.entry(key.to_string()).or_insert((now, 0));
+
+        if now.duration_since(entry.0) > window {
+            *entry = (now, 1);
+            true
+        } else if entry.1 >= self.max_requests {
+            false
+        } else {
+            entry.1 += 1;
+            true
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ApiState {
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
@@ -37,6 +74,8 @@ pub struct ApiState {
     pub execution_states: Arc<std::sync::Mutex<HashMap<String, crate::engine::ExecutionSharedState>>>,
     pub strategy_registry: Arc<std::sync::Mutex<HashMap<String, crate::engine::StrategySwapRef>>>,
     pub model_registry: Arc<ModelRegistry>,
+    pub api_key: String,
+    pub rate_limiter: SimpleRateLimiter,
 }
 
 // ------------------------------------------------------------------
@@ -442,6 +481,50 @@ pub struct RateLimiterStatusResponse {
 }
 
 // ------------------------------------------------------------------
+// Middleware
+// ------------------------------------------------------------------
+
+async fn auth_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    if method == axum::http::Method::POST || method == axum::http::Method::PUT || method == axum::http::Method::DELETE {
+        if !state.api_key.is_empty() {
+            let auth_header = req.headers().get("Authorization")
+                .and_then(|h| h.to_str().ok());
+            let expected = format!("Bearer {}", state.api_key);
+            match auth_header {
+                Some(header) if header == expected => {}
+                _ => return StatusCode::UNAUTHORIZED.into_response(),
+            }
+        }
+    }
+    next.run(req).await
+}
+
+async fn rate_limit_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    if method == axum::http::Method::POST || method == axum::http::Method::PUT || method == axum::http::Method::DELETE {
+        let ip = req.headers()
+            .get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .unwrap_or("unknown")
+            .to_string();
+        if !state.rate_limiter.check(&ip) {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+    }
+    next.run(req).await
+}
+
+// ------------------------------------------------------------------
 // Router
 // ------------------------------------------------------------------
 
@@ -491,6 +574,8 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/status/kill-switch/orders", get(kill_switch_orders_handler))
         .route("/status/per-symbol", get(per_symbol_stats_handler))
         .route("/shutdown", post(shutdown_handler))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
 
@@ -1309,6 +1394,8 @@ mod tests {
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
         }
     }
 
@@ -1392,6 +1479,8 @@ mod tests {
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
         };
         let app = create_router(state);
         let body = serde_json::json!({ "active": true });
@@ -1440,6 +1529,8 @@ mod tests {
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
         };
         let app = create_router(state);
         let response = app
@@ -1470,6 +1561,8 @@ mod tests {
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
         };
         let app = create_router(state);
         let body = serde_json::json!({
@@ -1513,6 +1606,8 @@ mod tests {
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
         };
         let app = create_router(state);
         let body = serde_json::json!({
@@ -1559,5 +1654,114 @@ mod tests {
             }
             _ => panic!("Expected SwapStrategy command"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_without_key() {
+        let (tx, _rx) = crossbeam_channel::bounded::<ControlCommand>(100);
+        let state = ApiState {
+            kill_switch: Arc::new(KillSwitch::new()),
+            metrics: Arc::new(GlobalMetrics::new()),
+            command_tx: tx,
+            config: Arc::new(RwLock::new(EngineConfig::default())),
+            position_manager: Arc::new(PositionManager::new()),
+            heartbeats: None,
+            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
+            api_key: "secret-key".to_string(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
+        };
+        let app = create_router(state);
+        let body = serde_json::json!({ "active": true });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control/kill-switch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_allows_with_valid_key() {
+        let (tx, rx) = crossbeam_channel::bounded::<ControlCommand>(100);
+        let state = ApiState {
+            kill_switch: Arc::new(KillSwitch::new()),
+            metrics: Arc::new(GlobalMetrics::new()),
+            command_tx: tx,
+            config: Arc::new(RwLock::new(EngineConfig::default())),
+            position_manager: Arc::new(PositionManager::new()),
+            heartbeats: None,
+            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
+            api_key: "secret-key".to_string(),
+            rate_limiter: SimpleRateLimiter::new(10, 1),
+        };
+        let app = create_router(state);
+        let body = serde_json::json!({ "active": true });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/control/kill-switch")
+                    .header("content-type", "application/json")
+                    .header("Authorization", "Bearer secret-key")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cmd = rx.try_recv().unwrap();
+        assert!(matches!(cmd, ControlCommand::SetKillSwitch(true)));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_throttles_requests() {
+        let (tx, _rx) = crossbeam_channel::bounded::<ControlCommand>(100);
+        let state = ApiState {
+            kill_switch: Arc::new(KillSwitch::new()),
+            metrics: Arc::new(GlobalMetrics::new()),
+            command_tx: tx,
+            config: Arc::new(RwLock::new(EngineConfig::default())),
+            position_manager: Arc::new(PositionManager::new()),
+            heartbeats: None,
+            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
+            api_key: String::new(),
+            rate_limiter: SimpleRateLimiter::new(1, 60),
+        };
+        let app = create_router(state);
+        let body = serde_json::json!({ "active": true });
+
+        // First request should pass
+        let response1 = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/control/kill-switch")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(response1.status(), StatusCode::OK);
+
+        // Second request should be rate limited
+        let response2 = app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/control/kill-switch")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(response2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

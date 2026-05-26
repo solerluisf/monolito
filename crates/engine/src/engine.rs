@@ -18,7 +18,7 @@ use parking_lot::RwLock;
 use market_data::{Normalizer, RawTick};
 use feature::{FeatureEngine, FeatureVector};
 use model::{PredictionEngine, InferenceEngine};
-use strategy::{StrategyEngine, TradeIntent};
+use strategy::{StrategyEngine, TradeIntent, SizeHint};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent, OrderTracker, RateLimiter};
 use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker};
@@ -172,12 +172,21 @@ impl AssetProcessor {
         // Calculate implied volatility from prediction confidence (simplified)
         let current_volatility = (1.0 - prediction.confidence as f64).max(0.0);
 
+        let quantity = match signal.size_hint {
+            SizeHint::Units(u) => u as f64,
+            SizeHint::Notional(n) if mid_price > 0.0 => n / mid_price,
+            _ => {
+                tracing::warn!(size_hint = ?signal.size_hint, "Unsupported size hint, falling back to default quantity");
+                self.default_order_quantity
+            }
+        };
+
         RiskCheckRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             symbol: signal.symbol.clone(),
             intent_id: signal.intent_id.clone(),
             side: format!("{:?}", signal.side),
-            quantity: self.default_order_quantity,
+            quantity,
             price: mid_price,
             timestamp_ns: now,
             current_volatility,

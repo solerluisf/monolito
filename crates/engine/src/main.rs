@@ -101,6 +101,9 @@ fn main() {
         .expect("Failed to create tokio runtime");
 
     rt.block_on(async {
+        let api_key = config.read().api_key.clone();
+        let rate_limit = config.read().control_plane_rate_limit;
+
         let api_state = ApiState {
             kill_switch: Arc::clone(&kill_switch),
             metrics: Arc::clone(&metrics),
@@ -111,6 +114,8 @@ fn main() {
             execution_states: Arc::clone(&execution_states),
             strategy_registry: Arc::clone(&strategy_registry),
             model_registry: Arc::new(model::ModelRegistry::new()),
+            api_key,
+            rate_limiter: unified_trading_engine::SimpleRateLimiter::new(rate_limit, 1),
         };
 
         let ws_state = WsState {

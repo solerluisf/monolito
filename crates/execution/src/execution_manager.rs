@@ -100,7 +100,7 @@ impl ExecutionManager {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let symbol = decision.request_id.chars().take(4).collect::<String>();
+        let symbol = decision.request.symbol.clone();
 
         if let Err(e) = self.validator.validate_symbol(&symbol) {
             tracing::warn!("Validation failed for {}: {}", symbol, e);
@@ -125,17 +125,22 @@ impl ExecutionManager {
 
         let order_id = uuid::Uuid::new_v4().to_string();
 
-        let side = if symbol.starts_with("req-") {
-            OrderSide::Buy
-        } else {
-            OrderSide::Sell
+        let side = match decision.request.side.as_str() {
+            "Long" | "CloseShort" | "Buy" | "buy" => OrderSide::Buy,
+            "Short" | "CloseLong" | "Sell" | "sell" => OrderSide::Sell,
+            other => {
+                tracing::warn!("Unexpected side '{}', defaulting to Sell", other);
+                OrderSide::Sell
+            }
         };
+
+        let quantity = decision.request.quantity;
 
         let cmd = OrderCommand {
             order_id: order_id.clone(),
             symbol: symbol.clone(),
             side: side.clone(),
-            quantity: 1.0,
+            quantity,
             order_type: OrderType::Market,
             limit_price: None,
             stop_price: None,
@@ -149,7 +154,7 @@ impl ExecutionManager {
             let entry = JournalEntry::Order {
                 symbol: symbol.clone(),
                 timestamp_ns: now,
-                data: format!("order_id={},side={:?},qty=1.0,decision={}", order_id, side, decision.request_id),
+                data: format!("order_id={},side={:?},qty={},decision={}", order_id, side, quantity, decision.request_id),
             };
             
             // Write to journal first
@@ -320,12 +325,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        RiskDecision {
+        let request = risk::RiskCheckRequest {
             request_id: "req-1".to_string(),
+            symbol: "AAPL".to_string(),
+            intent_id: "intent-1".to_string(),
+            side: "buy".to_string(),
+            quantity: 10.0,
+            price: 150.0,
+            timestamp_ns: now,
+            current_volatility: 0.01,
+            current_spread_bps: 10.0,
+        };
+        RiskDecision {
+            request_id: request.request_id.clone(),
             approved: true,
             rejection_reason: None,
             check_index: 14,
             timestamp_ns: now,
+            request,
         }
     }
 

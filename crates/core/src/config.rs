@@ -16,6 +16,8 @@ pub struct EngineConfig {
     pub channel_config: ChannelConfig,
     pub reactor_config: ReactorConfig,
     pub validator_config: ValidatorConfig,
+    pub api_key: String,
+    pub control_plane_rate_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +209,8 @@ impl Default for EngineConfig {
             channel_config: ChannelConfig::default(),
             reactor_config: ReactorConfig::default(),
             validator_config: ValidatorConfig::default(),
+            api_key: String::new(),
+            control_plane_rate_limit: 10,
         }
     }
 }

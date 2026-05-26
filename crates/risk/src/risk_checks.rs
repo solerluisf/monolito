@@ -23,12 +23,13 @@ pub struct RiskDecision {
     pub rejection_reason: Option<String>,
     pub check_index: usize,
     pub timestamp_ns: u64,
+    pub request: RiskCheckRequest,
 }
 
 impl RiskDecision {
-    pub fn approved(request_id: &str) -> Self {
+    pub fn approved(request: &RiskCheckRequest) -> Self {
         Self {
-            request_id: request_id.to_string(),
+            request_id: request.request_id.clone(),
             approved: true,
             rejection_reason: None,
             check_index: 14,
@@ -36,12 +37,13 @@ impl RiskDecision {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64,
+            request: request.clone(),
         }
     }
 
-    pub fn rejected(request_id: &str, reason: &str, check_index: usize) -> Self {
+    pub fn rejected(request: &RiskCheckRequest, reason: &str, check_index: usize) -> Self {
         Self {
-            request_id: request_id.to_string(),
+            request_id: request.request_id.clone(),
             approved: false,
             rejection_reason: Some(reason.to_string()),
             check_index,
@@ -49,6 +51,7 @@ impl RiskDecision {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64,
+            request: request.clone(),
         }
     }
 }
@@ -107,13 +110,13 @@ impl RiskEngine {
         }
 
         self.idempotency_store.insert(request.intent_id.clone());
-        RiskDecision::approved(&request.request_id)
+        RiskDecision::approved(request)
     }
 
     fn check_kill_switch(&mut self, _request: &RiskCheckRequest, kill_switch_active: bool) -> Option<RiskDecision> {
         if kill_switch_active {
             return Some(RiskDecision::rejected(
-                &_request.request_id,
+                _request,
                 "Kill switch active",
                 0,
             ));
@@ -124,7 +127,7 @@ impl RiskEngine {
     fn check_idempotency(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
         if self.idempotency_store.contains(&request.intent_id) {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Duplicate intent_id",
                 1,
             ));
@@ -140,7 +143,7 @@ impl RiskEngine {
         let age_ns = now.saturating_sub(request.timestamp_ns);
         if age_ns > self.config.risk_intent_staleness_ns {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Intent expired",
                 2,
             ));
@@ -163,7 +166,7 @@ impl RiskEngine {
 
         if self.order_rate_tokens < 1.0 {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Order rate limit exceeded",
                 3,
             ));
@@ -177,7 +180,7 @@ impl RiskEngine {
         let new_position = current + request.quantity;
         if new_position.abs() * request.price > self.config.max_position_per_symbol {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Position limit exceeded",
                 4,
             ));
@@ -190,7 +193,7 @@ impl RiskEngine {
         let new_exposure = metrics.gross_exposure + request.quantity * request.price;
         if new_exposure > self.config.max_portfolio_exposure {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Portfolio exposure limit exceeded",
                 5,
             ));
@@ -208,7 +211,7 @@ impl RiskEngine {
         };
         if new_leverage > self.config.max_leverage {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Leverage limit exceeded",
                 6,
             ));
@@ -220,7 +223,7 @@ impl RiskEngine {
         let metrics = self.portfolio.get_metrics();
         if metrics.drawdown_pct > self.config.max_drawdown_pct {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 "Drawdown limit exceeded",
                 7,
             ));
@@ -231,7 +234,7 @@ impl RiskEngine {
     fn check_volatility(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
         if request.current_volatility > self.config.max_volatility {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 &format!("Volatility too high: {:.4} > {:.4}", request.current_volatility, self.config.max_volatility),
                 8,
             ));
@@ -242,7 +245,7 @@ impl RiskEngine {
     fn check_spread(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
         if request.current_spread_bps > self.config.max_spread_bps {
             return Some(RiskDecision::rejected(
-                &request.request_id,
+                request,
                 &format!("Spread too wide: {:.2} bps > {:.2} bps", request.current_spread_bps, self.config.max_spread_bps),
                 9,
             ));
