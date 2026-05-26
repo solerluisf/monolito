@@ -6,7 +6,7 @@ use crossbeam_channel::bounded;
 
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
-use unified_trading_core::position_manager::PositionManager;
+use unified_trading_core::portfolio_manager::PortfolioManager;
 use market_data::{Normalizer, RawTick};
 use feature::FeatureEngine;
 use model::{InferenceEngine, PredictionEngine};
@@ -123,7 +123,7 @@ fn test_full_pipeline_tick_to_intent() {
         risk_rx,
         decision_tx,
         Default::default(),
-        100_000.0,
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
@@ -137,9 +137,9 @@ fn test_full_pipeline_tick_to_intent() {
         5.0,
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
-        Arc::new(PositionManager::new()),
-        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
-        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
+        Arc::new(parking_lot::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(parking_lot::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
@@ -207,7 +207,7 @@ fn test_pipeline_with_burst_ticks() {
         risk_rx,
         decision_tx,
         Default::default(),
-        100_000.0,
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
@@ -221,9 +221,9 @@ fn test_pipeline_with_burst_ticks() {
         5.0,
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
-        Arc::new(PositionManager::new()),
-        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
-        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
+        Arc::new(parking_lot::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(parking_lot::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
@@ -291,7 +291,7 @@ fn test_kill_switch_stops_pipeline() {
         risk_rx,
         decision_tx,
         Default::default(),
-        100_000.0,
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
     );
@@ -305,9 +305,9 @@ fn test_kill_switch_stops_pipeline() {
         5.0,
         Arc::clone(&metrics),
         Arc::clone(&kill_switch),
-        Arc::new(PositionManager::new()),
-        Arc::new(std::sync::Mutex::new(execution::OrderTracker::new())),
-        Arc::new(std::sync::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
+        Arc::new(PortfolioManager::new(100_000.0, 0.001)),
+        Arc::new(parking_lot::Mutex::new(execution::OrderTracker::new())),
+        Arc::new(parking_lot::Mutex::new(execution::RateLimiter::new(10.0, 5.0))),
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),

@@ -1,4 +1,4 @@
-use feature::FeatureVector;
+use feature::{FeatureVector, FeatureIndex};
 use crate::prediction_engine::Prediction;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,14 +57,14 @@ impl InferenceEngine {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let mid_price = features.get("mid_price").unwrap_or(0.0) as f32;
-        let rsi = features.get("rsi_14").unwrap_or(self.rsi_neutral as f32);
-        let macd_hist = features.get("macd_histogram").unwrap_or(0.0);
-        let atr = features.get("atr_14").unwrap_or(0.0);
-        let volume_ratio = features.get("volume_ratio").unwrap_or(1.0);
-        let regime = features.get("regime").unwrap_or(0.0);
-        let regime_strength = features.get("regime_strength").unwrap_or(0.0);
-        let confidence = features.get("confidence").unwrap_or(0.5);
+        let mid_price = features.get(FeatureIndex::MidPrice);
+        let rsi = features.get(FeatureIndex::Rsi14);
+        let macd_hist = features.get(FeatureIndex::MacdHistogram);
+        let atr = features.get(FeatureIndex::Atr14);
+        let volume_ratio = features.get(FeatureIndex::VolumeRatio);
+        let regime = features.get(FeatureIndex::Regime);
+        let regime_strength = features.get(FeatureIndex::RegimeStrength);
+        let confidence = features.get(FeatureIndex::Confidence);
 
         let action_score = self.compute_action_score(rsi, macd_hist, atr, volume_ratio);
         let forecast = self.compute_forecast(macd_hist, rsi, volume_ratio);
@@ -136,15 +136,15 @@ mod tests {
     }
 
     fn make_features() -> FeatureVector {
-        let mut fv = FeatureVector::new("AAPL", 1000, 20);
-        fv.push("mid_price", 150.0);
-        fv.push("rsi_14", 55.0);
-        fv.push("macd_histogram", 0.3);
-        fv.push("atr_14", 0.5);
-        fv.push("volume_ratio", 1.2);
-        fv.push("regime", 1.0);
-        fv.push("regime_strength", 0.6);
-        fv.push("confidence", 0.7);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 55.0);
+        fv.set(FeatureIndex::MacdHistogram, 0.3);
+        fv.set(FeatureIndex::Atr14, 0.5);
+        fv.set(FeatureIndex::VolumeRatio, 1.2);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.6);
+        fv.set(FeatureIndex::Confidence, 0.7);
         fv
     }
 
@@ -164,15 +164,15 @@ mod tests {
     #[test]
     fn test_inference_engine_bullish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new("AAPL", 1000, 20);
-        fv.push("mid_price", 150.0);
-        fv.push("rsi_14", 25.0);
-        fv.push("macd_histogram", 0.5);
-        fv.push("atr_14", 0.3);
-        fv.push("volume_ratio", 1.5);
-        fv.push("regime", 1.0);
-        fv.push("regime_strength", 0.8);
-        fv.push("confidence", 0.9);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 25.0);
+        fv.set(FeatureIndex::MacdHistogram, 0.5);
+        fv.set(FeatureIndex::Atr14, 0.3);
+        fv.set(FeatureIndex::VolumeRatio, 1.5);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.8);
+        fv.set(FeatureIndex::Confidence, 0.9);
 
         let pred = engine.predict(&fv);
         assert!(pred.action_score > 0.0);
@@ -181,15 +181,15 @@ mod tests {
     #[test]
     fn test_inference_engine_bearish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new("AAPL", 1000, 20);
-        fv.push("mid_price", 150.0);
-        fv.push("rsi_14", 75.0);
-        fv.push("macd_histogram", -0.5);
-        fv.push("atr_14", 0.3);
-        fv.push("volume_ratio", 1.5);
-        fv.push("regime", 0.0);
-        fv.push("regime_strength", 0.3);
-        fv.push("confidence", 0.8);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 75.0);
+        fv.set(FeatureIndex::MacdHistogram, -0.5);
+        fv.set(FeatureIndex::Atr14, 0.3);
+        fv.set(FeatureIndex::VolumeRatio, 1.5);
+        fv.set(FeatureIndex::Regime, 0.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.3);
+        fv.set(FeatureIndex::Confidence, 0.8);
 
         let pred = engine.predict(&fv);
         assert!(pred.action_score < 0.0);
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_inference_engine_missing_features() {
         let engine = make_engine();
-        let fv = FeatureVector::new("AAPL", 1000, 20);
+        let fv = FeatureVector::new("AAPL", 1000);
         let pred = engine.predict(&fv);
         assert!(pred.forecast >= -1.0 && pred.forecast <= 1.0);
     }

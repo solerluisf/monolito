@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::collections::HashMap;
+use parking_lot::Mutex;
 
 /// Histogram buckets for latency measurements (in nanoseconds)
 /// Buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms
@@ -61,6 +62,7 @@ pub struct GlobalMetrics {
     pub intents_rejected: AtomicU64,
     pub dropped_intents: AtomicU64,
     pub stale_predictions: AtomicU64,
+    pub model_fallback_activations: AtomicU64,
     pub orders_submitted: AtomicU64,
     pub orders_filled: AtomicU64,
     pub orders_cancelled: AtomicU64,
@@ -89,10 +91,10 @@ pub struct GlobalMetrics {
     pub command_channel_depth: AtomicI64,
     pub journal_channel_depth: AtomicI64,
     // Per-symbol counters
-    pub per_symbol_ticks: std::sync::Mutex<HashMap<String, AtomicU64>>,
-    pub per_symbol_features: std::sync::Mutex<HashMap<String, AtomicU64>>,
-    pub per_symbol_intents_approved: std::sync::Mutex<HashMap<String, AtomicU64>>,
-    pub per_symbol_intents_rejected: std::sync::Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_ticks: Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_features: Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_intents_approved: Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_intents_rejected: Mutex<HashMap<String, AtomicU64>>,
 }
 
 impl GlobalMetrics {
@@ -106,6 +108,7 @@ impl GlobalMetrics {
             intents_rejected: AtomicU64::new(0),
             dropped_intents: AtomicU64::new(0),
             stale_predictions: AtomicU64::new(0),
+            model_fallback_activations: AtomicU64::new(0),
             orders_submitted: AtomicU64::new(0),
             orders_filled: AtomicU64::new(0),
             orders_cancelled: AtomicU64::new(0),
@@ -131,10 +134,10 @@ impl GlobalMetrics {
             lifecycle_channel_depth: AtomicI64::new(0),
             command_channel_depth: AtomicI64::new(0),
             journal_channel_depth: AtomicI64::new(0),
-            per_symbol_ticks: std::sync::Mutex::new(HashMap::new()),
-            per_symbol_features: std::sync::Mutex::new(HashMap::new()),
-            per_symbol_intents_approved: std::sync::Mutex::new(HashMap::new()),
-            per_symbol_intents_rejected: std::sync::Mutex::new(HashMap::new()),
+            per_symbol_ticks: Mutex::new(HashMap::new()),
+            per_symbol_features: Mutex::new(HashMap::new()),
+            per_symbol_intents_approved: Mutex::new(HashMap::new()),
+            per_symbol_intents_rejected: Mutex::new(HashMap::new()),
         }
     }
 
@@ -147,6 +150,7 @@ impl GlobalMetrics {
         self.intents_rejected.store(0, Ordering::Relaxed);
         self.dropped_intents.store(0, Ordering::Relaxed);
         self.stale_predictions.store(0, Ordering::Relaxed);
+        self.model_fallback_activations.store(0, Ordering::Relaxed);
         self.orders_submitted.store(0, Ordering::Relaxed);
         self.orders_filled.store(0, Ordering::Relaxed);
         self.orders_cancelled.store(0, Ordering::Relaxed);
@@ -172,33 +176,33 @@ impl GlobalMetrics {
         self.lifecycle_channel_depth.store(0, Ordering::Relaxed);
         self.command_channel_depth.store(0, Ordering::Relaxed);
         self.journal_channel_depth.store(0, Ordering::Relaxed);
-        self.per_symbol_ticks.lock().unwrap().clear();
-        self.per_symbol_features.lock().unwrap().clear();
-        self.per_symbol_intents_approved.lock().unwrap().clear();
-        self.per_symbol_intents_rejected.lock().unwrap().clear();
+        self.per_symbol_ticks.lock().clear();
+        self.per_symbol_features.lock().clear();
+        self.per_symbol_intents_approved.lock().clear();
+        self.per_symbol_intents_rejected.lock().clear();
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         let per_symbol_ticks = {
-            let map = self.per_symbol_ticks.lock().unwrap();
+            let map = self.per_symbol_ticks.lock();
             map.iter()
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
         };
         let per_symbol_features = {
-            let map = self.per_symbol_features.lock().unwrap();
+            let map = self.per_symbol_features.lock();
             map.iter()
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
         };
         let per_symbol_intents_approved = {
-            let map = self.per_symbol_intents_approved.lock().unwrap();
+            let map = self.per_symbol_intents_approved.lock();
             map.iter()
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
         };
         let per_symbol_intents_rejected = {
-            let map = self.per_symbol_intents_rejected.lock().unwrap();
+            let map = self.per_symbol_intents_rejected.lock();
             map.iter()
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
@@ -212,6 +216,7 @@ impl GlobalMetrics {
             intents_rejected: self.intents_rejected.load(Ordering::Relaxed),
             dropped_intents: self.dropped_intents.load(Ordering::Relaxed),
             stale_predictions: self.stale_predictions.load(Ordering::Relaxed),
+            model_fallback_activations: self.model_fallback_activations.load(Ordering::Relaxed),
             orders_submitted: self.orders_submitted.load(Ordering::Relaxed),
             orders_filled: self.orders_filled.load(Ordering::Relaxed),
             orders_cancelled: self.orders_cancelled.load(Ordering::Relaxed),
@@ -245,28 +250,28 @@ impl GlobalMetrics {
     }
 
     pub fn increment_per_symbol_tick(&self, symbol: &str) {
-        let mut map = self.per_symbol_ticks.lock().unwrap();
+        let mut map = self.per_symbol_ticks.lock();
         map.entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn increment_per_symbol_feature(&self, symbol: &str) {
-        let mut map = self.per_symbol_features.lock().unwrap();
+        let mut map = self.per_symbol_features.lock();
         map.entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn increment_per_symbol_intent_approved(&self, symbol: &str) {
-        let mut map = self.per_symbol_intents_approved.lock().unwrap();
+        let mut map = self.per_symbol_intents_approved.lock();
         map.entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn increment_per_symbol_intent_rejected(&self, symbol: &str) {
-        let mut map = self.per_symbol_intents_rejected.lock().unwrap();
+        let mut map = self.per_symbol_intents_rejected.lock();
         map.entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
@@ -283,6 +288,7 @@ pub struct MetricsSnapshot {
     pub intents_rejected: u64,
     pub dropped_intents: u64,
     pub stale_predictions: u64,
+    pub model_fallback_activations: u64,
     pub orders_submitted: u64,
     pub orders_filled: u64,
     pub orders_cancelled: u64,

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,7 +45,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let was_half_open = inner.state == State::HalfOpen;
         inner.failures = 0;
         inner.state = State::Closed;
@@ -57,7 +57,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.failures += 1;
         let threshold = self.failure_threshold_val();
 
@@ -76,7 +76,7 @@ impl CircuitBreaker {
     }
 
     pub fn trip(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -89,7 +89,7 @@ impl CircuitBreaker {
     }
 
     pub fn can_execute(&self) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
 
         match inner.state {
             State::Closed => true,
@@ -114,7 +114,7 @@ impl CircuitBreaker {
     }
 
     pub fn reset(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.failures = 0;
         inner.state = State::Closed;
         self.is_open.store(false, Ordering::SeqCst);
@@ -131,11 +131,11 @@ impl CircuitBreaker {
     }
 
     pub fn failure_count(&self) -> u64 {
-        self.inner.lock().unwrap().failures
+        self.inner.lock().failures
     }
 
     pub fn state_name(&self) -> &'static str {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         match inner.state {
             State::Closed => "closed",
             State::Open => "open",

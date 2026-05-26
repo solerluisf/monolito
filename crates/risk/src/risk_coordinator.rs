@@ -6,9 +6,9 @@ use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::config::RiskConfig;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
+use unified_trading_core::portfolio_manager::PortfolioManager;
 
 use crate::risk_checks::{RiskCheckRequest, RiskDecision, RiskEngine};
-use crate::portfolio_manager::PortfolioManager;
 
 pub struct RiskCoordinator {
     pub request_rx: Receiver<RiskCheckRequest>,
@@ -24,15 +24,14 @@ impl RiskCoordinator {
         request_rx: Receiver<RiskCheckRequest>,
         decision_tx: Sender<RiskDecision>,
         config: RiskConfig,
-        initial_equity: f64,
+        portfolio: Arc<PortfolioManager>,
         kill_switch: Arc<KillSwitch>,
         metrics: Arc<GlobalMetrics>,
     ) -> Self {
-        let flat_threshold = config.portfolio_flat_threshold;
         Self {
             request_rx,
             decision_tx,
-            engine: RiskEngine::new(config, initial_equity, flat_threshold),
+            engine: RiskEngine::new(config, portfolio),
             kill_switch,
             metrics,
             running: Arc::new(AtomicBool::new(true)),
@@ -73,6 +72,13 @@ impl RiskCoordinator {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
+
+        // Drain remaining risk requests so they are not lost in the queue
+        while let Ok(request) = self.request_rx.try_recv() {
+            self.metrics.risk_channel_depth.fetch_sub(1, Ordering::Relaxed);
+            let decision = self.engine.check(&request, true); // reject under shutdown
+            let _ = self.decision_tx.try_send(decision);
+        }
     }
 
     pub fn start(mut self, core_id: usize) -> std::thread::JoinHandle<()> {
@@ -88,14 +94,6 @@ impl RiskCoordinator {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-    }
-
-    pub fn update_fill(&mut self, symbol: &str, price: f64, quantity: f64, is_buy: bool) {
-        self.engine.update_fill(symbol, price, quantity, is_buy);
-    }
-
-    pub fn update_market_price(&mut self, symbol: &str, price: f64) {
-        self.engine.update_market_price(symbol, price);
     }
 }
 
@@ -133,7 +131,7 @@ mod tests {
             req_rx,
             dec_tx,
             RiskConfig::default(),
-            100_000.0,
+            Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             Arc::clone(&kill_switch),
             Arc::clone(&metrics),
         );
@@ -159,7 +157,7 @@ mod tests {
             req_rx,
             dec_tx,
             RiskConfig::default(),
-            100_000.0,
+            Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             Arc::clone(&kill_switch),
             Arc::clone(&metrics),
         );

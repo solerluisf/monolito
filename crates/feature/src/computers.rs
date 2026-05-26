@@ -1,4 +1,4 @@
-use crate::feature_engine::{FeatureVector, FeatureSnapshot, RegimeLabel};
+use crate::feature_engine::{FeatureVector, FeatureSnapshot, RegimeLabel, FeatureIndex, FEATURE_COUNT};
 use crate::window_manager::WindowManager;
 use market_data::NormalizedTick;
 
@@ -146,29 +146,29 @@ impl FeatureEngine {
             tick.spread,
         );
 
-        let mut fv = FeatureVector::new(&self.symbol, tick.timestamp_ns, self.feature_capacity);
+        let mut fv = FeatureVector::new(&self.symbol, tick.timestamp_ns);
 
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&self.window_manager, tick);
-        fv.push("mid_price", mid);
-        fv.push("spread_bps", spread_bps);
-        fv.push("spread_abs", spread_abs);
+        fv.set(FeatureIndex::MidPrice, mid);
+        fv.set(FeatureIndex::SpreadBps, spread_bps);
+        fv.set(FeatureIndex::SpreadAbs, spread_abs);
 
         let (rsi, macd_line, macd_signal, macd_histogram) =
             MomentumComputer::compute(&mut self.window_manager);
-        fv.push("rsi_14", rsi);
-        fv.push("macd_line", macd_line);
-        fv.push("macd_signal", macd_signal);
-        fv.push("macd_histogram", macd_histogram);
+        fv.set(FeatureIndex::Rsi14, rsi);
+        fv.set(FeatureIndex::MacdLine, macd_line);
+        fv.set(FeatureIndex::MacdSignal, macd_signal);
+        fv.set(FeatureIndex::MacdHistogram, macd_histogram);
 
         let (atr, std_dev) = VolatilityComputer::compute(&mut self.window_manager);
-        fv.push("atr_14", atr);
-        fv.push("rolling_std", std_dev);
+        fv.set(FeatureIndex::Atr14, atr);
+        fv.set(FeatureIndex::RollingStd, std_dev);
 
         let volume_ratio = VolumeComputer::compute(&self.window_manager, tick);
-        fv.push("volume_ratio", volume_ratio);
+        fv.set(FeatureIndex::VolumeRatio, volume_ratio);
 
         let ofi = MicrostructureComputer::compute_order_flow_imbalance(tick);
-        fv.push("order_flow_imbalance", ofi);
+        fv.set(FeatureIndex::OrderFlowImbalance, ofi);
 
         let (regime, regime_strength) = RegimeComputer::compute(
             &self.window_manager,
@@ -179,12 +179,12 @@ impl FeatureEngine {
             self.regime_strength_atr_divisor,
             self.regime_trending_threshold,
         );
-        fv.push("regime", regime as i32 as f32);
-        fv.push("regime_strength", regime_strength);
+        fv.set(FeatureIndex::Regime, regime as i32 as f32);
+        fv.set(FeatureIndex::RegimeStrength, regime_strength);
 
-        fv.push("ema_9", self.window_manager.ema_9.value as f32);
-        fv.push("ema_21", self.window_manager.ema_21.value as f32);
-        fv.push("ema_50", self.window_manager.ema_50.value as f32);
+        fv.set(FeatureIndex::Ema9, self.window_manager.ema_9.value as f32);
+        fv.set(FeatureIndex::Ema21, self.window_manager.ema_21.value as f32);
+        fv.set(FeatureIndex::Ema50, self.window_manager.ema_50.value as f32);
 
         fv
     }
@@ -195,24 +195,24 @@ impl FeatureEngine {
         FeatureSnapshot {
             symbol: self.symbol.clone(),
             timestamp_ns: tick.timestamp_ns,
-            mid_price: fv.get("mid_price").unwrap_or(0.0),
-            spread_bps: fv.get("spread_bps").unwrap_or(0.0),
-            rsi_14: fv.get("rsi_14").unwrap_or(50.0),
-            macd_line: fv.get("macd_line").unwrap_or(0.0),
-            macd_signal: fv.get("macd_signal").unwrap_or(0.0),
-            macd_histogram: fv.get("macd_histogram").unwrap_or(0.0),
-            atr_14: fv.get("atr_14").unwrap_or(0.0),
-            ema_9: fv.get("ema_9").unwrap_or(0.0),
-            ema_21: fv.get("ema_21").unwrap_or(0.0),
-            ema_50: fv.get("ema_50").unwrap_or(0.0),
-            volume_ratio: fv.get("volume_ratio").unwrap_or(1.0),
-            order_flow_imbalance: fv.get("order_flow_imbalance").unwrap_or(0.0),
-            regime: match fv.get("regime").unwrap_or(0.0) as i32 {
+            mid_price: fv.get(FeatureIndex::MidPrice),
+            spread_bps: fv.get(FeatureIndex::SpreadBps),
+            rsi_14: fv.get(FeatureIndex::Rsi14),
+            macd_line: fv.get(FeatureIndex::MacdLine),
+            macd_signal: fv.get(FeatureIndex::MacdSignal),
+            macd_histogram: fv.get(FeatureIndex::MacdHistogram),
+            atr_14: fv.get(FeatureIndex::Atr14),
+            ema_9: fv.get(FeatureIndex::Ema9),
+            ema_21: fv.get(FeatureIndex::Ema21),
+            ema_50: fv.get(FeatureIndex::Ema50),
+            volume_ratio: fv.get(FeatureIndex::VolumeRatio),
+            order_flow_imbalance: fv.get(FeatureIndex::OrderFlowImbalance),
+            regime: match fv.get(FeatureIndex::Regime) as i32 {
                 0 => RegimeLabel::Ranging,
                 1 => RegimeLabel::Trending,
                 _ => RegimeLabel::Volatile,
             },
-            regime_strength: fv.get("regime_strength").unwrap_or(0.0),
+            regime_strength: fv.get(FeatureIndex::RegimeStrength),
         }
     }
 }
@@ -242,9 +242,9 @@ mod tests {
         let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
         let tick = make_tick("AAPL", 1000, 150.0, 0.05);
         let fv = engine.compute(&tick);
-        assert!(fv.len() > 10);
-        assert!(fv.get("mid_price").is_some());
-        assert!(fv.get("rsi_14").is_some());
+        assert_eq!(fv.len(), FEATURE_COUNT);
+        assert!(fv.get(FeatureIndex::MidPrice) > 0.0);
+        assert!(fv.get(FeatureIndex::Rsi14) > 0.0);
     }
 
     #[test]
@@ -265,8 +265,8 @@ mod tests {
         }
         let tick = make_tick("AAPL", 20000, 150.2, 0.05);
         let fv = engine.compute(&tick);
-        assert!(fv.get("ema_9").is_some());
-        assert!(fv.get("atr_14").is_some());
+        assert!(fv.get(FeatureIndex::Ema9) > 0.0);
+        assert!(fv.get(FeatureIndex::Atr14) > 0.0);
     }
 
     #[test]

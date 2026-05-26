@@ -175,7 +175,7 @@ pub struct AlpacaWebSocketFeed {
     pub reconnect_delay_ms: u64,
     pub max_reconnect_attempts: u32,
     /// Buffer of recent ticks for replay on reconnect
-    pub replay_buffer: std::sync::Mutex<std::collections::VecDeque<RawTick>>,
+    pub replay_buffer: parking_lot::Mutex<std::collections::VecDeque<RawTick>>,
     pub max_replay_ticks: usize,
 }
 
@@ -191,7 +191,7 @@ impl AlpacaWebSocketFeed {
             connected: Arc::new(AtomicBool::new(false)),
             reconnect_delay_ms: 1000,
             max_reconnect_attempts: 10,
-            replay_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: 1000,
         }
     }
@@ -361,7 +361,7 @@ impl AlpacaWebSocketFeed {
     }
 
     fn buffer_tick(&self, tick: RawTick) {
-        let mut buf = self.replay_buffer.lock().unwrap();
+        let mut buf = self.replay_buffer.lock();
         if buf.len() >= self.max_replay_ticks {
             buf.pop_front();
         }
@@ -370,7 +370,7 @@ impl AlpacaWebSocketFeed {
 
     fn replay_ticks(&self) {
         let ticks: Vec<RawTick> = {
-            let mut buf = self.replay_buffer.lock().unwrap();
+        let mut buf = self.replay_buffer.lock();
             buf.drain(..).collect()
         };
         if !ticks.is_empty() {
@@ -441,7 +441,7 @@ impl AlpacaWebSocketFeed {
             connected: Arc::clone(&self.connected),
             reconnect_delay_ms: self.reconnect_delay_ms,
             max_reconnect_attempts: self.max_reconnect_attempts,
-            replay_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: self.max_replay_ticks,
         };
 

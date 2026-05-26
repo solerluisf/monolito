@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 pub struct KillSwitch {
     active: AtomicBool,
@@ -27,7 +28,7 @@ impl KillSwitch {
         let start = std::time::Instant::now();
         
         let order_count = {
-            let orders = self.open_orders.lock().unwrap();
+            let orders = self.open_orders.lock();
             orders.len()
         };
 
@@ -74,7 +75,7 @@ impl KillSwitch {
     }
 
     pub fn track_open_order(&self, order_id: &str) -> bool {
-        let mut orders = self.open_orders.lock().unwrap();
+        let mut orders = self.open_orders.lock();
         let added = orders.insert(order_id.to_string());
         if added {
             tracing::debug!("Tracking open order: {}", order_id);
@@ -83,7 +84,7 @@ impl KillSwitch {
     }
 
     pub fn remove_open_order(&self, order_id: &str) -> bool {
-        let mut orders = self.open_orders.lock().unwrap();
+        let mut orders = self.open_orders.lock();
         let removed = orders.remove(order_id);
         if removed {
             tracing::debug!("Order no longer tracked: {}", order_id);
@@ -92,15 +93,15 @@ impl KillSwitch {
     }
 
     pub fn open_order_count(&self) -> usize {
-        self.open_orders.lock().unwrap().len()
+        self.open_orders.lock().len()
     }
 
     pub fn get_open_orders(&self) -> Vec<String> {
-        self.open_orders.lock().unwrap().iter().cloned().collect()
+        self.open_orders.lock().iter().cloned().collect()
     }
 
     pub fn is_order_tracked(&self, order_id: &str) -> bool {
-        self.open_orders.lock().unwrap().contains(order_id)
+        self.open_orders.lock().contains(order_id)
     }
 }
 

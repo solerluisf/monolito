@@ -84,7 +84,7 @@ fn main() {
     let metrics = Arc::clone(&engine.metrics);
     let command_tx = engine.command_channel.tx.clone();
     let config = Arc::clone(&engine.config);
-    let position_manager = Arc::clone(&engine.position_manager);
+    let portfolio_manager = Arc::clone(&engine.portfolio_manager);
     let strategy_registry = Arc::clone(&engine.strategy_registry);
 
     engine.start();
@@ -92,7 +92,7 @@ fn main() {
     let heartbeats = engine.heartbeats.clone();
     let execution_states = {
         let states = engine.execution_states.clone();
-        Arc::new(std::sync::Mutex::new(states))
+        Arc::new(parking_lot::Mutex::new(states))
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -109,7 +109,7 @@ fn main() {
             metrics: Arc::clone(&metrics),
             command_tx: command_tx.clone(),
             config: Arc::clone(&config),
-            position_manager: Arc::clone(&position_manager),
+            portfolio_manager: Arc::clone(&portfolio_manager),
             heartbeats: heartbeats.clone(),
             execution_states: Arc::clone(&execution_states),
             strategy_registry: Arc::clone(&strategy_registry),

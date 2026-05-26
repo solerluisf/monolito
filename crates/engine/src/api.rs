@@ -8,7 +8,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use unified_trading_core::{
     ExecutionDefaultsUpdate, CircuitBreakerConfigUpdate, RateLimitConfigUpdate,
     ChannelConfigUpdate, ReactorConfigUpdate, ValidatorConfigUpdate,
 };
-use unified_trading_core::PositionManager;
+use unified_trading_core::PortfolioManager;
 use unified_trading_core::EngineConfig;
 use parking_lot::RwLock;
 
@@ -31,7 +31,7 @@ use model::ModelRegistry;
 
 #[derive(Clone)]
 pub struct SimpleRateLimiter {
-    inner: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    inner: Arc<parking_lot::Mutex<HashMap<String, (Instant, u32)>>>,
     max_requests: u32,
     window_secs: u64,
 }
@@ -39,7 +39,7 @@ pub struct SimpleRateLimiter {
 impl SimpleRateLimiter {
     pub fn new(max_requests: u32, window_secs: u64) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             max_requests,
             window_secs,
         }
@@ -48,7 +48,7 @@ impl SimpleRateLimiter {
     pub fn check(&self, key: &str) -> bool {
         let now = Instant::now();
         let window = Duration::from_secs(self.window_secs);
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         let entry = map.entry(key.to_string()).or_insert((now, 0));
 
         if now.duration_since(entry.0) > window {
@@ -69,10 +69,10 @@ pub struct ApiState {
     pub metrics: Arc<GlobalMetrics>,
     pub command_tx: crossbeam_channel::Sender<ControlCommand>,
     pub config: Arc<RwLock<EngineConfig>>,
-    pub position_manager: Arc<PositionManager>,
+    pub portfolio_manager: Arc<PortfolioManager>,
     pub heartbeats: Option<Arc<parking_lot::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>>>,
-    pub execution_states: Arc<std::sync::Mutex<HashMap<String, crate::engine::ExecutionSharedState>>>,
-    pub strategy_registry: Arc<std::sync::Mutex<HashMap<String, crate::engine::StrategySwapRef>>>,
+    pub execution_states: Arc<parking_lot::Mutex<HashMap<String, crate::engine::ExecutionSharedState>>>,
+    pub strategy_registry: Arc<parking_lot::Mutex<HashMap<String, crate::engine::StrategySwapRef>>>,
     pub model_registry: Arc<ModelRegistry>,
     pub api_key: String,
     pub rate_limiter: SimpleRateLimiter,
@@ -437,7 +437,7 @@ pub struct ValidatorConfigResponse {
 
 #[derive(Serialize)]
 pub struct PortfolioResponse {
-    pub positions: Vec<unified_trading_core::position_manager::Position>,
+    pub positions: Vec<unified_trading_core::portfolio_manager::Position>,
     pub total_unrealized_pnl: f64,
     pub total_realized_pnl: f64,
     pub total_market_value: f64,
@@ -855,7 +855,7 @@ async fn prometheus_handler(State(state): State<ApiState>) -> Response<String> {
 
     output.push_str("# HELP circuit_breaker_state Circuit breaker state per symbol (1=open, 0=closed)\n");
     output.push_str("# TYPE circuit_breaker_state gauge\n");
-    let cb_states = state.execution_states.lock().unwrap();
+    let cb_states = state.execution_states.lock();
     for (symbol, exec_state) in cb_states.iter() {
         let is_open = exec_state.circuit_breaker.is_open.load(std::sync::atomic::Ordering::Relaxed);
         output.push_str(&format!("circuit_breaker_state{{symbol=\"{}\"}} {}\n", symbol, if is_open { 1 } else { 0 }));
@@ -911,7 +911,7 @@ async fn shutdown_handler(State(state): State<ApiState>) -> StatusCode {
 
 // Circuit breaker handlers
 async fn circuit_breaker_status(State(state): State<ApiState>) -> Json<Vec<CircuitBreakerStatusResponse>> {
-    let states = state.execution_states.lock().unwrap();
+    let states = state.execution_states.lock();
     let mut result = Vec::new();
     for (symbol, exec_state) in states.iter() {
         let cb = &exec_state.circuit_breaker;
@@ -1287,17 +1287,17 @@ async fn swap_model_handler(
 // Portfolio status handler
 async fn portfolio_handler(State(state): State<ApiState>) -> Json<PortfolioResponse> {
     Json(PortfolioResponse {
-        positions: state.position_manager.get_all_positions(),
-        total_unrealized_pnl: state.position_manager.total_unrealized_pnl(),
-        total_realized_pnl: state.position_manager.total_realized_pnl(),
-        total_market_value: state.position_manager.total_market_value(),
-        position_count: state.position_manager.position_count(),
+        positions: state.portfolio_manager.get_all_positions(),
+        total_unrealized_pnl: state.portfolio_manager.total_unrealized_pnl(),
+        total_realized_pnl: state.portfolio_manager.total_realized_pnl(),
+        total_market_value: state.portfolio_manager.total_market_value(),
+        position_count: state.portfolio_manager.position_count(),
     })
 }
 
 // Idempotency status handler
 async fn idempotency_status_handler(State(state): State<ApiState>) -> Json<IdempotencyStatusResponse> {
-    let states = state.execution_states.lock().unwrap();
+    let states = state.execution_states.lock();
     let total_size: usize = states.values().map(|s| s.idempotency_store.len()).sum();
     let total_capacity: usize = states.values().map(|s| s.idempotency_store.capacity()).sum();
     Json(IdempotencyStatusResponse {
@@ -1308,10 +1308,10 @@ async fn idempotency_status_handler(State(state): State<ApiState>) -> Json<Idemp
 
 // Orders status handler
 async fn orders_handler(State(state): State<ApiState>) -> Json<OrdersResponse> {
-    let states = state.execution_states.lock().unwrap();
+    let states = state.execution_states.lock();
     let mut all_orders = Vec::new();
     for (_, exec_state) in states.iter() {
-        let tracker = exec_state.order_tracker.lock().unwrap();
+        let tracker = exec_state.order_tracker.lock();
         for (_, order) in tracker.orders.iter() {
             all_orders.push(order.clone());
         }
@@ -1328,10 +1328,10 @@ async fn tracked_orders_handler(State(state): State<ApiState>) -> Json<TrackedOr
 
 // Rate limiter status handler
 async fn rate_limiter_status_handler(State(state): State<ApiState>) -> Json<Vec<RateLimiterStatusResponse>> {
-    let states = state.execution_states.lock().unwrap();
+    let states = state.execution_states.lock();
     let mut result = Vec::new();
     for (symbol, exec_state) in states.iter() {
-        let rl = exec_state.rate_limiter.lock().unwrap();
+        let rl = exec_state.rate_limiter.lock();
         let global = rl.global_tokens_remaining();
         let (sym_tok, sym_pct, _) = rl.get_back_pressure_status(symbol, 0.0)
             .unwrap_or((0.0, 0.0, false));
@@ -1383,16 +1383,16 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let (tx, _rx) = crossbeam_channel::bounded::<ControlCommand>(100);
         let config = Arc::new(RwLock::new(EngineConfig::default()));
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
         ApiState {
             kill_switch: Arc::clone(&kill_switch),
             metrics: Arc::clone(&metrics),
             command_tx: tx,
             config,
-            position_manager,
+            portfolio_manager,
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1474,10 +1474,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1524,10 +1524,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1556,10 +1556,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1601,10 +1601,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1664,10 +1664,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: "secret-key".to_string(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1696,10 +1696,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: "secret-key".to_string(),
             rate_limiter: SimpleRateLimiter::new(10, 1),
@@ -1731,10 +1731,10 @@ mod tests {
             metrics: Arc::new(GlobalMetrics::new()),
             command_tx: tx,
             config: Arc::new(RwLock::new(EngineConfig::default())),
-            position_manager: Arc::new(PositionManager::new()),
+            portfolio_manager: Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             heartbeats: None,
-            execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            execution_states: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            strategy_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             model_registry: Arc::new(ModelRegistry::new()),
             api_key: String::new(),
             rate_limiter: SimpleRateLimiter::new(1, 60),

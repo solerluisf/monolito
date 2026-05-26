@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 pub const DEFAULT_CAPACITY: usize = 100_000;
@@ -29,7 +29,7 @@ impl IdempotencyStore {
     }
 
     pub fn is_processed(&self, key: &str) -> bool {
-        let mut processed = self.processed.lock().unwrap();
+        let mut processed = self.processed.lock();
 
         if let Some(entry) = processed.get_mut(key) {
             entry.last_accessed = Instant::now();
@@ -42,8 +42,8 @@ impl IdempotencyStore {
     }
 
     pub fn mark_processed(&self, key: String, result: String) {
-        let mut processed = self.processed.lock().unwrap();
-        let mut access_order = self.access_order.lock().unwrap();
+        let mut processed = self.processed.lock();
+        let mut access_order = self.access_order.lock();
 
         if !processed.contains_key(&key) && processed.len() >= self.capacity {
             if let Some(lru_key) = access_order.pop_back() {
@@ -65,7 +65,7 @@ impl IdempotencyStore {
     }
 
     pub fn get_result(&self, key: &str) -> Option<String> {
-        let mut processed = self.processed.lock().unwrap();
+        let mut processed = self.processed.lock();
 
         if let Some(entry) = processed.get_mut(key) {
             entry.last_accessed = Instant::now();
@@ -79,11 +79,11 @@ impl IdempotencyStore {
     }
 
     pub fn len(&self) -> usize {
-        self.processed.lock().unwrap().len()
+        self.processed.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.processed.lock().unwrap().is_empty()
+        self.processed.lock().is_empty()
     }
 
     pub fn capacity(&self) -> usize {
@@ -91,14 +91,14 @@ impl IdempotencyStore {
     }
 
     pub fn clear(&self) {
-        let mut processed = self.processed.lock().unwrap();
-        let mut access_order = self.access_order.lock().unwrap();
+        let mut processed = self.processed.lock();
+        let mut access_order = self.access_order.lock();
         processed.clear();
         access_order.clear();
     }
 
     fn update_access_order(&self, key: &str) {
-        let mut access_order = self.access_order.lock().unwrap();
+        let mut access_order = self.access_order.lock();
 
         if let Some(pos) = access_order.iter().position(|k| k == key) {
             access_order.remove(pos);

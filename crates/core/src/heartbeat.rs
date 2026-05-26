@@ -14,9 +14,6 @@ pub struct HeartbeatHandle {
 
 impl HeartbeatHandle {
     pub fn pulse(&self) {
-        let now = Instant::now()
-            .duration_since(Instant::now())
-            .as_nanos() as u64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

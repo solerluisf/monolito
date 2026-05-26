@@ -2,7 +2,7 @@ use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use feature::FeatureVector;
+use feature::{FeatureVector, FeatureIndex};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 #[derive(Debug, Clone)]
@@ -43,11 +43,11 @@ impl Prediction {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let forecast = features.get("forecast").unwrap_or(0.0) as f32;
-        let confidence = features.get("confidence").unwrap_or(0.0) as f32;
-        let action_score = features.get("action_score").unwrap_or(0.0) as f32;
-        let regime_label = features.get("regime").unwrap_or(0.0) as i32;
-        let regime_strength = features.get("regime_strength").unwrap_or(0.0) as f32;
+        let forecast = features.get(FeatureIndex::MidPrice);
+        let confidence = features.get(FeatureIndex::Confidence);
+        let action_score = features.get(FeatureIndex::MacdHistogram);
+        let regime_label = features.get(FeatureIndex::Regime) as i32;
+        let regime_strength = features.get(FeatureIndex::RegimeStrength);
 
         Self {
             symbol: symbol.to_string(),
@@ -56,6 +56,29 @@ impl Prediction {
             action_score,
             regime_label,
             regime_strength,
+            computed_ns: now,
+        }
+    }
+
+    /// Create a heuristic prediction from raw features when the model is stale or unavailable.
+    /// Uses MACD histogram as a simple trend-following signal with fixed confidence.
+    pub fn heuristic_from_features(features: &FeatureVector, symbol: &str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let macd_hist = features.get(FeatureIndex::MacdHistogram);
+        let action_score = macd_hist;
+        let confidence = 0.6f32; // Fixed heuristic confidence above typical minimums
+
+        Self {
+            symbol: symbol.to_string(),
+            forecast: features.get(FeatureIndex::MidPrice),
+            confidence,
+            action_score,
+            regime_label: features.get(FeatureIndex::Regime) as i32,
+            regime_strength: features.get(FeatureIndex::RegimeStrength),
             computed_ns: now,
         }
     }
@@ -179,12 +202,12 @@ mod tests {
         let (tx, rx) = bounded::<FeatureVector>(100);
         let engine = PredictionEngine::new(rx, "AAPL");
 
-        let mut fv = FeatureVector::new("AAPL", 1000, 10);
-        fv.push("mid_price", 150.0);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 150.0);
         tx.send(fv).unwrap();
 
         let handle = engine.start(|features| {
-            let mid = features.get("mid_price").unwrap_or(0.0);
+            let mid = features.get(FeatureIndex::MidPrice);
             Prediction {
                 symbol: features.symbol.clone(),
                 forecast: mid as f32,

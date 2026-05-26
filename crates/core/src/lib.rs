@@ -10,6 +10,7 @@ pub mod threading;
 pub mod validator;
 pub mod idempotency;
 pub mod position_manager;
+pub mod portfolio_manager;
 pub mod symbol_registry;
 pub mod channel_utils;
 pub mod large_pages;
@@ -32,5 +33,6 @@ pub use threading::{pin_to_core, set_thread_priority, spawn_pinned, ThreadPriori
 pub use validator::RequestValidator;
 pub use idempotency::IdempotencyStore;
 pub use position_manager::PositionManager;
+pub use portfolio_manager::PortfolioManager;
 pub use symbol_registry::{SymbolRegistry, SymbolId, SymbolIdArray, MAX_SYMBOLS};
 pub use large_pages::{enable_large_pages, allocate_large_pages, log_large_page_result, LargePageResult};

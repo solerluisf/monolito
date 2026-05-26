@@ -10,14 +10,14 @@ use unified_trading_core::journal::{JournalWriter, JournalEntry};
 use unified_trading_core::heartbeat::ThreadHeartbeatMonitor;
 use unified_trading_core::command_channel::{CommandChannel, CommandActor, ControlCommand, ControlResponse};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
-use unified_trading_core::position_manager::PositionManager;
+use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::config_watcher::ConfigWatcher;
 use unified_trading_core::idempotency::IdempotencyStore;
 use parking_lot::RwLock;
 
 use market_data::{Normalizer, RawTick};
 use feature::{FeatureEngine, FeatureVector};
-use model::{PredictionEngine, InferenceEngine};
+use model::{Prediction, PredictionEngine, InferenceEngine};
 use strategy::{StrategyEngine, TradeIntent, SizeHint};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent, OrderTracker, RateLimiter};
@@ -27,8 +27,8 @@ use crate::tick_reactor::{spawn_reactor, ReactorCommand};
 
 #[derive(Clone)]
 pub struct ExecutionSharedState {
-    pub order_tracker: Arc<std::sync::Mutex<OrderTracker>>,
-    pub rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    pub order_tracker: Arc<parking_lot::Mutex<OrderTracker>>,
+    pub rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub idempotency_store: Arc<IdempotencyStore>,
 }
@@ -50,9 +50,7 @@ pub fn recv_batch<T>(rx: &Receiver<T>, buf: &mut Vec<T>, max: usize) -> usize {
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::Mutex;
-
-use model::Prediction;
+use parking_lot::Mutex;
 
 pub type StrategySwapRef = Arc<ArcSwap<Box<dyn strategy::Strategy>>>;
 type PredictionRef = Arc<ArcSwap<Prediction>>;
@@ -74,14 +72,10 @@ pub struct AssetProcessor {
 
 impl AssetProcessor {
     /// Fast precheck on the hot path: returns `true` if the intent should proceed to the channel.
-    /// Combines kill-switch and staleness checks to avoid wasted channel bandwidth.
+    /// Only checks kill-switch; staleness is handled by heuristic fallback in the main loop.
     #[inline]
-    fn fast_precheck(&self, prediction: &Prediction) -> bool {
+    fn fast_precheck(&self, _prediction: &Prediction) -> bool {
         if self.kill_switch.is_active() {
-            return false;
-        }
-        if prediction.is_stale(self.prediction_staleness_ns) {
-            self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         true
@@ -112,6 +106,15 @@ impl AssetProcessor {
 
                 // Read prediction from ArcSwap (set by PredictionEngine)
                 let prediction = self.latest_pred.load_full();
+
+                // If prediction is stale, fall back to a heuristic based on raw features
+                let prediction = if prediction.is_stale(self.prediction_staleness_ns) {
+                    self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(symbol = %self.symbol, "Model prediction stale; using heuristic fallback");
+                    Arc::new(Prediction::heuristic_from_features(&features, &self.symbol))
+                } else {
+                    prediction
+                };
                 
                 // Fast precheck before channel send
                 if !self.fast_precheck(&prediction) {
@@ -150,6 +153,11 @@ impl AssetProcessor {
                 let latency = proc_ns.saturating_sub(tick.timestamp_ns);
                 self.metrics.feed_latency.record(latency);
             }
+        }
+
+        // Drain remaining ticks so the channel doesn't hold stale messages
+        while let Ok(_tick) = md_rx.try_recv() {
+            self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -206,9 +214,11 @@ impl AssetProcessor {
     pub heartbeats: Option<Arc<parking_lot::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>>>,
     pub config_watcher: Option<ConfigWatcher>,
     pub strategy_registry: Arc<Mutex<HashMap<String, StrategySwapRef>>>,
-    pub position_manager: Arc<PositionManager>,
+    pub portfolio_manager: Arc<PortfolioManager>,
     pub execution_states: HashMap<String, ExecutionSharedState>,
     pub tick_reactor_tx: Option<crossbeam_channel::Sender<crate::tick_reactor::ReactorCommand>>,
+    pub thread_handles: Vec<std::thread::JoinHandle<()>>,
+    pub command_actor: Option<CommandActor>,
     next_asset_core: usize,
 }
 
@@ -218,8 +228,10 @@ impl UnifiedEngine {
         let metrics = Arc::new(GlobalMetrics::new());
         let command_channel = CommandChannel::new(config.channel_config.command_channel_capacity);
         let strategy_registry = Arc::new(Mutex::new(HashMap::new()));
+        let initial_equity = config.risk_config.initial_equity;
+        let flat_threshold = config.risk_config.portfolio_flat_threshold;
         let config = Arc::new(RwLock::new(config));
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(initial_equity, flat_threshold));
 
         Self {
             config: Arc::clone(&config),
@@ -232,9 +244,11 @@ impl UnifiedEngine {
             heartbeats: None,
             config_watcher: None,
             strategy_registry,
-            position_manager,
+            portfolio_manager,
             execution_states: HashMap::new(),
             tick_reactor_tx: None,
+            thread_handles: Vec::new(),
+            command_actor: None,
             next_asset_core: 1,
         }
     }
@@ -277,12 +291,12 @@ impl UnifiedEngine {
 
         self.start_assets(feed_rx);
         self.start_config_watcher();
-        self.start_command_actor();
+        self.command_actor = Some(self.start_command_actor());
 
         tracing::info!("Unified Trading Engine running");
     }
 
-    fn start_alpaca_feed(&self, symbols: &[String], core_id: usize) -> Option<Receiver<RawTick>> {
+    fn start_alpaca_feed(&mut self, symbols: &[String], core_id: usize) -> Option<Receiver<RawTick>> {
         if symbols.is_empty() {
             return None;
         }
@@ -311,7 +325,7 @@ impl UnifiedEngine {
         let ks = Arc::clone(&self.kill_switch);
         let hb_monitor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread("alpaca-feed"));
 
-        spawn_pinned(
+        let handle = spawn_pinned(
             "alpaca-feed",
             core_id,
             ThreadPriority::Normal,
@@ -335,6 +349,7 @@ impl UnifiedEngine {
                 });
             },
         );
+        self.thread_handles.push(handle);
 
         tracing::info!("Alpaca WebSocket feed started for {:?} on core {}", symbols, core_id);
         Some(feed_rx)
@@ -368,11 +383,11 @@ impl UnifiedEngine {
         };
 
         // Start lifecycle handler with heartbeat
-        let pm_clone = Arc::clone(&self.position_manager);
+        let pm_clone = Arc::clone(&self.portfolio_manager);
         let ks = Arc::clone(&self.kill_switch);
         let metrics = Arc::clone(&self.metrics);
         let hb_lifecycle = self.heartbeat_monitor.as_ref().map(|m| m.register_thread("lifecycle-handler"));
-        spawn_pinned(
+        let lifecycle_handle = spawn_pinned(
             "lifecycle-handler",
             0, // Use core 0 for lifecycle handler
             ThreadPriority::Normal,
@@ -397,9 +412,21 @@ impl UnifiedEngine {
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+                // Drain remaining lifecycle events so they are not lost
+                while let Ok(event) = lifecycle_rx.try_recv() {
+                    metrics.lifecycle_channel_depth.fetch_sub(1, Ordering::Relaxed);
+                    tracing::info!(
+                        event_type = ?event.event_type,
+                        symbol = %event.symbol,
+                        execution_id = %event.execution_id,
+                        "Order lifecycle event (drained)"
+                    );
+                    metrics.orders_lifecycle_events.fetch_add(1, Ordering::Relaxed);
+                }
                 tracing::info!("Order lifecycle handler stopped");
             },
         );
+        self.thread_handles.push(lifecycle_handle);
 
         let mut asset_idx = 0;
         for asset_config in &config.asset_configs {
@@ -429,7 +456,7 @@ impl UnifiedEngine {
 
             let ks = Arc::clone(&self.kill_switch);
             let metrics = Arc::clone(&self.metrics);
-            let pm = Arc::clone(&self.position_manager);
+            let pm = Arc::clone(&self.portfolio_manager);
 
             let strategy = StrategyEngine::new(
                 &asset_config.symbol,
@@ -462,7 +489,7 @@ impl UnifiedEngine {
 
             let strategy_arc = Arc::new(ArcSwap::new(Arc::new(Box::new(strategy) as Box<dyn strategy::Strategy>)));
 
-            self.strategy_registry.lock().unwrap().insert(
+            self.strategy_registry.lock().insert(
                 asset_config.symbol.clone(),
                 Arc::clone(&strategy_arc),
             );
@@ -519,24 +546,26 @@ impl UnifiedEngine {
                 config.feature_config.volume_ratio_clamp,
                 config.model_config.volume_confirmation_threshold,
             );
-            let _pred_handle = pred_engine.start(move |features| {
+            let pred_handle = pred_engine.start(move |features| {
                 inference_engine.predict(features)
             }, pred_core_id);
+            self.thread_handles.push(pred_handle);
 
             let risk_coordinator = RiskCoordinator::new(
                 risk_rx,
                 decision_tx,
                 config.risk_config.clone(),
-                config.risk_config.initial_equity,
+                Arc::clone(&pm),
                 Arc::clone(&ks),
                 Arc::clone(&metrics),
             );
-            let _risk_handle = risk_coordinator.start(risk_core_id);
+            let risk_handle = risk_coordinator.start(risk_core_id);
+            self.thread_handles.push(risk_handle);
 
             let global_rate = config.risk_config.max_order_rate_per_sec as f64;
             let per_symbol_rate = global_rate / execution_defaults.execution_per_symbol_rate_divisor;
-            let order_tracker = Arc::new(std::sync::Mutex::new(OrderTracker::new()));
-            let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
+            let order_tracker = Arc::new(parking_lot::Mutex::new(OrderTracker::new()));
+            let rate_limiter = Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
             let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_cfg.failure_threshold, circuit_breaker_cfg.cooldown_ms));
             let idempotency_store = Arc::new(IdempotencyStore::new());
             let exec_shared = ExecutionSharedState {
@@ -562,12 +591,13 @@ impl UnifiedEngine {
                 idempotency_store,
                 unified_trading_core::validator::RequestValidator::new(config.validator_config.clone()),
             );
-            let _exec_handle = exec_manager.start(exec_core_id);
+            let exec_handle = exec_manager.start(exec_core_id);
+            self.thread_handles.push(exec_handle);
 
             // Start asset processor with heartbeat
             let sym = asset_config.symbol.clone();
             let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", sym)));
-            spawn_pinned(
+            let asset_handle = spawn_pinned(
                 &format!("asset-{}", sym),
                 core_id,
                 ThreadPriority::High,
@@ -577,6 +607,7 @@ impl UnifiedEngine {
                     tracing::info!("Asset processor for {} stopped", sym);
                 },
             );
+            self.thread_handles.push(asset_handle);
 
             tracing::info!(
                 "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH, exec on core {} HIGH)",
@@ -619,7 +650,7 @@ impl UnifiedEngine {
         self.config_watcher = Some(watcher);
     }
 
-    fn start_command_actor(&self) {
+    fn start_command_actor(&self) -> CommandActor {
         let config = self.config.read();
         let command_core_id = config.threading_config.command_core_id;
         drop(config);
@@ -629,12 +660,12 @@ impl UnifiedEngine {
         let kill_switch = Arc::clone(&self.kill_switch);
         let strategy_registry = Arc::clone(&self.strategy_registry);
         let config_arc = Arc::clone(&self.config);
-        let execution_states = Arc::new(std::sync::Mutex::new(self.execution_states.clone()));
-        let position_manager = Arc::clone(&self.position_manager);
+        let execution_states = Arc::new(parking_lot::Mutex::new(self.execution_states.clone()));
+        let portfolio_manager = Arc::clone(&self.portfolio_manager);
         let journal_tx_opt = self.journal_tx.clone();
         let tick_reactor_tx_opt = self.tick_reactor_tx.clone();
 
-        let _actor = CommandActor::new(self.command_channel.rx.clone(), move |cmd| {
+        CommandActor::new(self.command_channel.rx.clone(), move |cmd| {
             match cmd {
                 ControlCommand::SetKillSwitch(active) => {
                     if active {
@@ -653,7 +684,7 @@ impl UnifiedEngine {
                     ControlResponse::Ok
                 }
                 ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
-                    let registry = strategy_registry.lock().unwrap();
+                    let registry = strategy_registry.lock();
                     if let Some(strategy_ref) = registry.get(&symbol) {
                         let old_name = strategy_ref.load().name().to_string();
 
@@ -822,7 +853,7 @@ impl UnifiedEngine {
                     ControlResponse::Ok
                 }
                 ControlCommand::SetCircuitBreakerParams(update) => {
-                    let states = execution_states.lock().unwrap();
+                    let states = execution_states.lock();
                     for (_, exec_state) in states.iter() {
                         exec_state.circuit_breaker.set_failure_threshold(update.failure_threshold);
                         exec_state.circuit_breaker.set_cooldown_ms(update.cooldown_ms);
@@ -834,9 +865,9 @@ impl UnifiedEngine {
                     ControlResponse::Ok
                 }
                 ControlCommand::SetRateLimits(update) => {
-                    let states = execution_states.lock().unwrap();
+                    let states = execution_states.lock();
                     for (_, exec_state) in states.iter() {
-                        let mut rl = exec_state.rate_limiter.lock().unwrap();
+                        let mut rl = exec_state.rate_limiter.lock();
                         rl.set_global_rate(update.global_rate);
                         rl.set_default_per_symbol_rate(update.per_symbol_rate);
                     }
@@ -873,14 +904,14 @@ impl UnifiedEngine {
                     ControlResponse::Ok
                 }
                 ControlCommand::CircuitBreakerTrip => {
-                    let states = execution_states.lock().unwrap();
+                    let states = execution_states.lock();
                     for (_, exec_state) in states.iter() {
                         exec_state.circuit_breaker.trip();
                     }
                     ControlResponse::Ok
                 }
                 ControlCommand::CircuitBreakerReset => {
-                    let states = execution_states.lock().unwrap();
+                    let states = execution_states.lock();
                     for (_, exec_state) in states.iter() {
                         exec_state.circuit_breaker.reset();
                     }
@@ -929,26 +960,67 @@ impl UnifiedEngine {
                     }
                 }
             }
-        }, command_core_id, Some(metrics_for_actor));
+        }, command_core_id, Some(metrics_for_actor))
     }
 
     pub fn shutdown(&mut self) {
         self.kill_switch.activate();
         tracing::info!("Unified Trading Engine shutting down...");
 
+        // 1. Stop accepting new external work (close tick reactor control channel)
+        self.tick_reactor_tx = None;
+
+        // 2. Stop command actor so no new control commands are processed
+        if let Some(mut actor) = self.command_actor.take() {
+            actor.shutdown();
+        }
+
+        // 3. Flush journal synchronously before threads exit
+        if let Some(ref journal) = self.journal {
+            if let Err(e) = journal.flush_sync() {
+                tracing::warn!("Journal flush failed during shutdown: {}", e);
+            }
+        }
+
+        // 4. Shut down journal writer thread
         if let Some(journal) = self.journal.take() {
             journal.shutdown();
         }
 
+        // 5. Shutdown heartbeat monitor
         if let Some(mut monitor) = self.heartbeat_monitor.take() {
             monitor.shutdown();
         }
 
+        // 6. Stop config watcher
         if let Some(mut watcher) = self.config_watcher.take() {
             watcher.stop();
         }
 
+        // 7. Join all worker threads with a timeout
+        let timeout = std::time::Duration::from_secs(5);
+        for handle in self.thread_handles.drain(..) {
+            match Self::join_with_timeout(handle, timeout) {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!("Thread failed to join within {:?} during shutdown", timeout);
+                }
+            }
+        }
+
         let snap = self.metrics.snapshot();
         tracing::info!("Final metrics: {:?}", snap);
+    }
+
+    fn join_with_timeout(handle: std::thread::JoinHandle<()>, timeout: std::time::Duration) -> Result<(), ()> {
+        let (tx, rx) = crossbeam_channel::bounded::<Result<(), Box<dyn std::any::Any + Send>>>(1);
+        let _ = std::thread::spawn(move || {
+            let result = handle.join();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result.map_err(|_| ()),
+            Err(_) => Err(()),
+        }
     }
 }

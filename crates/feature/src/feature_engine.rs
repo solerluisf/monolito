@@ -1,41 +1,58 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeatureIndex {
+    MidPrice = 0,
+    SpreadBps = 1,
+    SpreadAbs = 2,
+    Rsi14 = 3,
+    MacdLine = 4,
+    MacdSignal = 5,
+    MacdHistogram = 6,
+    Atr14 = 7,
+    RollingStd = 8,
+    VolumeRatio = 9,
+    OrderFlowImbalance = 10,
+    Regime = 11,
+    RegimeStrength = 12,
+    Ema9 = 13,
+    Ema21 = 14,
+    Ema50 = 15,
+    Confidence = 16,
+}
+
+pub const FEATURE_COUNT: usize = 17;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureVector {
     pub symbol: String,
     pub timestamp_ns: u64,
-    pub values: Vec<f32>,
-    pub feature_names: Vec<String>,
+    pub values: [f32; FEATURE_COUNT],
 }
 
 impl FeatureVector {
-    pub fn new(symbol: &str, timestamp_ns: u64, capacity: usize) -> Self {
+    pub fn new(symbol: &str, timestamp_ns: u64) -> Self {
         Self {
             symbol: symbol.to_string(),
             timestamp_ns,
-            values: Vec::with_capacity(capacity),
-            feature_names: Vec::with_capacity(capacity),
+            values: [0.0f32; FEATURE_COUNT],
         }
     }
 
-    pub fn push(&mut self, name: &str, value: f32) {
-        self.feature_names.push(name.to_string());
-        self.values.push(value);
+    pub fn set(&mut self, index: FeatureIndex, value: f32) {
+        self.values[index as usize] = value;
     }
 
-    pub fn get(&self, name: &str) -> Option<f32> {
-        self.feature_names
-            .iter()
-            .position(|n| n == name)
-            .map(|i| self.values[i])
+    pub fn get(&self, index: FeatureIndex) -> f32 {
+        self.values[index as usize]
     }
 
     pub fn len(&self) -> usize {
-        self.values.len()
+        FEATURE_COUNT
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        false
     }
 
     pub fn to_array<const N: usize>(&self) -> [f32; N] {
@@ -272,12 +289,12 @@ mod tests {
 
     #[test]
     fn test_feature_vector() {
-        let mut fv = FeatureVector::new("AAPL", 1000, 10);
-        fv.push("mid_price", 150.0);
-        fv.push("rsi", 65.0);
-        assert_eq!(fv.len(), 2);
-        assert_eq!(fv.get("mid_price"), Some(150.0));
-        assert_eq!(fv.get("missing"), None);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 65.0);
+        assert_eq!(fv.len(), FEATURE_COUNT);
+        assert_eq!(fv.get(FeatureIndex::MidPrice), 150.0);
+        assert_eq!(fv.get(FeatureIndex::Confidence), 0.0);
     }
 
     #[test]
@@ -333,12 +350,12 @@ mod tests {
 
     #[test]
     fn test_feature_vector_to_array() {
-        let mut fv = FeatureVector::new("AAPL", 1000, 10);
-        fv.push("a", 1.0);
-        fv.push("b", 2.0);
+        let mut fv = FeatureVector::new("AAPL", 1000);
+        fv.set(FeatureIndex::MidPrice, 1.0);
+        fv.set(FeatureIndex::Rsi14, 2.0);
         let arr: [f32; 5] = fv.to_array();
         assert_eq!(arr[0], 1.0);
-        assert_eq!(arr[1], 2.0);
+        assert_eq!(arr[1], 0.0);
         assert_eq!(arr[2], 0.0);
     }
 }

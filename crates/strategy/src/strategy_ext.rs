@@ -1,5 +1,5 @@
 use crate::strategy_engine::{TradeIntent, SignalSide, SizeHint, IntentType, StrategyEngine};
-use feature::FeatureVector;
+use feature::{FeatureVector, FeatureIndex};
 
 pub trait StrategyEngineExt {
     fn evaluate_from_features(&mut self, features: &FeatureVector) -> Option<TradeIntent>;
@@ -10,11 +10,11 @@ pub trait StrategyEngineExt {
 impl StrategyEngineExt for StrategyEngine {
     #[tracing::instrument(skip_all, fields(symbol = %features.symbol))]
     fn evaluate_from_features(&mut self, features: &FeatureVector) -> Option<TradeIntent> {
-        let rsi = features.get("rsi_14").unwrap_or(self.rsi_neutral as f32);
-        let macd_hist = features.get("macd_histogram").unwrap_or(0.0);
-        let atr = features.get("atr_14").unwrap_or(0.0);
-        let volume_ratio = features.get("volume_ratio").unwrap_or(1.0);
-        let regime_strength = features.get("regime_strength").unwrap_or(0.0);
+        let rsi = features.get(FeatureIndex::Rsi14);
+        let macd_hist = features.get(FeatureIndex::MacdHistogram);
+        let atr = features.get(FeatureIndex::Atr14);
+        let volume_ratio = features.get(FeatureIndex::VolumeRatio);
+        let regime_strength = features.get(FeatureIndex::RegimeStrength);
 
         let action_score = self.compute_action_score(rsi, macd_hist, atr, volume_ratio);
         let confidence = self.compute_confidence(rsi, macd_hist, regime_strength);

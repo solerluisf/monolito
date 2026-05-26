@@ -7,7 +7,7 @@ use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::journal::{JournalWriter, JournalEntry};
 use unified_trading_core::validator::RequestValidator;
 use unified_trading_core::idempotency::IdempotencyStore;
-use unified_trading_core::position_manager::PositionManager;
+use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use crate::order_tracker::{OrderTracker, OrderStatus};
@@ -20,11 +20,11 @@ pub struct ExecutionManager {
     pub decision_rx: Receiver<RiskDecision>,
     pub lifecycle_tx: Sender<OrderLifecycleEvent>,
     pub execution_port: Arc<dyn IExecutionPort>,
-    pub order_tracker: Arc<std::sync::Mutex<OrderTracker>>,
-    pub rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    pub order_tracker: Arc<parking_lot::Mutex<OrderTracker>>,
+    pub rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub idempotency_store: Arc<IdempotencyStore>,
-    pub position_manager: Arc<PositionManager>,
+    pub portfolio_manager: Arc<PortfolioManager>,
     pub metrics: Arc<GlobalMetrics>,
     pub journal: Option<Arc<JournalWriter>>,
     pub kill_switch: Arc<KillSwitch>,
@@ -41,9 +41,9 @@ impl ExecutionManager {
         per_symbol_rate: f64,
         metrics: Arc<GlobalMetrics>,
         kill_switch: Arc<KillSwitch>,
-        position_manager: Arc<PositionManager>,
-        order_tracker: Arc<std::sync::Mutex<OrderTracker>>,
-        rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+        portfolio_manager: Arc<PortfolioManager>,
+        order_tracker: Arc<parking_lot::Mutex<OrderTracker>>,
+        rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
         circuit_breaker: Arc<CircuitBreaker>,
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
@@ -56,7 +56,7 @@ impl ExecutionManager {
             rate_limiter,
             circuit_breaker,
             idempotency_store,
-            position_manager,
+            portfolio_manager,
             metrics,
             journal: None,
             kill_switch,
@@ -91,6 +91,13 @@ impl ExecutionManager {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
+
+        // Drain remaining decisions so they are not lost in the queue
+        while let Ok(decision) = self.decision_rx.try_recv() {
+            if decision.approved {
+                tracing::warn!(request_id = %decision.request_id, "Draining unexecuted approved decision during shutdown");
+            }
+        }
     }
 
     #[tracing::instrument(skip_all, fields(request_id = %decision.request_id))]
@@ -109,7 +116,7 @@ impl ExecutionManager {
         }
 
         {
-            let mut rate_limiter = self.rate_limiter.lock().unwrap();
+            let mut rate_limiter = self.rate_limiter.lock();
             if !rate_limiter.try_consume(&symbol, 1.0) {
                 self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(symbol = %symbol, "Rate limit exceeded");
@@ -227,14 +234,14 @@ impl ExecutionManager {
             .as_nanos() as u64;
 
         {
-            let mut tracker = self.order_tracker.lock().unwrap();
+            let mut tracker = self.order_tracker.lock();
             tracker.update_fill(order_id, filled_qty);
         }
         self.kill_switch.remove_open_order(order_id);
         self.metrics.orders_filled.fetch_add(1, Ordering::Relaxed);
         self.circuit_breaker.record_success();
 
-        self.position_manager.on_fill(symbol, filled_qty, fill_price, true);
+        self.portfolio_manager.on_fill(symbol, fill_price, filled_qty, true);
 
         let lifecycle_event = OrderLifecycleEvent::new(
             order_id.to_string(),
@@ -278,7 +285,7 @@ impl ExecutionManager {
             .as_nanos() as u64;
 
         {
-            let mut tracker = self.order_tracker.lock().unwrap();
+            let mut tracker = self.order_tracker.lock();
             tracker.update_status(order_id, OrderStatus::Cancelled);
         }
         self.kill_switch.remove_open_order(order_id);
@@ -353,10 +360,10 @@ mod tests {
         per_symbol_rate: f64,
         metrics: Arc<GlobalMetrics>,
         kill_switch: Arc<KillSwitch>,
-        position_manager: Arc<PositionManager>,
+        portfolio_manager: Arc<PortfolioManager>,
     ) -> ExecutionManager {
-        let order_tracker = Arc::new(std::sync::Mutex::new(OrderTracker::new()));
-        let rate_limiter = Arc::new(std::sync::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
+        let order_tracker = Arc::new(parking_lot::Mutex::new(OrderTracker::new()));
+        let rate_limiter = Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
         let circuit_breaker = Arc::new(CircuitBreaker::new(5, 30_000));
         let idempotency_store = Arc::new(IdempotencyStore::new());
         ExecutionManager::new(
@@ -367,7 +374,7 @@ mod tests {
             per_symbol_rate,
             metrics,
             kill_switch,
-            position_manager,
+            portfolio_manager,
             order_tracker,
             rate_limiter,
             circuit_breaker,
@@ -382,7 +389,7 @@ mod tests {
         let (lifecycle_tx, lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
         let kill_switch = Arc::new(KillSwitch::new());
         let metrics = Arc::new(GlobalMetrics::new());
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
 
         let manager = make_manager(
             dec_rx,
@@ -391,7 +398,7 @@ mod tests {
             5.0,
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
-            position_manager,
+            portfolio_manager,
         );
 
         dec_tx.send(make_approved_decision()).unwrap();
@@ -410,7 +417,7 @@ mod tests {
         let kill_switch = Arc::new(KillSwitch::new());
         kill_switch.activate();
         let metrics = Arc::new(GlobalMetrics::new());
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
 
         let manager = make_manager(
             dec_rx,
@@ -419,7 +426,7 @@ mod tests {
             5.0,
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
-            position_manager,
+            portfolio_manager,
         );
 
         dec_tx.send(make_approved_decision()).unwrap();
@@ -436,7 +443,7 @@ mod tests {
         let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
         let kill_switch = Arc::new(KillSwitch::new());
         let metrics = Arc::new(GlobalMetrics::new());
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
 
         let mut manager = make_manager(
             dec_rx,
@@ -445,18 +452,18 @@ mod tests {
             5.0,
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
-            Arc::clone(&position_manager),
+            Arc::clone(&portfolio_manager),
         );
 
         let order_id = {
-            let mut tracker = manager.order_tracker.lock().unwrap();
+            let mut tracker = manager.order_tracker.lock();
             tracker.create_order("AAPL", "buy", 10.0, None, "corr-1")
         };
         manager.on_fill(&order_id, "AAPL", 10.0, 150.0);
         assert_eq!(metrics.orders_filled.load(Ordering::Relaxed), 1);
 
-        let pos = position_manager.get_position("AAPL").unwrap();
-        assert_eq!(pos.quantity, 10.0);
+        let pos = portfolio_manager.get_position("AAPL").unwrap();
+        assert_eq!(pos.net_position, 10.0);
 
         drop(dec_tx);
     }
@@ -467,7 +474,7 @@ mod tests {
         let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
         let kill_switch = Arc::new(KillSwitch::new());
         let metrics = Arc::new(GlobalMetrics::new());
-        let position_manager = Arc::new(PositionManager::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
 
         let mut manager = make_manager(
             dec_rx,
@@ -476,7 +483,7 @@ mod tests {
             100.0,
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
-            position_manager,
+            portfolio_manager,
         );
 
         for _ in 0..5 {
