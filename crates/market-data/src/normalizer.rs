@@ -58,7 +58,7 @@ impl Normalizer {
         }
     }
 
-    pub fn process(&mut self, raw: RawTick) -> NormalizedTick {
+    pub fn process(&mut self, raw: RawTick) -> (NormalizedTick, bool) {
         let mid_price = (raw.bid + raw.ask) / 2.0;
         let spread = raw.ask - raw.bid;
         let spread_bps = if mid_price > 0.0 {
@@ -68,9 +68,10 @@ impl Normalizer {
         };
 
         self.last_sequence += 1;
+        let gap = self.last_timestamp_ns > 0 && raw.timestamp_ns > self.last_timestamp_ns + 1_000_000_000;
         self.last_timestamp_ns = raw.timestamp_ns;
 
-        NormalizedTick {
+        (NormalizedTick {
             symbol: raw.symbol,
             timestamp_ns: raw.timestamp_ns,
             mid_price,
@@ -81,7 +82,7 @@ impl Normalizer {
             bid_size: raw.bid_size,
             ask_size: raw.ask_size,
             volume: raw.last_size,
-        }
+        }, gap)
     }
 
     pub fn check_sequence(&self, expected: u64) -> Option<u64> {
@@ -166,7 +167,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
         };
-        let normalized = norm.process(raw);
+        let (normalized, _gap) = norm.process(raw);
         assert_eq!(normalized.symbol, "AAPL");
         assert!((normalized.mid_price - 150.025).abs() < 0.001);
         assert!((normalized.spread - 0.05).abs() < 0.001);
@@ -186,7 +187,7 @@ mod tests {
             last_size: 10,
             exchange: "IEX".to_string(),
         };
-        let normalized = norm.process(raw);
+        let (normalized, _gap) = norm.process(raw);
         assert!((normalized.spread_bps - 1.0).abs() < 0.01);
     }
 

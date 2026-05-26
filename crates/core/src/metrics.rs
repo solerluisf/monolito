@@ -72,6 +72,7 @@ pub struct GlobalMetrics {
     pub journal_writes: AtomicU64,
     pub heartbeat_misses: AtomicU64,
     pub errors: AtomicU64,
+    pub feed_gaps: AtomicU64,
     // Latency histograms
     pub tick_to_intent_latency: LatencyHistogram,
     pub risk_check_latency: LatencyHistogram,
@@ -79,6 +80,7 @@ pub struct GlobalMetrics {
     pub broker_send_latency: LatencyHistogram,
     pub feed_latency: LatencyHistogram,
     pub broker_round_trip_latency: LatencyHistogram,
+    pub decision_latency: LatencyHistogram,
     // Channel depth gauges (approximate, since crossbeam doesn't expose len())
     pub feature_channel_depth: AtomicI64,
     pub risk_channel_depth: AtomicI64,
@@ -115,12 +117,14 @@ impl GlobalMetrics {
             journal_writes: AtomicU64::new(0),
             heartbeat_misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            feed_gaps: AtomicU64::new(0),
             tick_to_intent_latency: LatencyHistogram::new(),
             risk_check_latency: LatencyHistogram::new(),
             journal_flush_latency: LatencyHistogram::new(),
             broker_send_latency: LatencyHistogram::new(),
             feed_latency: LatencyHistogram::new(),
             broker_round_trip_latency: LatencyHistogram::new(),
+            decision_latency: LatencyHistogram::new(),
             feature_channel_depth: AtomicI64::new(0),
             risk_channel_depth: AtomicI64::new(0),
             decision_channel_depth: AtomicI64::new(0),
@@ -154,12 +158,14 @@ impl GlobalMetrics {
         self.journal_writes.store(0, Ordering::Relaxed);
         self.heartbeat_misses.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
+        self.feed_gaps.store(0, Ordering::Relaxed);
         self.tick_to_intent_latency.reset();
         self.risk_check_latency.reset();
         self.journal_flush_latency.reset();
         self.broker_send_latency.reset();
         self.feed_latency.reset();
         self.broker_round_trip_latency.reset();
+        self.decision_latency.reset();
         self.feature_channel_depth.store(0, Ordering::Relaxed);
         self.risk_channel_depth.store(0, Ordering::Relaxed);
         self.decision_channel_depth.store(0, Ordering::Relaxed);
@@ -217,12 +223,14 @@ impl GlobalMetrics {
             journal_writes: self.journal_writes.load(Ordering::Relaxed),
             heartbeat_misses: self.heartbeat_misses.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            feed_gaps: self.feed_gaps.load(Ordering::Relaxed),
             tick_to_intent_latency: self.tick_to_intent_latency.snapshot(),
             risk_check_latency: self.risk_check_latency.snapshot(),
             journal_flush_latency: self.journal_flush_latency.snapshot(),
             broker_send_latency: self.broker_send_latency.snapshot(),
             feed_latency: self.feed_latency.snapshot(),
             broker_round_trip_latency: self.broker_round_trip_latency.snapshot(),
+            decision_latency: self.decision_latency.snapshot(),
             feature_channel_depth: self.feature_channel_depth.load(Ordering::Relaxed),
             risk_channel_depth: self.risk_channel_depth.load(Ordering::Relaxed),
             decision_channel_depth: self.decision_channel_depth.load(Ordering::Relaxed),
@@ -286,6 +294,7 @@ pub struct MetricsSnapshot {
     pub journal_writes: u64,
     pub heartbeat_misses: u64,
     pub errors: u64,
+    pub feed_gaps: u64,
     // Latency histograms (buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms)
     pub tick_to_intent_latency: [u64; 6],
     pub risk_check_latency: [u64; 6],
@@ -293,6 +302,7 @@ pub struct MetricsSnapshot {
     pub broker_send_latency: [u64; 6],
     pub feed_latency: [u64; 6],
     pub broker_round_trip_latency: [u64; 6],
+    pub decision_latency: [u64; 6],
     // Channel depth gauges
     pub feature_channel_depth: i64,
     pub risk_channel_depth: i64,

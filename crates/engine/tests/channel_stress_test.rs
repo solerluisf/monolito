@@ -59,7 +59,7 @@ fn run_processor(
         }
 
         for tick in batch.drain(..) {
-            let normalized = normalizer.process(tick.clone());
+            let (normalized, _gap) = normalizer.process(tick.clone());
             let features = feature_engine.compute(&normalized);
             let _ = feature_tx.try_send(features.clone());
 

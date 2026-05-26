@@ -2,6 +2,7 @@ mod allocator;
 
 use std::sync::Arc;
 
+use model::ModelRegistry;
 use unified_trading_core::config::EngineConfig;
 use unified_trading_core::ws::{create_ws_router, WsState};
 use unified_trading_core::large_pages::{enable_large_pages, log_large_page_result};
@@ -109,6 +110,7 @@ fn main() {
             heartbeats: heartbeats.clone(),
             execution_states: Arc::clone(&execution_states),
             strategy_registry: Arc::clone(&strategy_registry),
+            model_registry: Arc::new(model::ModelRegistry::new()),
         };
 
         let ws_state = WsState {

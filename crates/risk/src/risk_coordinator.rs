@@ -62,6 +62,12 @@ impl RiskCoordinator {
                     self.metrics.decision_channel_depth.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = check_start.elapsed().as_nanos() as u64;
                     self.metrics.risk_check_latency.record(elapsed_ns);
+                    let decision_latency_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    let total_latency = decision_latency_ns.saturating_sub(request.timestamp_ns);
+                    self.metrics.decision_latency.record(total_latency);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

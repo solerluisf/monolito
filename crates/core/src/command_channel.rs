@@ -45,9 +45,6 @@ pub struct BrokerConfigUpdate {
     pub rest_url: String,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
-    pub ws_reconnect_delay_ms: u64,
-    pub ws_max_reconnect_attempts: u32,
-    pub http_client_timeout_sec: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +87,6 @@ pub struct JournalConfigUpdate {
     pub flush_interval_ms: u64,
     pub snapshot_interval_sec: u64,
     pub max_file_size_mb: u64,
-    pub journal_flush_sync_timeout_sec: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +99,6 @@ pub struct AssetConfigUpdate {
 #[derive(Debug, Clone)]
 pub struct ExecutionDefaultsUpdate {
     pub default_order_quantity: f64,
-    pub default_order_price: f64,
     pub execution_per_symbol_rate_divisor: f64,
 }
 

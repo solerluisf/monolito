@@ -24,6 +24,7 @@ use parking_lot::RwLock;
 
 use execution::{OrderTracker, RateLimiter};
 use gateway::CircuitBreaker;
+use model::ModelRegistry;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -35,6 +36,7 @@ pub struct ApiState {
     pub heartbeats: Option<Arc<parking_lot::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>>>,
     pub execution_states: Arc<std::sync::Mutex<HashMap<String, crate::engine::ExecutionSharedState>>>,
     pub strategy_registry: Arc<std::sync::Mutex<HashMap<String, crate::engine::StrategySwapRef>>>,
+    pub model_registry: Arc<ModelRegistry>,
 }
 
 // ------------------------------------------------------------------
@@ -147,6 +149,11 @@ pub struct ModeRequest {
 }
 
 #[derive(Deserialize)]
+pub struct PaperTradingRequest {
+    pub paper_trading: bool,
+}
+
+#[derive(Deserialize)]
 pub struct RiskParamsRequest {
     pub max_portfolio_exposure: f64,
     pub max_leverage: f64,
@@ -186,9 +193,6 @@ pub struct BrokerParamsRequest {
     pub rest_url: String,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
-    pub ws_reconnect_delay_ms: u64,
-    pub ws_max_reconnect_attempts: u32,
-    pub http_client_timeout_sec: u64,
 }
 
 #[derive(Serialize)]
@@ -199,9 +203,6 @@ pub struct BrokerParamsResponse {
     pub rest_url: String,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
-    pub ws_reconnect_delay_ms: u64,
-    pub ws_max_reconnect_attempts: u32,
-    pub http_client_timeout_sec: u64,
 }
 
 #[derive(Deserialize)]
@@ -278,7 +279,6 @@ pub struct JournalParamsRequest {
     pub flush_interval_ms: u64,
     pub snapshot_interval_sec: u64,
     pub max_file_size_mb: u64,
-    pub journal_flush_sync_timeout_sec: u64,
 }
 
 #[derive(Serialize)]
@@ -287,20 +287,17 @@ pub struct JournalParamsResponse {
     pub flush_interval_ms: u64,
     pub snapshot_interval_sec: u64,
     pub max_file_size_mb: u64,
-    pub journal_flush_sync_timeout_sec: u64,
 }
 
 #[derive(Deserialize)]
 pub struct ExecutionDefaultsRequest {
     pub default_order_quantity: f64,
-    pub default_order_price: f64,
     pub execution_per_symbol_rate_divisor: f64,
 }
 
 #[derive(Serialize)]
 pub struct ExecutionDefaultsResponse {
     pub default_order_quantity: f64,
-    pub default_order_price: f64,
     pub execution_per_symbol_rate_divisor: f64,
 }
 
@@ -326,6 +323,25 @@ pub struct CircuitBreakerConfigRequest {
 pub struct CircuitBreakerConfigResponse {
     pub failure_threshold: u64,
     pub cooldown_ms: u64,
+}
+
+#[derive(Deserialize)]
+pub struct SwapModelRequest {
+    pub model_id: String,
+}
+
+#[derive(Serialize)]
+pub struct ActiveModelResponse {
+    pub model_id: String,
+    pub version: u32,
+    pub input_features: Vec<String>,
+    pub applicable_regimes: Vec<i32>,
+    pub priority: u32,
+}
+
+#[derive(Serialize)]
+pub struct ModelListResponse {
+    pub models: Vec<ActiveModelResponse>,
 }
 
 #[derive(Deserialize)]
@@ -435,7 +451,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/health/kill-switch", get(kill_switch_status))
         .route("/health/heartbeats", get(heartbeats_handler))
         .route("/control/kill-switch", post(set_kill_switch))
-        .route("/control/circuit-breaker", get(circuit_breaker_status))
+        .route("/control/circuit-breaker", get(circuit_breaker_status).post(set_circuit_breaker_config_handler).put(set_circuit_breaker_config_handler))
         .route("/control/circuit-breaker/trip", post(trip_circuit_breaker))
         .route("/control/circuit-breaker/reset", post(reset_circuit_breaker))
         .route("/control/circuit-breaker/config", post(set_circuit_breaker_config_handler).put(set_circuit_breaker_config_handler))
@@ -446,11 +462,14 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/control/asset/:symbol/config", get(get_asset_config_handler).put(set_asset_config_handler))
         .route("/control/mode", post(set_mode_handler))
         .route("/control/broker", put(set_broker_params_handler))
-        .route("/control/broker/mode", post(set_mode_handler).put(set_mode_handler))
+        .route("/control/broker/mode", post(set_paper_trading_handler).put(set_paper_trading_handler))
         .route("/control/risk/parameters", post(set_risk_params_handler).put(set_risk_params_handler))
         .route("/control/risk/parameters", get(get_risk_params_handler))
         .route("/control/features/parameters", post(set_feature_params_handler).put(set_feature_params_handler))
         .route("/control/model/parameters", post(set_model_params_handler).put(set_model_params_handler))
+        .route("/control/model/active", get(get_active_model_handler))
+        .route("/control/model/list", get(list_models_handler))
+        .route("/control/model/swap", post(swap_model_handler))
         .route("/control/journal/config", post(set_journal_params_handler).put(set_journal_params_handler))
         .route("/control/journal/flush", post(flush_journal_handler))
         .route("/control/config/reload", post(reload_config_handler))
@@ -739,6 +758,24 @@ async fn prometheus_handler(State(state): State<ApiState>) -> Response<String> {
     output.push_str("# TYPE journal_channel_depth gauge\n");
     output.push_str(&format!("journal_channel_depth {}\n", snap.journal_channel_depth));
 
+    output.push_str("# HELP feed_gaps Total feed gaps detected (>1s between ticks)\n");
+    output.push_str("# TYPE feed_gaps counter\n");
+    output.push_str(&format!("feed_gaps {}\n", snap.feed_gaps));
+
+    output.push_str("# HELP decision_latency Decision latency histogram (tick timestamp → decision send)\n");
+    output.push_str("# TYPE decision_latency counter\n");
+    for (i, v) in snap.decision_latency.iter().enumerate() {
+        output.push_str(&format!("decision_latency_bucket{{le=\"{}\"}} {}\n", i, v));
+    }
+
+    output.push_str("# HELP circuit_breaker_state Circuit breaker state per symbol (1=open, 0=closed)\n");
+    output.push_str("# TYPE circuit_breaker_state gauge\n");
+    let cb_states = state.execution_states.lock().unwrap();
+    for (symbol, exec_state) in cb_states.iter() {
+        let is_open = exec_state.circuit_breaker.is_open.load(std::sync::atomic::Ordering::Relaxed);
+        output.push_str(&format!("circuit_breaker_state{{symbol=\"{}\"}} {}\n", symbol, if is_open { 1 } else { 0 }));
+    }
+
     for (symbol, count) in &snap.per_symbol_ticks {
         output.push_str("# HELP per_symbol_ticks Ticks processed per symbol\n");
         output.push_str("# TYPE per_symbol_ticks counter\n");
@@ -876,6 +913,15 @@ async fn set_mode_handler(
     send_command(&state, ControlCommand::SetMode(req.mode)    )
 }
 
+// Paper trading toggle handler (accepts bool per checklist)
+async fn set_paper_trading_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<PaperTradingRequest>,
+) -> StatusCode {
+    let mode = if req.paper_trading { "paper" } else { "live" };
+    send_command(&state, ControlCommand::SetMode(mode.to_string())    )
+}
+
 // Risk parameters handlers
 async fn set_risk_params_handler(
     State(state): State<ApiState>,
@@ -928,9 +974,6 @@ async fn set_broker_params_handler(
         rest_url: req.rest_url,
         max_retries: req.max_retries,
         retry_backoff_ms: req.retry_backoff_ms,
-        ws_reconnect_delay_ms: req.ws_reconnect_delay_ms,
-        ws_max_reconnect_attempts: req.ws_max_reconnect_attempts,
-        http_client_timeout_sec: req.http_client_timeout_sec,
     })    )
 }
 
@@ -988,7 +1031,6 @@ async fn set_journal_params_handler(
         flush_interval_ms: req.flush_interval_ms,
         snapshot_interval_sec: req.snapshot_interval_sec,
         max_file_size_mb: req.max_file_size_mb,
-        journal_flush_sync_timeout_sec: req.journal_flush_sync_timeout_sec,
     })    )
 }
 
@@ -1007,7 +1049,6 @@ async fn set_execution_defaults_handler(
 ) -> StatusCode {
     send_command(&state, ControlCommand::SetExecutionDefaults(ExecutionDefaultsUpdate {
         default_order_quantity: req.default_order_quantity,
-        default_order_price: req.default_order_price,
         execution_per_symbol_rate_divisor: req.execution_per_symbol_rate_divisor,
     })    )
 }
@@ -1116,6 +1157,46 @@ async fn per_symbol_stats_handler(State(state): State<ApiState>) -> Json<PerSymb
         per_symbol_intents_approved: snap.per_symbol_intents_approved,
         per_symbol_intents_rejected: snap.per_symbol_intents_rejected,
     })
+}
+
+// Model handlers
+async fn get_active_model_handler(State(state): State<ApiState>) -> Json<ActiveModelResponse> {
+    match state.model_registry.get_active() {
+        Some(info) => Json(ActiveModelResponse {
+            model_id: info.model_id,
+            version: info.version,
+            input_features: info.input_features,
+            applicable_regimes: info.applicable_regimes,
+            priority: info.priority,
+        }),
+        None => Json(ActiveModelResponse {
+            model_id: String::new(),
+            version: 0,
+            input_features: Vec::new(),
+            applicable_regimes: Vec::new(),
+            priority: 0,
+        }),
+    }
+}
+
+async fn list_models_handler(State(state): State<ApiState>) -> Json<ModelListResponse> {
+    let models = state.model_registry.list_models();
+    Json(ModelListResponse {
+        models: models.into_iter().map(|info| ActiveModelResponse {
+            model_id: info.model_id,
+            version: info.version,
+            input_features: info.input_features,
+            applicable_regimes: info.applicable_regimes,
+            priority: info.priority,
+        }).collect(),
+    })
+}
+
+async fn swap_model_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<SwapModelRequest>,
+) -> StatusCode {
+    send_command(&state, ControlCommand::ModelSwap(req.model_id)    )
 }
 
 // Portfolio status handler
@@ -1227,6 +1308,7 @@ mod tests {
             heartbeats: None,
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
         }
     }
 
@@ -1309,6 +1391,7 @@ mod tests {
             heartbeats: None,
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
         };
         let app = create_router(state);
         let body = serde_json::json!({ "active": true });
@@ -1356,6 +1439,7 @@ mod tests {
             heartbeats: None,
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
         };
         let app = create_router(state);
         let response = app
@@ -1385,6 +1469,7 @@ mod tests {
             heartbeats: None,
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
         };
         let app = create_router(state);
         let body = serde_json::json!({
@@ -1427,6 +1512,7 @@ mod tests {
             heartbeats: None,
             execution_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             strategy_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            model_registry: Arc::new(ModelRegistry::new()),
         };
         let app = create_router(state);
         let body = serde_json::json!({

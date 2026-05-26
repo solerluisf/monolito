@@ -142,7 +142,6 @@ pub struct ThreadingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionDefaults {
     pub default_order_quantity: f64,
-    pub default_order_price: f64,
     pub execution_per_symbol_rate_divisor: f64,
 }
 
@@ -350,7 +349,6 @@ impl Default for ExecutionDefaults {
     fn default() -> Self {
         Self {
             default_order_quantity: 1.0,
-            default_order_price: 150.0,
             execution_per_symbol_rate_divisor: 2.0,
         }
     }

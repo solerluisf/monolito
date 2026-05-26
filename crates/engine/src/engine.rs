@@ -70,7 +70,6 @@ pub struct AssetProcessor {
     pub metrics: Arc<GlobalMetrics>,
     pub prediction_staleness_ns: u64,
     pub default_order_quantity: f64,
-    pub default_order_price: f64,
 }
 
 impl AssetProcessor {
@@ -97,7 +96,10 @@ impl AssetProcessor {
 
             for tick in batch.drain(..) {
                 let tick_start = std::time::Instant::now();
-                let normalized = self.normalizer.process(tick.clone());
+                let (normalized, gap) = self.normalizer.process(tick.clone());
+                if gap {
+                    self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
+                }
                 let features = self.feature_engine.compute(&normalized);
                 let _ = self.feature_tx.try_send(features.clone());
                 self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
@@ -118,7 +120,7 @@ impl AssetProcessor {
 
                 let strat = self.strategy.load_full();
                 if let Some(signal) = strat.evaluate(&prediction, &self.signal_ctx) {
-                    let request = self.build_risk_request(&signal, &prediction, current_spread_bps);
+                    let request = self.build_risk_request(&signal, &prediction, current_spread_bps, normalized.mid_price);
                     match self.coordinator_tx.try_send(request) {
                         Ok(()) => {
                             self.metrics.intents_generated.fetch_add(1, Ordering::Relaxed);
@@ -161,7 +163,7 @@ impl AssetProcessor {
         self.strategy.store(Arc::new(new_strategy));
     }
 
-    pub fn build_risk_request(&self, signal: &TradeIntent, prediction: &Prediction, current_spread_bps: f64) -> RiskCheckRequest {
+    pub fn build_risk_request(&self, signal: &TradeIntent, prediction: &Prediction, current_spread_bps: f64, mid_price: f64) -> RiskCheckRequest {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -176,7 +178,7 @@ impl AssetProcessor {
             intent_id: signal.intent_id.clone(),
             side: format!("{:?}", signal.side),
             quantity: self.default_order_quantity,
-            price: self.default_order_price,
+            price: mid_price,
             timestamp_ns: now,
             current_volatility,
             current_spread_bps,
@@ -491,7 +493,6 @@ impl UnifiedEngine {
                 metrics: Arc::clone(&metrics),
                 prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
                 default_order_quantity: execution_defaults.default_order_quantity,
-                default_order_price: execution_defaults.default_order_price,
             };
 
             let inference_engine = InferenceEngine::new(
@@ -807,7 +808,6 @@ impl UnifiedEngine {
                 ControlCommand::SetExecutionDefaults(update) => {
                     let mut cfg = config_arc.write();
                     cfg.execution_defaults.default_order_quantity = update.default_order_quantity;
-                    cfg.execution_defaults.default_order_price = update.default_order_price;
                     cfg.execution_defaults.execution_per_symbol_rate_divisor = update.execution_per_symbol_rate_divisor;
                     tracing::info!("Execution defaults updated via API");
                     ControlResponse::Ok
