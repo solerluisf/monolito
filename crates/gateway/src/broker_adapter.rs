@@ -26,9 +26,9 @@ impl BrokerAdapterFactory {
         match broker_type {
             "alpaca" => match crate::AlpacaExecutionPort::new("", "", true) {
                 Ok(port) => Box::new(port),
-                Err(_) => Box::new(crate::MockExecutionPort),
+                Err(_) => Box::new(crate::MockExecutionPort::default()),
             },
-            "mock" | _ => Box::new(crate::MockExecutionPort),
+            "mock" | _ => Box::new(crate::MockExecutionPort::default()),
         }
     }
 }

@@ -347,6 +347,7 @@ mod tests {
             request_id: request.request_id.clone(),
             approved: true,
             rejection_reason: None,
+            warnings: Vec::new(),
             check_index: 14,
             timestamp_ns: now,
             request,
@@ -369,7 +370,7 @@ mod tests {
         ExecutionManager::new(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort),
+            Arc::new(MockExecutionPort::default()),
             global_rate,
             per_symbol_rate,
             metrics,

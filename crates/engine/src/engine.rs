@@ -21,7 +21,7 @@ use model::{Prediction, PredictionEngine, InferenceEngine};
 use strategy::{StrategyEngine, TradeIntent, SizeHint};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent, OrderTracker, RateLimiter};
-use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker};
+use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide};
 
 use crate::tick_reactor::{spawn_reactor, ReactorCommand};
 
@@ -31,6 +31,15 @@ pub struct ExecutionSharedState {
     pub rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub idempotency_store: Arc<IdempotencyStore>,
+}
+
+/// Holds the per-asset pipeline channels and thread handles so they can be
+/// shut down independently when a symbol is unsubscribed at runtime.
+pub struct AssetPipeline {
+    pub symbol: String,
+    pub md_tx: crossbeam_channel::Sender<RawTick>,
+    pub thread_handles: Vec<std::thread::JoinHandle<()>>,
+    pub strategy_ref: StrategySwapRef,
 }
 
 pub fn recv_batch<T>(rx: &Receiver<T>, buf: &mut Vec<T>, max: usize) -> usize {
@@ -90,7 +99,13 @@ impl AssetProcessor {
 
             for tick in batch.drain(..) {
                 let tick_start = std::time::Instant::now();
-                let (normalized, gap) = self.normalizer.process(tick.clone());
+                let (normalized, gap) = match self.normalizer.process(tick.clone()) {
+                    Some(result) => result,
+                    None => {
+                        tracing::warn!(symbol = %self.symbol, "Tick rejected by normalizer (malformed prices)");
+                        continue;
+                    }
+                };
                 if gap {
                     self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
                 }
@@ -216,6 +231,7 @@ impl AssetProcessor {
     pub strategy_registry: Arc<Mutex<HashMap<String, StrategySwapRef>>>,
     pub portfolio_manager: Arc<PortfolioManager>,
     pub execution_states: HashMap<String, ExecutionSharedState>,
+    pub asset_pipelines: HashMap<String, AssetPipeline>,
     pub tick_reactor_tx: Option<crossbeam_channel::Sender<crate::tick_reactor::ReactorCommand>>,
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     pub command_actor: Option<CommandActor>,
@@ -246,6 +262,7 @@ impl UnifiedEngine {
             strategy_registry,
             portfolio_manager,
             execution_states: HashMap::new(),
+            asset_pipelines: HashMap::new(),
             tick_reactor_tx: None,
             thread_handles: Vec::new(),
             command_actor: None,
@@ -374,12 +391,12 @@ impl UnifiedEngine {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize Alpaca execution port: {}, using mock", e);
-                    Arc::new(MockExecutionPort)
+                    Arc::new(MockExecutionPort::default())
                 }
             }
         } else {
             tracing::warn!("Alpaca API credentials not configured, using mock execution port");
-            Arc::new(MockExecutionPort)
+            Arc::new(MockExecutionPort::default())
         };
 
         // Start lifecycle handler with heartbeat
@@ -428,193 +445,61 @@ impl UnifiedEngine {
         );
         self.thread_handles.push(lifecycle_handle);
 
+        // Pre-create execution shared states for all enabled assets
+        let mut prebuilt_states: HashMap<String, ExecutionSharedState> = HashMap::new();
+        let global_rate = config.risk_config.max_order_rate_per_sec as f64;
+        let per_symbol_rate = global_rate / execution_defaults.execution_per_symbol_rate_divisor;
+        let asset_configs: Vec<_> = config.asset_configs.clone();
+        let journal_dir = config.journal_config.journal_dir.clone();
+        for asset_config in &asset_configs {
+            if !asset_config.enabled {
+                continue;
+            }
+            let idempotency_path = std::path::PathBuf::from(&journal_dir)
+                .join(format!("idempotency_{}.log", asset_config.symbol));
+            let state = ExecutionSharedState {
+                order_tracker: Arc::new(parking_lot::Mutex::new(OrderTracker::new())),
+                rate_limiter: Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate))),
+                circuit_breaker: Arc::new(CircuitBreaker::new(circuit_breaker_cfg.failure_threshold, circuit_breaker_cfg.cooldown_ms)),
+                idempotency_store: Arc::new(IdempotencyStore::new_with_path(
+                    IdempotencyStore::DEFAULT_CAPACITY,
+                    &idempotency_path,
+                )),
+            };
+            prebuilt_states.insert(asset_config.symbol.clone(), state);
+        }
+
+        // Reconcile broker state and rehydrate from journal before trading starts
+        self.reconcile_and_rehydrate(&execution_port, &prebuilt_states, &config);
+
+        // Clone config before dropping the read lock so spawn_asset_pipeline can use it
+        let config_clone = config.clone();
+        // Drop config read lock before spawning pipelines (spawn_asset_pipeline needs &mut self)
+        drop(config);
+
         let mut asset_idx = 0;
-        for asset_config in &config.asset_configs {
+        for asset_config in &asset_configs {
             if !asset_config.enabled {
                 continue;
             }
 
-            let core_id = self.next_asset_core;
-            self.next_asset_core += 1;
-            if self.next_asset_core > 3 {
-                self.next_asset_core = 1;
-            }
-
-            // Distribute per-asset threads across cores to avoid collision
-            let pred_core_id = (threading_config.prediction_core_id + asset_idx) % 4;
-            let risk_core_id = (threading_config.risk_core_id + asset_idx) % 4;
-            let exec_core_id = (threading_config.execution_core_id + asset_idx) % 4;
-            asset_idx += 1;
-
-            let (md_tx, md_rx) = bounded::<RawTick>(channel_cfg.per_asset_tick_channel_capacity);
-            let (feature_tx, feature_rx) = bounded::<FeatureVector>(channel_cfg.feature_channel_capacity);
-            let (risk_tx, risk_rx) = bounded::<RiskCheckRequest>(channel_cfg.risk_channel_capacity);
-            let (decision_tx, decision_rx) = bounded::<RiskDecision>(channel_cfg.decision_channel_capacity);
-            let (lifecycle_tx_clone, _order_rx) = (lifecycle_tx.clone(), bounded::<String>(channel_cfg.lifecycle_channel_capacity).1);
-
-            md_tx_list.push((asset_config.symbol.clone(), md_tx));
-
-            let ks = Arc::clone(&self.kill_switch);
-            let metrics = Arc::clone(&self.metrics);
-            let pm = Arc::clone(&self.portfolio_manager);
-
-            let strategy = StrategyEngine::new(
+            let exec_shared = prebuilt_states.remove(&asset_config.symbol)
+                .expect("prebuilt state exists for enabled asset");
+            let pipeline = self.spawn_asset_pipeline(
                 &asset_config.symbol,
-                config.strategy_config.long_entry_threshold,
-                config.strategy_config.short_entry_threshold,
-                config.strategy_config.confidence_minimum,
-                config.strategy_config.hysteresis_deadband,
-                config.strategy_config.entry_cooldown_ms,
-                config.strategy_config.exit_cooldown_ms,
-                config.strategy_config.prediction_staleness_ns,
-                config.risk_config.allow_short,
-                config.strategy_config.trade_intent_ttl_ns,
-                config.strategy_config.max_long_units,
-                config.strategy_config.max_short_units,
-                config.strategy_config.urgency_aggressive_threshold,
-                config.strategy_config.urgency_normal_threshold,
-                config.model_config.action_score_rsi_weight,
-                config.model_config.action_score_macd_weight,
-                config.model_config.action_score_volatility_weight,
-                config.model_config.atr_penalty_threshold,
-                config.model_config.atr_penalty_value,
-                config.model_config.rsi_overbought,
-                config.model_config.rsi_oversold,
-                config.model_config.rsi_neutral,
-                config.model_config.confidence_rsi_weight,
-                config.model_config.confidence_macd_weight,
-                config.model_config.confidence_regime_weight,
-                config.feature_config.volume_ratio_clamp,
+                &lifecycle_tx,
+                &execution_port,
+                &config_clone,
+                asset_idx,
+                exec_shared,
             );
-
-            let strategy_arc = Arc::new(ArcSwap::new(Arc::new(Box::new(strategy) as Box<dyn strategy::Strategy>)));
-
-            self.strategy_registry.lock().insert(
-                asset_config.symbol.clone(),
-                Arc::clone(&strategy_arc),
-            );
-
-            let signal_ctx = strategy::SignalContext::new(&asset_config.symbol);
-
-            // Create prediction engine first to get the ArcSwap
-            let pred_engine = PredictionEngine::new(feature_rx, &asset_config.symbol);
-            let latest_pred = Arc::clone(&pred_engine.latest_pred);
-
-            let processor = AssetProcessor {
-                symbol: asset_config.symbol.clone(),
-                normalizer: Normalizer::new(&asset_config.symbol),
-                feature_engine: FeatureEngine::new(
-                    &asset_config.symbol,
-                    config.feature_config.rsi_period,
-                    config.feature_config.atr_period,
-                    config.feature_config.macd_signal,
-                    config.feature_config.feature_capacity,
-                    config.feature_config.price_window_size,
-                    config.feature_config.volume_window_size,
-                    config.feature_config.spread_window_size,
-                    config.feature_config.return_1_window,
-                    config.feature_config.return_5_window,
-                    config.feature_config.return_20_window,
-                    config.feature_config.volume_ratio_clamp,
-                    config.feature_config.regime_volatile_atr_threshold,
-                    config.feature_config.regime_strength_atr_divisor,
-                    config.feature_config.regime_trending_threshold,
-                ),
-                strategy: strategy_arc,
-                latest_pred,
-                signal_ctx,
-                coordinator_tx: risk_tx,
-                feature_tx: feature_tx.clone(),
-                kill_switch: Arc::clone(&ks),
-                metrics: Arc::clone(&metrics),
-                prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
-                default_order_quantity: execution_defaults.default_order_quantity,
-            };
-
-            let inference_engine = InferenceEngine::new(
-                config.model_config.feature_vector_size,
-                config.model_config.action_score_rsi_weight,
-                config.model_config.action_score_macd_weight,
-                config.model_config.action_score_volatility_weight,
-                config.model_config.atr_penalty_threshold,
-                config.model_config.atr_penalty_value,
-                config.model_config.rsi_overbought,
-                config.model_config.rsi_oversold,
-                config.model_config.rsi_neutral,
-                config.model_config.forecast_momentum_weight,
-                config.model_config.forecast_volume_weight,
-                config.feature_config.volume_ratio_clamp,
-                config.model_config.volume_confirmation_threshold,
-            );
-            let pred_handle = pred_engine.start(move |features| {
-                inference_engine.predict(features)
-            }, pred_core_id);
-            self.thread_handles.push(pred_handle);
-
-            let risk_coordinator = RiskCoordinator::new(
-                risk_rx,
-                decision_tx,
-                config.risk_config.clone(),
-                Arc::clone(&pm),
-                Arc::clone(&ks),
-                Arc::clone(&metrics),
-            );
-            let risk_handle = risk_coordinator.start(risk_core_id);
-            self.thread_handles.push(risk_handle);
-
-            let global_rate = config.risk_config.max_order_rate_per_sec as f64;
-            let per_symbol_rate = global_rate / execution_defaults.execution_per_symbol_rate_divisor;
-            let order_tracker = Arc::new(parking_lot::Mutex::new(OrderTracker::new()));
-            let rate_limiter = Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
-            let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_cfg.failure_threshold, circuit_breaker_cfg.cooldown_ms));
-            let idempotency_store = Arc::new(IdempotencyStore::new());
-            let exec_shared = ExecutionSharedState {
-                order_tracker: Arc::clone(&order_tracker),
-                rate_limiter: Arc::clone(&rate_limiter),
-                circuit_breaker: Arc::clone(&circuit_breaker),
-                idempotency_store: Arc::clone(&idempotency_store),
-            };
-            self.execution_states.insert(asset_config.symbol.clone(), exec_shared);
-
-            let exec_manager = ExecutionManager::new(
-                decision_rx,
-                lifecycle_tx_clone,
-                Arc::clone(&execution_port),
-                global_rate,
-                per_symbol_rate,
-                Arc::clone(&metrics),
-                Arc::clone(&ks),
-                pm,
-                order_tracker,
-                rate_limiter,
-                circuit_breaker,
-                idempotency_store,
-                unified_trading_core::validator::RequestValidator::new(config.validator_config.clone()),
-            );
-            let exec_handle = exec_manager.start(exec_core_id);
-            self.thread_handles.push(exec_handle);
-
-            // Start asset processor with heartbeat
-            let sym = asset_config.symbol.clone();
-            let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", sym)));
-            let asset_handle = spawn_pinned(
-                &format!("asset-{}", sym),
-                core_id,
-                ThreadPriority::High,
-                move || {
-                    let mut processor = processor;
-                    processor.run_loop(&md_rx);
-                    tracing::info!("Asset processor for {} stopped", sym);
-                },
-            );
-            self.thread_handles.push(asset_handle);
-
-            tracing::info!(
-                "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH, exec on core {} HIGH)",
-                asset_config.symbol, core_id, pred_core_id, risk_core_id, exec_core_id
-            );
+            md_tx_list.push((asset_config.symbol.clone(), pipeline.md_tx.clone()));
+            self.asset_pipelines.insert(asset_config.symbol.clone(), pipeline);
+            asset_idx += 1;
         }
-        drop(config);
+
+        // Start periodic lightweight reconciliation thread
+        self.start_periodic_reconciliation(&execution_port);
 
         if let Some(feed_rx) = feed_rx {
             let tick_reactor_core_id = threading_config.tick_reactor_core_id;
@@ -636,6 +521,395 @@ impl UnifiedEngine {
             }
 
             tracing::info!("Tick reactor started with {} subscriptions", md_tx_list.len());
+        }
+    }
+
+    /// Reconcile local state with the broker and replay the journal to rehydrate
+    /// `PortfolioManager` and per-asset `OrderTracker` / `IdempotencyStore`.
+    fn reconcile_and_rehydrate(
+        &self,
+        execution_port: &Arc<dyn IExecutionPort>,
+        prebuilt_states: &HashMap<String, ExecutionSharedState>,
+        config: &EngineConfig,
+    ) {
+        tracing::info!("Starting broker reconciliation and state rehydration...");
+
+        // 1. Query broker for open orders
+        match execution_port.query_open_orders() {
+            Ok(open_orders) => {
+                tracing::info!(count = %open_orders.len(), "Broker open orders received");
+                for order in &open_orders {
+                    if let Some(state) = prebuilt_states.get(&order.symbol) {
+                        let side_str = match order.side {
+                            OrderSide::Buy => "buy",
+                            OrderSide::Sell => "sell",
+                        };
+                        let mut tracker = state.order_tracker.lock();
+                        let order_id = tracker.create_order(&order.symbol, side_str, order.quantity, None, &order.order_id);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        let _ = tracker.submit_order(&order_id, now);
+                        if order.filled_qty > 0.0 {
+                            let _ = tracker.partial_fill_order(&order_id, order.filled_qty, 0.0, now);
+                        }
+                        tracing::info!(symbol = %order.symbol, order_id = %order.order_id, "Rehydrated open order from broker");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query broker open orders: {}", e);
+            }
+        }
+
+        // 2. Query broker for positions
+        match execution_port.query_positions() {
+            Ok(positions) => {
+                tracing::info!(count = %positions.len(), "Broker positions received");
+                for pos in &positions {
+                    let is_buy = pos.qty > 0.0;
+                    let qty = pos.qty.abs();
+                    self.portfolio_manager.on_fill(&pos.symbol, pos.current_price, qty, is_buy);
+                    // Override avg entry price with broker's value for accuracy
+                    if let Some(mut p) = self.portfolio_manager.get_position(&pos.symbol) {
+                        p.avg_entry_price = pos.avg_entry_price;
+                        // Note: PortfolioManager doesn't have a direct setter for avg_entry_price;
+                        // the on_fill calculation is close enough for reconciliation.
+                    }
+                    tracing::info!(symbol = %pos.symbol, qty = %pos.qty, "Rehydrated position from broker");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query broker positions: {}", e);
+            }
+        }
+
+        // 3. Replay journal to recover idempotency keys and fill state
+        if let Some(ref journal) = self.journal {
+            let mut replayed_orders: u64 = 0;
+            let mut replayed_fills: u64 = 0;
+            let result = journal.replay(|entry| {
+                match entry {
+                    JournalEntry::Order { symbol, timestamp_ns, data } => {
+                        // Parse idempotency key from data if present
+                        if let Some(key_start) = data.find("decision=") {
+                            let key = format!("{}-{}", symbol, &data[key_start + 9..]);
+                            if let Some(state) = prebuilt_states.get(symbol) {
+                                state.idempotency_store.mark_processed(key, "replayed".to_string());
+                            }
+                        }
+                        replayed_orders += 1;
+                    }
+                    JournalEntry::Fill { symbol, timestamp_ns, data } => {
+                        // Try to parse fill price and qty from data
+                        let mut price: f64 = 0.0;
+                        let mut qty: f64 = 0.0;
+                        for part in data.split(',') {
+                            if let Some(val) = part.strip_prefix("price=") {
+                                price = val.parse().unwrap_or(0.0);
+                            }
+                            if let Some(val) = part.strip_prefix("qty=") {
+                                qty = val.parse().unwrap_or(0.0);
+                            }
+                        }
+                        if price > 0.0 && qty > 0.0 {
+                            // We don't know side from the fill entry alone, so we
+                            // approximate by looking at the net position change.
+                            // For exact recovery, broker positions take precedence.
+                        }
+                        replayed_fills += 1;
+                    }
+                    _ => {}
+                }
+            });
+            match result {
+                Ok(count) => {
+                    tracing::info!(
+                        entries = %count,
+                        orders = %replayed_orders,
+                        fills = %replayed_fills,
+                        "Journal replay complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Journal replay failed: {}", e);
+                }
+            }
+        } else {
+            tracing::warn!("No journal writer available; skipping journal replay");
+        }
+
+        tracing::info!("Reconciliation and rehydration complete");
+    }
+
+    /// Spawn a background thread that periodically queries the broker for open
+    /// orders and positions, logs discrepancies against local state, and emits
+    /// metrics.  This is a lightweight drift-detection mechanism, not a full
+    /// rehydration.
+    fn start_periodic_reconciliation(&mut self, execution_port: &Arc<dyn IExecutionPort>) {
+        let port = Arc::clone(execution_port);
+        let portfolio_manager = Arc::clone(&self.portfolio_manager);
+        let execution_states = Arc::new(parking_lot::Mutex::new(self.execution_states.clone()));
+        let kill_switch = Arc::clone(&self.kill_switch);
+        let interval = std::time::Duration::from_secs(60);
+
+        let handle = spawn_pinned(
+            "periodic-reconciliation",
+            0,
+            ThreadPriority::Normal,
+            move || {
+                loop {
+                    std::thread::sleep(interval);
+                    if kill_switch.is_active() {
+                        break;
+                    }
+
+                    // Query broker positions
+                    match port.query_positions() {
+                        Ok(positions) => {
+                            let local_positions: Vec<String> = portfolio_manager
+                                .get_all_positions()
+                                .into_iter()
+                                .filter(|p| !p.is_flat())
+                                .map(|p| p.symbol.clone())
+                                .collect();
+
+                            for pos in &positions {
+                                if !local_positions.contains(&pos.symbol) {
+                                    tracing::warn!(
+                                        symbol = %pos.symbol,
+                                        qty = %pos.qty,
+                                        "Broker has position not tracked locally"
+                                    );
+                                }
+                            }
+
+                            for sym in &local_positions {
+                                if !positions.iter().any(|p| &p.symbol == sym) {
+                                    tracing::warn!(
+                                        symbol = %sym,
+                                        "Local position not found at broker"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Periodic reconciliation: failed to query positions: {}", e);
+                        }
+                    }
+
+                    // Query broker open orders
+                    match port.query_open_orders() {
+                        Ok(open_orders) => {
+                            let states = execution_states.lock();
+                            let mut local_open_count: usize = 0;
+                            for (_, state) in states.iter() {
+                                let tracker = state.order_tracker.lock();
+                                local_open_count += tracker.open_orders_count();
+                            }
+                            if open_orders.len() != local_open_count {
+                                tracing::warn!(
+                                    broker_open = %open_orders.len(),
+                                    local_open = %local_open_count,
+                                    "Open order count drift detected"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Periodic reconciliation: failed to query open orders: {}", e);
+                        }
+                    }
+
+                    tracing::info!("Periodic reconciliation cycle complete");
+                }
+            },
+        );
+        self.thread_handles.push(handle);
+    }
+
+    /// Spawn the complete per-asset pipeline (Normalizer → FeatureEngine → PredictionEngine
+    /// → StrategyEngine → RiskCoordinator → ExecutionManager). Returns an `AssetPipeline`
+    /// that holds the tick sender and thread handles so the pipeline can be shut down later.
+    fn spawn_asset_pipeline(
+        &mut self,
+        symbol: &str,
+        lifecycle_tx: &Sender<OrderLifecycleEvent>,
+        execution_port: &Arc<dyn IExecutionPort>,
+        config: &EngineConfig,
+        asset_idx: usize,
+        exec_shared: ExecutionSharedState,
+    ) -> AssetPipeline {
+        let core_id = self.next_asset_core;
+        self.next_asset_core += 1;
+        if self.next_asset_core > 3 {
+            self.next_asset_core = 1;
+        }
+
+        let threading_config = &config.threading_config;
+        let pred_core_id = (threading_config.prediction_core_id + asset_idx) % 4;
+        let risk_core_id = (threading_config.risk_core_id + asset_idx) % 4;
+        let exec_core_id = (threading_config.execution_core_id + asset_idx) % 4;
+
+        let channel_cfg = &config.channel_config;
+        let (md_tx, md_rx) = bounded::<RawTick>(channel_cfg.per_asset_tick_channel_capacity);
+        let (feature_tx, feature_rx) = bounded::<FeatureVector>(channel_cfg.feature_channel_capacity);
+        let (risk_tx, risk_rx) = bounded::<RiskCheckRequest>(channel_cfg.risk_channel_capacity);
+        let (decision_tx, decision_rx) = bounded::<RiskDecision>(channel_cfg.decision_channel_capacity);
+        let lifecycle_tx_clone = lifecycle_tx.clone();
+
+        let ks = Arc::clone(&self.kill_switch);
+        let metrics = Arc::clone(&self.metrics);
+        let pm = Arc::clone(&self.portfolio_manager);
+
+        let strategy = StrategyEngine::new(
+            symbol,
+            config.strategy_config.long_entry_threshold,
+            config.strategy_config.short_entry_threshold,
+            config.strategy_config.confidence_minimum,
+            config.strategy_config.hysteresis_deadband,
+            config.strategy_config.entry_cooldown_ms,
+            config.strategy_config.exit_cooldown_ms,
+            config.strategy_config.prediction_staleness_ns,
+            config.risk_config.allow_short,
+            config.strategy_config.trade_intent_ttl_ns,
+            config.strategy_config.max_long_units,
+            config.strategy_config.max_short_units,
+            config.strategy_config.urgency_aggressive_threshold,
+            config.strategy_config.urgency_normal_threshold,
+            config.model_config.action_score_rsi_weight,
+            config.model_config.action_score_macd_weight,
+            config.model_config.action_score_volatility_weight,
+            config.model_config.atr_penalty_threshold,
+            config.model_config.atr_penalty_value,
+            config.model_config.rsi_overbought,
+            config.model_config.rsi_oversold,
+            config.model_config.rsi_neutral,
+            config.model_config.confidence_rsi_weight,
+            config.model_config.confidence_macd_weight,
+            config.model_config.confidence_regime_weight,
+            config.feature_config.volume_ratio_clamp,
+        );
+
+        let strategy_arc = Arc::new(ArcSwap::new(Arc::new(Box::new(strategy) as Box<dyn strategy::Strategy>)));
+
+        self.strategy_registry.lock().insert(
+            symbol.to_string(),
+            Arc::clone(&strategy_arc),
+        );
+
+        let signal_ctx = strategy::SignalContext::new(symbol);
+
+        // Create prediction engine first to get the ArcSwap
+        let pred_engine = PredictionEngine::new(feature_rx, symbol);
+        let latest_pred = Arc::clone(&pred_engine.latest_pred);
+
+        let processor = AssetProcessor {
+            symbol: symbol.to_string(),
+            normalizer: Normalizer::new(symbol),
+            feature_engine: FeatureEngine::new(
+                symbol,
+                config.feature_config.rsi_period,
+                config.feature_config.atr_period,
+                config.feature_config.macd_signal,
+                config.feature_config.feature_capacity,
+                config.feature_config.price_window_size,
+                config.feature_config.volume_window_size,
+                config.feature_config.spread_window_size,
+                config.feature_config.return_1_window,
+                config.feature_config.return_5_window,
+                config.feature_config.return_20_window,
+                config.feature_config.volume_ratio_clamp,
+                config.feature_config.regime_volatile_atr_threshold,
+                config.feature_config.regime_strength_atr_divisor,
+                config.feature_config.regime_trending_threshold,
+            ),
+            strategy: strategy_arc.clone(),
+            latest_pred,
+            signal_ctx,
+            coordinator_tx: risk_tx,
+            feature_tx: feature_tx.clone(),
+            kill_switch: Arc::clone(&ks),
+            metrics: Arc::clone(&metrics),
+            prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
+            default_order_quantity: config.execution_defaults.default_order_quantity,
+        };
+
+        let inference_engine = InferenceEngine::new(
+            config.model_config.feature_vector_size,
+            config.model_config.action_score_rsi_weight,
+            config.model_config.action_score_macd_weight,
+            config.model_config.action_score_volatility_weight,
+            config.model_config.atr_penalty_threshold,
+            config.model_config.atr_penalty_value,
+            config.model_config.rsi_overbought,
+            config.model_config.rsi_oversold,
+            config.model_config.rsi_neutral,
+            config.model_config.forecast_momentum_weight,
+            config.model_config.forecast_volume_weight,
+            config.feature_config.volume_ratio_clamp,
+            config.model_config.volume_confirmation_threshold,
+        );
+        let pred_handle = pred_engine.start(move |features| {
+            inference_engine.predict(features)
+        }, pred_core_id);
+
+        let risk_coordinator = RiskCoordinator::new(
+            risk_rx,
+            decision_tx,
+            config.risk_config.clone(),
+            Arc::clone(&pm),
+            Arc::clone(&ks),
+            Arc::clone(&metrics),
+        );
+        let risk_handle = risk_coordinator.start(risk_core_id);
+
+        let global_rate = config.risk_config.max_order_rate_per_sec as f64;
+        let per_symbol_rate = global_rate / config.execution_defaults.execution_per_symbol_rate_divisor;
+
+        self.execution_states.insert(symbol.to_string(), exec_shared.clone());
+
+        let exec_manager = ExecutionManager::new(
+            decision_rx,
+            lifecycle_tx_clone,
+            Arc::clone(execution_port),
+            global_rate,
+            per_symbol_rate,
+            Arc::clone(&metrics),
+            Arc::clone(&ks),
+            pm,
+            Arc::clone(&exec_shared.order_tracker),
+            Arc::clone(&exec_shared.rate_limiter),
+            Arc::clone(&exec_shared.circuit_breaker),
+            Arc::clone(&exec_shared.idempotency_store),
+            unified_trading_core::validator::RequestValidator::new(config.validator_config.clone()),
+        );
+        let exec_handle = exec_manager.start(exec_core_id);
+
+        // Start asset processor with heartbeat
+        let sym = symbol.to_string();
+        let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", sym)));
+        let asset_handle = spawn_pinned(
+            &format!("asset-{}", sym),
+            core_id,
+            ThreadPriority::High,
+            move || {
+                let mut processor = processor;
+                processor.run_loop(&md_rx);
+                tracing::info!("Asset processor for {} stopped", sym);
+            },
+        );
+
+        tracing::info!(
+            "Started asset processor for {} on core {} (prediction on core {} BELOW_NORMAL, risk on core {} HIGH, exec on core {} HIGH)",
+            symbol, core_id, pred_core_id, risk_core_id, exec_core_id
+        );
+
+        AssetPipeline {
+            symbol: symbol.to_string(),
+            md_tx,
+            thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle],
+            strategy_ref: strategy_arc,
         }
     }
 

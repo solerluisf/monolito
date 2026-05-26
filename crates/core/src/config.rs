@@ -1,4 +1,35 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckSeverity {
+    Veto,
+    Advisory,
+    Info,
+}
+
+impl Default for CheckSeverity {
+    fn default() -> Self {
+        CheckSeverity::Veto
+    }
+}
+
+/// Default severity for each built-in risk check.
+/// Operators can override these at runtime via config.
+pub fn default_check_severities() -> HashMap<String, CheckSeverity> {
+    let mut map = HashMap::new();
+    map.insert("kill_switch".to_string(), CheckSeverity::Veto);
+    map.insert("idempotency".to_string(), CheckSeverity::Veto);
+    map.insert("staleness".to_string(), CheckSeverity::Veto);
+    map.insert("order_rate".to_string(), CheckSeverity::Veto);
+    map.insert("position_limit".to_string(), CheckSeverity::Veto);
+    map.insert("portfolio_exposure".to_string(), CheckSeverity::Veto);
+    map.insert("leverage".to_string(), CheckSeverity::Veto);
+    map.insert("drawdown".to_string(), CheckSeverity::Veto);
+    map.insert("volatility".to_string(), CheckSeverity::Advisory);
+    map.insert("spread".to_string(), CheckSeverity::Advisory);
+    map
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -43,6 +74,7 @@ pub struct RiskConfig {
     pub risk_intent_staleness_ns: u64,
     pub portfolio_flat_threshold: f64,
     pub initial_equity: f64,
+    pub severity_overrides: std::collections::HashMap<String, CheckSeverity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +263,7 @@ impl Default for RiskConfig {
             risk_intent_staleness_ns: 2_000_000_000,
             portfolio_flat_threshold: 0.001,
             initial_equity: 100_000.0,
+            severity_overrides: default_check_severities(),
         }
     }
 }

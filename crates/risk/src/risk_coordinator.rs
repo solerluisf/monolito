@@ -28,10 +28,13 @@ impl RiskCoordinator {
         kill_switch: Arc<KillSwitch>,
         metrics: Arc<GlobalMetrics>,
     ) -> Self {
+        let severity_overrides = config.severity_overrides.clone();
+        let mut engine = RiskEngine::new(config, portfolio);
+        engine.severity_overrides = severity_overrides;
         Self {
             request_rx,
             decision_tx,
-            engine: RiskEngine::new(config, portfolio),
+            engine,
             kill_switch,
             metrics,
             running: Arc::new(AtomicBool::new(true)),

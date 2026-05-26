@@ -149,6 +149,8 @@ impl FeatureEngine {
         let mut fv = FeatureVector::new(&self.symbol, tick.timestamp_ns);
 
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&self.window_manager, tick);
+        // Clamp spread_bps to a sane max (500 bps = 5%) to avoid poisoning from corrupt data
+        let spread_bps = spread_bps.min(500.0).max(0.0);
         fv.set(FeatureIndex::MidPrice, mid);
         fv.set(FeatureIndex::SpreadBps, spread_bps);
         fv.set(FeatureIndex::SpreadAbs, spread_abs);
@@ -164,7 +166,9 @@ impl FeatureEngine {
         fv.set(FeatureIndex::Atr14, atr);
         fv.set(FeatureIndex::RollingStd, std_dev);
 
-        let volume_ratio = VolumeComputer::compute(&self.window_manager, tick);
+        let volume_ratio = VolumeComputer::compute(&self.window_manager, tick)
+            .min(self.volume_ratio_clamp as f32)
+            .max(0.0);
         fv.set(FeatureIndex::VolumeRatio, volume_ratio);
 
         let ofi = MicrostructureComputer::compute_order_flow_imbalance(tick);

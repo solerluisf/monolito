@@ -17,7 +17,7 @@ pub mod large_pages;
 
 pub use kill_switch::KillSwitch;
 pub use metrics::{GlobalMetrics, MetricsSnapshot};
-pub use config::EngineConfig;
+pub use config::{EngineConfig, CheckSeverity, default_check_severities};
 pub use journal::JournalWriter;
 pub use journal::JournalEntry;
 pub use journal::JournalCommand;

@@ -58,20 +58,28 @@ impl Normalizer {
         }
     }
 
-    pub fn process(&mut self, raw: RawTick) -> (NormalizedTick, bool) {
+    /// Returns `None` if the tick contains invalid prices (NaN, Inf, non-positive, or bid > ask).
+    pub fn process(&mut self, raw: RawTick) -> Option<(NormalizedTick, bool)> {
+        if !Self::validate_tick(&raw) {
+            tracing::warn!(
+                symbol = %raw.symbol,
+                bid = %raw.bid,
+                ask = %raw.ask,
+                last_price = %raw.last_price,
+                "Rejected malformed tick: NaN, Inf, non-positive price, or crossed book"
+            );
+            return None;
+        }
+
         let mid_price = (raw.bid + raw.ask) / 2.0;
         let spread = raw.ask - raw.bid;
-        let spread_bps = if mid_price > 0.0 {
-            (spread / mid_price) * 10_000.0
-        } else {
-            0.0
-        };
+        let spread_bps = (spread / mid_price) * 10_000.0;
 
         self.last_sequence += 1;
         let gap = self.last_timestamp_ns > 0 && raw.timestamp_ns > self.last_timestamp_ns + 1_000_000_000;
         self.last_timestamp_ns = raw.timestamp_ns;
 
-        (NormalizedTick {
+        Some((NormalizedTick {
             symbol: raw.symbol,
             timestamp_ns: raw.timestamp_ns,
             mid_price,
@@ -82,7 +90,16 @@ impl Normalizer {
             bid_size: raw.bid_size,
             ask_size: raw.ask_size,
             volume: raw.last_size,
-        }, gap)
+        }, gap))
+    }
+
+    fn validate_tick(raw: &RawTick) -> bool {
+        for &price in &[raw.bid, raw.ask, raw.last_price] {
+            if price.is_nan() || price.is_infinite() || price <= 0.0 {
+                return false;
+            }
+        }
+        raw.bid <= raw.ask
     }
 
     pub fn check_sequence(&self, expected: u64) -> Option<u64> {
@@ -167,7 +184,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
         };
-        let (normalized, _gap) = norm.process(raw);
+        let (normalized, _gap) = norm.process(raw).unwrap();
         assert_eq!(normalized.symbol, "AAPL");
         assert!((normalized.mid_price - 150.025).abs() < 0.001);
         assert!((normalized.spread - 0.05).abs() < 0.001);
@@ -187,7 +204,7 @@ mod tests {
             last_size: 10,
             exchange: "IEX".to_string(),
         };
-        let (normalized, _gap) = norm.process(raw);
+        let (normalized, _gap) = norm.process(raw).unwrap();
         assert!((normalized.spread_bps - 1.0).abs() < 0.01);
     }
 
@@ -204,7 +221,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
-        });
+        }).unwrap();
         assert!(norm.check_sequence(2).is_none());
         assert!(norm.check_sequence(5).is_some());
     }
@@ -222,7 +239,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
-        });
+        }).unwrap();
         assert!(!norm.check_staleness(1_100_000_000, 200_000_000));
         assert!(norm.check_staleness(1_300_000_000, 200_000_000));
     }
@@ -244,5 +261,110 @@ mod tests {
         assert!(alert.is_some());
         let alert = alert.unwrap();
         assert!(matches!(alert.alert_type, FeedAlertType::LatencySpike));
+    }
+
+    #[test]
+    fn test_normalizer_rejects_nan_bid() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: f64::NAN,
+            ask: 150.05,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 150.02,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        assert!(norm.process(raw).is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_inf_ask() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: 150.0,
+            ask: f64::INFINITY,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 150.02,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        assert!(norm.process(raw).is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_zero_price() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: 150.0,
+            ask: 150.05,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 0.0,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        assert!(norm.process(raw).is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_negative_bid() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: -1.0,
+            ask: 150.05,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 150.02,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        assert!(norm.process(raw).is_none());
+    }
+
+    #[test]
+    fn test_normalizer_rejects_crossed_book() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: 160.0,
+            ask: 150.05,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 150.02,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        assert!(norm.process(raw).is_none());
+    }
+
+    #[test]
+    fn test_normalizer_accepts_valid_tick() {
+        let mut norm = Normalizer::new("AAPL");
+        let raw = RawTick {
+            symbol: "AAPL".to_string(),
+            timestamp_ns: 1000,
+            bid: 150.0,
+            ask: 150.05,
+            bid_size: 100,
+            ask_size: 200,
+            last_price: 150.02,
+            last_size: 50,
+            exchange: "IEX".to_string(),
+        };
+        let result = norm.process(raw);
+        assert!(result.is_some());
+        let (normalized, _) = result.unwrap();
+        assert!((normalized.mid_price - 150.025).abs() < 0.001);
     }
 }

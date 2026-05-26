@@ -13,9 +13,12 @@ pub struct IdempotencyStore {
     processed: Mutex<HashMap<String, Entry>>,
     access_order: Mutex<VecDeque<String>>,
     capacity: usize,
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl IdempotencyStore {
+    pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY;
+
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
@@ -25,6 +28,66 @@ impl IdempotencyStore {
             processed: Mutex::new(HashMap::with_capacity(capacity)),
             access_order: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            persist_path: None,
+        }
+    }
+
+    pub fn new_with_path(capacity: usize, path: &std::path::Path) -> Self {
+        let mut store = Self {
+            processed: Mutex::new(HashMap::with_capacity(capacity)),
+            access_order: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+            persist_path: Some(path.to_path_buf()),
+        };
+        store.load_from_disk();
+        store
+    }
+
+    fn load_from_disk(&mut self) {
+        let Some(ref path) = self.persist_path else { return };
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!("Failed to read idempotency store: {}", e);
+                return;
+            }
+        };
+
+        let mut processed = self.processed.lock();
+        let mut access_order = self.access_order.lock();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let key = parts[0].to_string();
+            let result = parts[1].to_string();
+            let entry = Entry {
+                result,
+                last_accessed: std::time::Instant::now(),
+            };
+            processed.insert(key.clone(), entry);
+            access_order.push_front(key);
+        }
+    }
+
+    fn append_to_disk(&self, key: &str, result: &str) {
+        let Some(ref path) = self.persist_path else { return };
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Failed to open idempotency store for append: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{} {}", key, result) {
+            tracing::warn!("Failed to append to idempotency store: {}", e);
         }
     }
 
@@ -51,17 +114,20 @@ impl IdempotencyStore {
             }
         }
 
-        let entry = Entry {
-            result,
-            last_accessed: Instant::now(),
-        };
-
         if processed.contains_key(&key) {
             access_order.retain(|k| k != &key);
         }
 
+        let entry = Entry {
+            result: result.clone(),
+            last_accessed: Instant::now(),
+        };
+
         processed.insert(key.clone(), entry);
-        access_order.push_front(key);
+        access_order.push_front(key.clone());
+        drop(processed);
+        drop(access_order);
+        self.append_to_disk(&key, &result);
     }
 
     pub fn get_result(&self, key: &str) -> Option<String> {
@@ -95,6 +161,11 @@ impl IdempotencyStore {
         let mut access_order = self.access_order.lock();
         processed.clear();
         access_order.clear();
+        drop(processed);
+        drop(access_order);
+        if let Some(ref path) = self.persist_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn update_access_order(&self, key: &str) {
@@ -181,5 +252,27 @@ mod tests {
         assert_eq!(store.len(), 2);
         store.clear();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_disk_persistence() {
+        let tmp_path = std::env::temp_dir().join(format!("idempotency_test_{}", std::process::id()));
+        {
+            let store = IdempotencyStore::new_with_path(100, &tmp_path);
+            store.mark_processed("key1".to_string(), "result1".to_string());
+            store.mark_processed("key2".to_string(), "result2".to_string());
+            assert_eq!(store.len(), 2);
+            // store dropped here; file should persist
+        }
+
+        {
+            let store2 = IdempotencyStore::new_with_path(100, &tmp_path);
+            assert!(store2.is_processed("key1"));
+            assert!(store2.is_processed("key2"));
+            assert_eq!(store2.get_result("key1"), Some("result1".to_string()));
+            assert_eq!(store2.len(), 2);
+        }
+
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

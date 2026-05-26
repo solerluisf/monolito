@@ -11,6 +11,7 @@ pub use alpaca_execution::{
     IExecutionPort, OrderCommand, OrderSide, OrderType, TimeInForce,
     CancelCommand, ReplaceCommand, StatusQuery, OrderStatusResponse,
     AlpacaExecutionPort, MockExecutionPort,
+    OpenOrderInfo, PositionInfo,
 };
 pub use alpaca::AlpacaAdapter;
 pub use circuit_breaker::CircuitBreaker;

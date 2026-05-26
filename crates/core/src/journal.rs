@@ -32,6 +32,7 @@ pub struct JournalWriter {
     handle: Option<thread::JoinHandle<()>>,
     write_count: Arc<AtomicU64>,
     metrics: Arc<GlobalMetrics>,
+    journal_dir: PathBuf,
 }
 
 impl JournalWriter {
@@ -67,7 +68,49 @@ impl JournalWriter {
             handle: Some(handle),
             write_count,
             metrics,
+            journal_dir: path,
         }
+    }
+
+    pub fn replay<F>(&self, mut handler: F) -> Result<u64, String>
+    where
+        F: FnMut(&JournalEntry),
+    {
+        let mut entries_read: u64 = 0;
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+
+        // Collect all journal files in the directory
+        if let Ok(entries) = std::fs::read_dir(&self.journal_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("journal_") && name_str.ends_with(".log") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+
+        // Sort by file name (which includes timestamp) for deterministic replay order
+        files.sort();
+
+        for file_path in files {
+            let content = std::fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read journal file {:?}: {}", file_path, e))?;
+
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(entry) = parse_entry_line(line) {
+                    handler(&entry);
+                    entries_read += 1;
+                }
+            }
+        }
+
+        Ok(entries_read)
     }
 
     fn run_loop(
@@ -158,6 +201,80 @@ impl JournalWriter {
         if let Some(handle) = self.handle {
             let _ = handle.join();
         }
+    }
+}
+
+fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
+    let parts: Vec<&str> = line.splitn(4, '|').collect();
+    if parts.len() < 3 {
+        return Err("Invalid journal line format".to_string());
+    }
+
+    let entry_type = parts[0];
+    let timestamp_ns: u64 = parts[2].parse().map_err(|e| format!("Bad timestamp: {}", e))?;
+
+    match entry_type {
+        "TICK" => {
+            if parts.len() != 4 {
+                return Err("Invalid TICK entry".to_string());
+            }
+            Ok(JournalEntry::Tick {
+                symbol: parts[1].to_string(),
+                timestamp_ns,
+                data: parts[3].to_string(),
+            })
+        }
+        "INTENT" => {
+            if parts.len() != 4 {
+                return Err("Invalid INTENT entry".to_string());
+            }
+            Ok(JournalEntry::Intent {
+                symbol: parts[1].to_string(),
+                timestamp_ns,
+                data: parts[3].to_string(),
+            })
+        }
+        "FILL" => {
+            if parts.len() != 4 {
+                return Err("Invalid FILL entry".to_string());
+            }
+            Ok(JournalEntry::Fill {
+                symbol: parts[1].to_string(),
+                timestamp_ns,
+                data: parts[3].to_string(),
+            })
+        }
+        "ORDER" => {
+            if parts.len() != 4 {
+                return Err("Invalid ORDER entry".to_string());
+            }
+            Ok(JournalEntry::Order {
+                symbol: parts[1].to_string(),
+                timestamp_ns,
+                data: parts[3].to_string(),
+            })
+        }
+        "SNAPSHOT" => {
+            if parts.len() == 3 {
+                Ok(JournalEntry::Snapshot {
+                    timestamp_ns,
+                    data: parts[2].to_string(),
+                })
+            } else {
+                Err("Invalid SNAPSHOT entry".to_string())
+            }
+        }
+        "EVENT" => {
+            if parts.len() != 4 {
+                return Err("Invalid EVENT entry".to_string());
+            }
+            Ok(JournalEntry::Event {
+                event_type: parts[1].to_string(),
+                timestamp_ns,
+                data: parts[3].to_string(),
+            })
+        }
+        _ => Err(format!("Unknown journal entry type: {}", entry_type)),
     }
 }
 
@@ -282,6 +399,64 @@ mod tests {
         assert_eq!(count, 1);
 
         writer.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_journal_replay() {
+        let metrics = Arc::new(GlobalMetrics::new());
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("journal_replay_test_{}", std::process::id()));
+        let writer = JournalWriter::new(
+            tmp_dir.to_str().unwrap(),
+            10,
+            Arc::clone(&metrics),
+            0,
+        );
+
+        let entries = vec![
+            JournalEntry::Order {
+                symbol: "AAPL".to_string(),
+                timestamp_ns: 100,
+                data: "order_id=o1,side=Buy,qty=10,decision=req-1".to_string(),
+            },
+            JournalEntry::Fill {
+                symbol: "AAPL".to_string(),
+                timestamp_ns: 200,
+                data: "price=150.0,qty=10".to_string(),
+            },
+            JournalEntry::Tick {
+                symbol: "MSFT".to_string(),
+                timestamp_ns: 300,
+                data: "price=300.0".to_string(),
+            },
+        ];
+
+        for entry in &entries {
+            writer.write(entry.clone()).unwrap();
+        }
+        assert!(writer.flush_sync().is_ok());
+        writer.shutdown();
+
+        let writer2 = JournalWriter::new(
+            tmp_dir.to_str().unwrap(),
+            10,
+            Arc::clone(&metrics),
+            0,
+        );
+
+        let mut replayed = Vec::new();
+        let count = writer2.replay(|entry| {
+            replayed.push(entry.clone());
+        }).expect("replay should succeed");
+
+        assert_eq!(count, 3);
+        assert_eq!(replayed.len(), 3);
+        assert!(matches!(replayed[0], JournalEntry::Order { .. }));
+        assert!(matches!(replayed[1], JournalEntry::Fill { .. }));
+        assert!(matches!(replayed[2], JournalEntry::Tick { .. }));
+
+        writer2.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

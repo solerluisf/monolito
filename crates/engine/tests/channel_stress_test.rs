@@ -59,7 +59,7 @@ fn run_processor(
         }
 
         for tick in batch.drain(..) {
-            let (normalized, _gap) = normalizer.process(tick.clone());
+            let (normalized, _gap) = normalizer.process(tick.clone()).unwrap();
             let features = feature_engine.compute(&normalized);
             let _ = feature_tx.try_send(features.clone());
 
@@ -134,7 +134,7 @@ fn test_pipeline_with_500k_ticks() {
     let exec_manager = ExecutionManager::new(
         decision_rx,
         lifecycle_tx,
-        Arc::new(MockExecutionPort),
+        Arc::new(MockExecutionPort::default()),
         100_000.0,
         50_000.0,
         Arc::clone(&metrics),

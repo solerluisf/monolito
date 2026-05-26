@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::alpaca_execution::{
-    AlpacaOrderRequest, AlpacaOrderResponse, CancelCommand, IExecutionPort,
+    AlpacaOrderRequest, AlpacaOrderResponse, AlpacaPosition, CancelCommand, IExecutionPort,
     OrderCommand, OrderSide, ReplaceCommand, StatusQuery, OrderStatusResponse, OrderType, TimeInForce,
+    OpenOrderInfo, PositionInfo,
 };
 
 pub struct AlpacaAdapter {
@@ -247,6 +248,104 @@ impl IExecutionPort for AlpacaAdapter {
         );
 
         Ok(resp)
+    }
+
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
+        let url = format!("{}/orders?status=open", self.base_url);
+
+        let response = self.client
+            .get(&url)
+            .headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(
+                    "APCA-API-KEY-ID",
+                    reqwest::header::HeaderValue::from_str(&self.api_key).unwrap(),
+                );
+                h.insert(
+                    "APCA-API-SECRET-KEY",
+                    reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap(),
+                );
+                h
+            })
+            .send()
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("Query open orders failed: {} - {}", status, body));
+        }
+
+        let orders: Vec<AlpacaOrderResponse> = response
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let mut result = Vec::new();
+        for order in orders {
+            let total_qty: f64 = order.qty.parse().unwrap_or(0.0);
+            let filled_qty: f64 = order.filled_qty.parse().unwrap_or(0.0);
+            result.push(OpenOrderInfo {
+                order_id: order.id,
+                symbol: order.symbol,
+                side: match order.side.to_lowercase().as_str() {
+                    "buy" => OrderSide::Buy,
+                    _ => OrderSide::Sell,
+                },
+                quantity: total_qty,
+                filled_qty,
+                status: order.status,
+            });
+        }
+
+        tracing::info!(count = %result.len(), "Queried open orders from Alpaca via Adapter");
+        Ok(result)
+    }
+
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, String> {
+        let url = format!("{}/positions", self.base_url);
+
+        let response = self.client
+            .get(&url)
+            .headers({
+                let mut h = reqwest::header::HeaderMap::new();
+                h.insert(
+                    "APCA-API-KEY-ID",
+                    reqwest::header::HeaderValue::from_str(&self.api_key).unwrap(),
+                );
+                h.insert(
+                    "APCA-API-SECRET-KEY",
+                    reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap(),
+                );
+                h
+            })
+            .send()
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("Query positions failed: {} - {}", status, body));
+        }
+
+        let positions: Vec<AlpacaPosition> = response
+            .json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let mut result = Vec::new();
+        for pos in positions {
+            let qty: f64 = pos.qty.parse().unwrap_or(0.0);
+            let avg_entry: f64 = pos.avg_entry_price.parse().unwrap_or(0.0);
+            let current: f64 = pos.current_price.parse().unwrap_or(0.0);
+            result.push(PositionInfo {
+                symbol: pos.symbol,
+                qty,
+                avg_entry_price: avg_entry,
+                current_price: current,
+            });
+        }
+
+        tracing::info!(count = %result.len(), "Queried positions from Alpaca via Adapter");
+        Ok(result)
     }
 }
 

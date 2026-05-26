@@ -89,11 +89,31 @@ impl OrderStatusResponse {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenOrderInfo {
+    pub order_id: String,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub quantity: f64,
+    pub filled_qty: f64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionInfo {
+    pub symbol: String,
+    pub qty: f64,
+    pub avg_entry_price: f64,
+    pub current_price: f64,
+}
+
 pub trait IExecutionPort: Send + Sync {
     fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String>;
     fn cancel_order(&self, cmd: &CancelCommand) -> Result<(), String>;
     fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, String>;
     fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String>;
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String>;
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, String>;
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +146,14 @@ pub(crate) struct AlpacaOrderResponse {
 pub(crate) struct AlpacaCancelResponse {
     pub(crate) id: String,
     pub(crate) status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AlpacaPosition {
+    pub(crate) symbol: String,
+    pub(crate) qty: String,
+    pub(crate) avg_entry_price: String,
+    pub(crate) current_price: String,
 }
 
 pub struct AlpacaExecutionPort {
@@ -172,6 +200,15 @@ impl AlpacaExecutionPort {
     }
 }
 
+impl AlpacaExecutionPort {
+    fn get_headers_map(&self) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("APCA-API-KEY-ID", reqwest::header::HeaderValue::from_str(&self.api_key).unwrap());
+        h.insert("APCA-API-SECRET-KEY", reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap());
+        h
+    }
+}
+
 impl IExecutionPort for AlpacaExecutionPort {
     fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
         let side = match cmd.side {
@@ -206,13 +243,7 @@ impl IExecutionPort for AlpacaExecutionPort {
         let url = format!("{}/orders", self.base_url);
 
         let response = self.client.post(&url)
-            .headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert("APCA-API-KEY-ID", reqwest::header::HeaderValue::from_str(&self.api_key).unwrap());
-                h.insert("APCA-API-SECRET-KEY", reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap());
-                h.insert("Content-Type", reqwest::header::HeaderValue::from_static("application/json"));
-                h
-            })
+            .headers(self.get_headers_map())
             .json(&req)
             .send()
             .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -235,12 +266,7 @@ impl IExecutionPort for AlpacaExecutionPort {
         let url = format!("{}/orders/{}", self.base_url, cmd.execution_id);
 
         let response = self.client.delete(&url)
-            .headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert("APCA-API-KEY-ID", reqwest::header::HeaderValue::from_str(&self.api_key).unwrap());
-                h.insert("APCA-API-SECRET-KEY", reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap());
-                h
-            })
+            .headers(self.get_headers_map())
             .send()
             .map_err(|e| format!("HTTP request failed: {}", e))?;
 
@@ -267,13 +293,7 @@ impl IExecutionPort for AlpacaExecutionPort {
         }
 
         let response = self.client.patch(&url)
-            .headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert("APCA-API-KEY-ID", reqwest::header::HeaderValue::from_str(&self.api_key).unwrap());
-                h.insert("APCA-API-SECRET-KEY", reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap());
-                h.insert("Content-Type", reqwest::header::HeaderValue::from_static("application/json"));
-                h
-            })
+            .headers(self.get_headers_map())
             .json(&body)
             .send()
             .map_err(|e| format!("HTTP request failed: {}", e))?;
@@ -296,12 +316,7 @@ impl IExecutionPort for AlpacaExecutionPort {
         let url = format!("{}/orders/{}", self.base_url, query.execution_id);
 
         let response = self.client.get(&url)
-            .headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert("APCA-API-KEY-ID", reqwest::header::HeaderValue::from_str(&self.api_key).unwrap());
-                h.insert("APCA-API-SECRET-KEY", reqwest::header::HeaderValue::from_str(&self.api_secret).unwrap());
-                h
-            })
+            .headers(self.get_headers_map())
             .send()
             .map_err(|e| format!("HTTP request failed: {}", e))?;
 
@@ -339,9 +354,90 @@ impl IExecutionPort for AlpacaExecutionPort {
 
         Ok(response)
     }
+
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
+        let url = format!("{}/orders?status=open", self.base_url);
+
+        let response = self.client.get(&url)
+            .headers(self.get_headers_map())
+            .send()
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("Query open orders failed: {} - {}", status, body));
+        }
+
+        let orders: Vec<AlpacaOrderResponse> = response.json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let mut result = Vec::new();
+        for order in orders {
+            let total_qty: f64 = order.qty.parse().unwrap_or(0.0);
+            let filled_qty: f64 = order.filled_qty.parse().unwrap_or(0.0);
+            result.push(OpenOrderInfo {
+                order_id: order.id,
+                symbol: order.symbol,
+                side: Self::parse_side(&order.side),
+                quantity: total_qty,
+                filled_qty,
+                status: order.status,
+            });
+        }
+
+        tracing::info!(count = %result.len(), "Queried open orders from Alpaca");
+        Ok(result)
+    }
+
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, String> {
+        let url = format!("{}/positions", self.base_url);
+
+        let response = self.client.get(&url)
+            .headers(self.get_headers_map())
+            .send()
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(format!("Query positions failed: {} - {}", status, body));
+        }
+
+        let positions: Vec<AlpacaPosition> = response.json()
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let mut result = Vec::new();
+        for pos in positions {
+            let qty: f64 = pos.qty.parse().unwrap_or(0.0);
+            let avg_entry: f64 = pos.avg_entry_price.parse().unwrap_or(0.0);
+            let current: f64 = pos.current_price.parse().unwrap_or(0.0);
+            result.push(PositionInfo {
+                symbol: pos.symbol,
+                qty,
+                avg_entry_price: avg_entry,
+                current_price: current,
+            });
+        }
+
+        tracing::info!(count = %result.len(), "Queried positions from Alpaca");
+        Ok(result)
+    }
 }
 
-pub struct MockExecutionPort;
+pub struct MockExecutionPort {
+    pub open_orders: Vec<OpenOrderInfo>,
+    pub positions: Vec<PositionInfo>,
+}
+
+impl Default for MockExecutionPort {
+    fn default() -> Self {
+        Self {
+            open_orders: Vec::new(),
+            positions: Vec::new(),
+        }
+    }
+}
 
 impl IExecutionPort for MockExecutionPort {
     fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
@@ -365,6 +461,14 @@ impl IExecutionPort for MockExecutionPort {
             100,
         ).with_fill(100, 150.0))
     }
+
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
+        Ok(self.open_orders.clone())
+    }
+
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, String> {
+        Ok(self.positions.clone())
+    }
 }
 
 #[cfg(test)]
@@ -373,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_mock_execution_port_submit() {
-        let port = MockExecutionPort;
+        let port = MockExecutionPort::default();
         let cmd = OrderCommand {
             order_id: "test-1".to_string(),
             symbol: "AAPL".to_string(),
@@ -392,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_mock_execution_port_cancel() {
-        let port = MockExecutionPort;
+        let port = MockExecutionPort::default();
         let cmd = CancelCommand {
             execution_id: "test-1".to_string(),
         };
@@ -413,5 +517,35 @@ mod tests {
         assert_eq!(response.filled_qty, 50);
         assert_eq!(response.remaining_qty, 50);
         assert_eq!(response.avg_fill_price, Some(150.0));
+    }
+
+    #[test]
+    fn test_mock_query_open_orders() {
+        let mut port = MockExecutionPort::default();
+        port.open_orders.push(OpenOrderInfo {
+            order_id: "o1".to_string(),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            quantity: 10.0,
+            filled_qty: 0.0,
+            status: "new".to_string(),
+        });
+        let orders = port.query_open_orders().unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].symbol, "AAPL");
+    }
+
+    #[test]
+    fn test_mock_query_positions() {
+        let mut port = MockExecutionPort::default();
+        port.positions.push(PositionInfo {
+            symbol: "AAPL".to_string(),
+            qty: 100.0,
+            avg_entry_price: 150.0,
+            current_price: 155.0,
+        });
+        let positions = port.query_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "AAPL");
     }
 }

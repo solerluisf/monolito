@@ -182,6 +182,9 @@ impl<T: Clone + Default> RollingWindow<T> {
             })
             .sum::<f64>()
             / (vals.len() - 1) as f64;
+        if !variance.is_finite() || variance < 0.0 {
+            return 0.0;
+        }
         variance.sqrt()
     }
 }
@@ -280,6 +283,72 @@ impl ATRState {
         self.last_low = low;
         self.last_close = close;
         self.tr_values.mean()
+    }
+}
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn rolling_window_mean_is_finite(values in prop::collection::vec(any::<f64>(), 0..100)) {
+            let mut rw = RollingWindow::new(20);
+            for v in values {
+                if v.is_finite() {
+                    rw.push(v);
+                }
+            }
+            let mean = rw.mean();
+            prop_assert!(mean.is_finite(), "mean should be finite, got {}", mean);
+        }
+
+        #[test]
+        fn rolling_window_std_dev_non_negative(values in prop::collection::vec(any::<f64>(), 0..100)) {
+            let mut rw = RollingWindow::new(20);
+            for v in values {
+                if v.is_finite() {
+                    rw.push(v);
+                }
+            }
+            let std_dev = rw.std_dev();
+            prop_assert!(std_dev >= 0.0, "std_dev should be non-negative, got {}", std_dev);
+            prop_assert!(std_dev.is_finite() || std_dev == 0.0,
+                "std_dev should be finite, got {}", std_dev);
+        }
+
+        #[test]
+        fn rsi_state_never_nan_or_inf(prices in prop::collection::vec(any::<f64>(), 0..50)) {
+            let mut rsi = RSIState::new(14);
+            rsi.last_price = 100.0;
+            for price in prices {
+                if price > 0.0 && price.is_finite() {
+                    let val = rsi.update(price);
+                    prop_assert!(val.is_finite(), "RSI should be finite, got {}", val);
+                    prop_assert!(val >= 0.0 && val <= 100.0,
+                        "RSI should be in [0,100], got {}", val);
+                }
+            }
+        }
+
+        #[test]
+        fn atr_state_never_nan_or_inf(highs in prop::collection::vec(any::<f64>(), 0..50),
+                                       lows in prop::collection::vec(any::<f64>(), 0..50),
+                                       closes in prop::collection::vec(any::<f64>(), 0..50)) {
+            let mut atr = ATRState::new(14);
+            atr.last_close = 100.0;
+            for i in 0..highs.len().min(lows.len()).min(closes.len()) {
+                let h = highs[i];
+                let l = lows[i];
+                let c = closes[i];
+                if h > 0.0 && h.is_finite() && l > 0.0 && l.is_finite() && c > 0.0 && c.is_finite() && h >= l {
+                    let val = atr.update(h, l, c);
+                    prop_assert!(val.is_finite() && val >= 0.0,
+                        "ATR should be finite and non-negative, got {}", val);
+                }
+            }
+        }
     }
 }
 

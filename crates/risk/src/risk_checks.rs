@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unified_trading_core::config::RiskConfig;
+use unified_trading_core::config::{RiskConfig, CheckSeverity, default_check_severities};
 use unified_trading_core::portfolio_manager::PortfolioManager;
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,7 @@ pub struct RiskDecision {
     pub request_id: String,
     pub approved: bool,
     pub rejection_reason: Option<String>,
+    pub warnings: Vec<String>,
     pub check_index: usize,
     pub timestamp_ns: u64,
     pub request: RiskCheckRequest,
@@ -33,6 +35,7 @@ impl RiskDecision {
             request_id: request.request_id.clone(),
             approved: true,
             rejection_reason: None,
+            warnings: Vec::new(),
             check_index: 14,
             timestamp_ns: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -47,6 +50,7 @@ impl RiskDecision {
             request_id: request.request_id.clone(),
             approved: false,
             rejection_reason: Some(reason.to_string()),
+            warnings: Vec::new(),
             check_index,
             timestamp_ns: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -63,6 +67,7 @@ pub struct RiskEngine {
     pub idempotency_store: std::collections::HashSet<String>,
     pub order_rate_tokens: f64,
     pub order_rate_last_refill: u64,
+    pub severity_overrides: HashMap<String, CheckSeverity>,
 }
 
 impl RiskEngine {
@@ -74,85 +79,117 @@ impl RiskEngine {
             idempotency_store: std::collections::HashSet::new(),
             order_rate_tokens: max_order_rate,
             order_rate_last_refill: 0,
+            severity_overrides: default_check_severities(),
         }
+    }
+
+    fn severity(&self, check_name: &str) -> CheckSeverity {
+        self.severity_overrides
+            .get(check_name)
+            .copied()
+            .unwrap_or(CheckSeverity::Veto)
     }
 
     #[tracing::instrument(skip_all, fields(symbol = %request.symbol, intent_id = %request.intent_id))]
     pub fn check(&mut self, request: &RiskCheckRequest, kill_switch_active: bool) -> RiskDecision {
-        if let Some(decision) = Self::check_kill_switch(self, request, kill_switch_active) {
-            return decision;
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Phase 1: Run all hard Veto checks first (these block the order)
+        macro_rules! run_veto {
+            ($name:literal, $index:expr, $check:expr) => {
+                if let Some(reason) = $check {
+                    match self.severity($name) {
+                        CheckSeverity::Veto => {
+                            return RiskDecision::rejected(request, &reason, $index);
+                        }
+                        CheckSeverity::Advisory => {
+                            tracing::warn!(check = $name, reason = %reason, "Advisory risk check triggered");
+                            warnings.push(reason);
+                        }
+                        CheckSeverity::Info => {
+                            tracing::info!(check = $name, reason = %reason, "Info risk check note");
+                        }
+                    }
+                }
+            };
         }
-        if let Some(decision) = Self::check_idempotency(self, request, kill_switch_active) {
-            return decision;
+
+        run_veto!("kill_switch", 0, self.check_kill_switch(kill_switch_active));
+        run_veto!("idempotency", 1, self.check_idempotency(request));
+        run_veto!("staleness", 2, self.check_staleness(request));
+        run_veto!("order_rate", 3, self.check_order_rate(request));
+        run_veto!("position_limit", 4, self.check_position_limit(request));
+        run_veto!("portfolio_exposure", 5, self.check_portfolio_exposure(request));
+        run_veto!("leverage", 6, self.check_leverage(request));
+        run_veto!("drawdown", 7, self.check_drawdown(request));
+
+        // Phase 2: Run Advisory / Info checks (volatility, spread)
+        if let Some(reason) = self.check_volatility(request) {
+            match self.severity("volatility") {
+                CheckSeverity::Veto => return RiskDecision::rejected(request, &reason, 8),
+                CheckSeverity::Advisory => {
+                    tracing::warn!(check = "volatility", reason = %reason, "Advisory risk check triggered");
+                    warnings.push(reason);
+                }
+                CheckSeverity::Info => {
+                    tracing::info!(check = "volatility", reason = %reason, "Info risk check note");
+                }
+            }
         }
-        if let Some(decision) = Self::check_staleness(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_order_rate(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_position_limit(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_portfolio_exposure(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_leverage(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_drawdown(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_volatility(self, request, kill_switch_active) {
-            return decision;
-        }
-        if let Some(decision) = Self::check_spread(self, request, kill_switch_active) {
-            return decision;
+
+        if let Some(reason) = self.check_spread(request) {
+            match self.severity("spread") {
+                CheckSeverity::Veto => return RiskDecision::rejected(request, &reason, 9),
+                CheckSeverity::Advisory => {
+                    tracing::warn!(check = "spread", reason = %reason, "Advisory risk check triggered");
+                    warnings.push(reason);
+                }
+                CheckSeverity::Info => {
+                    tracing::info!(check = "spread", reason = %reason, "Info risk check note");
+                }
+            }
         }
 
         self.idempotency_store.insert(request.intent_id.clone());
-        RiskDecision::approved(request)
+        if warnings.is_empty() {
+            RiskDecision::approved(request)
+        } else {
+            let mut decision = RiskDecision::approved(request);
+            decision.warnings = warnings;
+            decision
+        }
     }
 
-    fn check_kill_switch(&mut self, _request: &RiskCheckRequest, kill_switch_active: bool) -> Option<RiskDecision> {
+    fn check_kill_switch(&self, kill_switch_active: bool) -> Option<String> {
         if kill_switch_active {
-            return Some(RiskDecision::rejected(
-                _request,
-                "Kill switch active",
-                0,
-            ));
+            Some("Kill switch active".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_idempotency(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_idempotency(&self, request: &RiskCheckRequest) -> Option<String> {
         if self.idempotency_store.contains(&request.intent_id) {
-            return Some(RiskDecision::rejected(
-                request,
-                "Duplicate intent_id",
-                1,
-            ));
+            Some("Duplicate intent_id".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_staleness(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_staleness(&self, request: &RiskCheckRequest) -> Option<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         let age_ns = now.saturating_sub(request.timestamp_ns);
         if age_ns > self.config.risk_intent_staleness_ns {
-            return Some(RiskDecision::rejected(
-                request,
-                "Intent expired",
-                2,
-            ));
+            Some("Intent expired".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_order_rate(&mut self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_order_rate(&mut self, _request: &RiskCheckRequest) -> Option<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -166,43 +203,34 @@ impl RiskEngine {
         self.order_rate_last_refill = now;
 
         if self.order_rate_tokens < 1.0 {
-            return Some(RiskDecision::rejected(
-                request,
-                "Order rate limit exceeded",
-                3,
-            ));
+            Some("Order rate limit exceeded".to_string())
+        } else {
+            self.order_rate_tokens -= 1.0;
+            None
         }
-        self.order_rate_tokens -= 1.0;
-        None
     }
 
-    fn check_position_limit(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_position_limit(&self, request: &RiskCheckRequest) -> Option<String> {
         let current = self.portfolio.net_position(&request.symbol);
         let new_position = current + request.quantity;
         if new_position.abs() * request.price > self.config.max_position_per_symbol {
-            return Some(RiskDecision::rejected(
-                request,
-                "Position limit exceeded",
-                4,
-            ));
+            Some("Position limit exceeded".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_portfolio_exposure(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_portfolio_exposure(&self, request: &RiskCheckRequest) -> Option<String> {
         let metrics = self.portfolio.get_metrics();
         let new_exposure = metrics.gross_exposure + request.quantity * request.price;
         if new_exposure > self.config.max_portfolio_exposure {
-            return Some(RiskDecision::rejected(
-                request,
-                "Portfolio exposure limit exceeded",
-                5,
-            ));
+            Some("Portfolio exposure limit exceeded".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_leverage(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_leverage(&self, request: &RiskCheckRequest) -> Option<String> {
         let metrics = self.portfolio.get_metrics();
         let new_exposure = metrics.gross_exposure + request.quantity * request.price;
         let new_leverage = if metrics.current_equity > 0.0 {
@@ -211,49 +239,42 @@ impl RiskEngine {
             0.0
         };
         if new_leverage > self.config.max_leverage {
-            return Some(RiskDecision::rejected(
-                request,
-                "Leverage limit exceeded",
-                6,
-            ));
+            Some("Leverage limit exceeded".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_drawdown(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_drawdown(&self, _request: &RiskCheckRequest) -> Option<String> {
         let metrics = self.portfolio.get_metrics();
         if metrics.drawdown_pct > self.config.max_drawdown_pct {
-            return Some(RiskDecision::rejected(
-                request,
-                "Drawdown limit exceeded",
-                7,
-            ));
+            Some("Drawdown limit exceeded".to_string())
+        } else {
+            None
         }
-        None
     }
 
-    fn check_volatility(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_volatility(&self, request: &RiskCheckRequest) -> Option<String> {
         if request.current_volatility > self.config.max_volatility {
-            return Some(RiskDecision::rejected(
-                request,
-                &format!("Volatility too high: {:.4} > {:.4}", request.current_volatility, self.config.max_volatility),
-                8,
-            ));
+            Some(format!(
+                "Volatility too high: {:.4} > {:.4}",
+                request.current_volatility, self.config.max_volatility
+            ))
+        } else {
+            None
         }
-        None
     }
 
-    fn check_spread(&self, request: &RiskCheckRequest, _ks: bool) -> Option<RiskDecision> {
+    fn check_spread(&self, request: &RiskCheckRequest) -> Option<String> {
         if request.current_spread_bps > self.config.max_spread_bps {
-            return Some(RiskDecision::rejected(
-                request,
-                &format!("Spread too wide: {:.2} bps > {:.2} bps", request.current_spread_bps, self.config.max_spread_bps),
-                9,
-            ));
+            Some(format!(
+                "Spread too wide: {:.2} bps > {:.2} bps",
+                request.current_spread_bps, self.config.max_spread_bps
+            ))
+        } else {
+            None
         }
-        None
     }
-
 }
 
 #[cfg(test)]
@@ -357,8 +378,9 @@ mod tests {
         request.current_volatility = 0.05; // Above threshold
         
         let decision = engine.check(&request, false);
-        assert!(!decision.approved);
-        assert!(decision.rejection_reason.unwrap().contains("Volatility"));
+        // By default volatility is Advisory, so it should be approved with a warning
+        assert!(decision.approved);
+        assert!(decision.warnings.iter().any(|w| w.contains("Volatility")));
     }
 
     #[test]
@@ -366,6 +388,37 @@ mod tests {
         let mut config = RiskConfig::default();
         config.max_spread_bps = 20.0;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_spread_bps = 50.0; // Above threshold
+        
+        let decision = engine.check(&request, false);
+        // By default spread is Advisory, so it should be approved with a warning
+        assert!(decision.approved);
+        assert!(decision.warnings.iter().any(|w| w.contains("Spread")));
+    }
+
+    #[test]
+    fn test_risk_engine_volatility_veto() {
+        let mut config = RiskConfig::default();
+        config.max_volatility = 0.02;
+        let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+        engine.severity_overrides.insert("volatility".to_string(), CheckSeverity::Veto);
+
+        let mut request = make_request("AAPL", 10.0, 150.0);
+        request.current_volatility = 0.05; // Above threshold
+        
+        let decision = engine.check(&request, false);
+        assert!(!decision.approved);
+        assert!(decision.rejection_reason.unwrap().contains("Volatility"));
+    }
+
+    #[test]
+    fn test_risk_engine_spread_veto() {
+        let mut config = RiskConfig::default();
+        config.max_spread_bps = 20.0;
+        let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+        engine.severity_overrides.insert("spread".to_string(), CheckSeverity::Veto);
 
         let mut request = make_request("AAPL", 10.0, 150.0);
         request.current_spread_bps = 50.0; // Above threshold
@@ -386,6 +439,7 @@ mod tests {
         
         let decision = engine.check(&request, false);
         assert!(decision.approved);
+        assert!(decision.warnings.is_empty());
     }
 
     #[test]
@@ -399,5 +453,6 @@ mod tests {
         
         let decision = engine.check(&request, false);
         assert!(decision.approved);
+        assert!(decision.warnings.is_empty());
     }
 }

@@ -57,7 +57,7 @@ fn run_processor(
         }
 
         for tick in batch.drain(..) {
-            let (normalized, _gap) = normalizer.process(tick.clone());
+            let (normalized, _gap) = normalizer.process(tick.clone()).unwrap();
             let features = feature_engine.compute(&normalized);
             let _ = feature_tx.try_send(features.clone());
 
@@ -132,7 +132,7 @@ fn test_full_pipeline_tick_to_intent() {
     let exec_manager = ExecutionManager::new(
         decision_rx,
         lifecycle_tx,
-        Arc::new(MockExecutionPort),
+        Arc::new(MockExecutionPort::default()),
         10.0,
         5.0,
         Arc::clone(&metrics),
@@ -216,7 +216,7 @@ fn test_pipeline_with_burst_ticks() {
     let exec_manager = ExecutionManager::new(
         decision_rx,
         lifecycle_tx,
-        Arc::new(MockExecutionPort),
+        Arc::new(MockExecutionPort::default()),
         10.0,
         5.0,
         Arc::clone(&metrics),
@@ -300,7 +300,7 @@ fn test_kill_switch_stops_pipeline() {
     let exec_manager = ExecutionManager::new(
         decision_rx,
         lifecycle_tx,
-        Arc::new(MockExecutionPort),
+        Arc::new(MockExecutionPort::default()),
         10.0,
         5.0,
         Arc::clone(&metrics),
