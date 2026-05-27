@@ -42,12 +42,18 @@ pub fn pin_to_core(core_id: usize) -> Result<(), PinError> {
         }
         Ok(())
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let thread_id = unsafe { libc::pthread_self() };
-        let mask = 1u64 << core_id;
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
-            libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<u64>(), &mask)
+            libc::CPU_ZERO(&mut mask);
+            libc::CPU_SET(core_id, &mut mask);
+            libc::pthread_setaffinity_np(
+                thread_id,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mask,
+            )
         };
         if result != 0 {
             return Err(PinError {
@@ -56,11 +62,10 @@ pub fn pin_to_core(core_id: usize) -> Result<(), PinError> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
-    #[cfg(not(unix))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         Err(PinError {
-            message: "Core pinning not implemented for this platform".to_string(),
+            message: "Core pinning is only implemented for Linux on Unix platforms".to_string(),
         })
     }
 }

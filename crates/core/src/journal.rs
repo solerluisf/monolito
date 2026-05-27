@@ -433,10 +433,8 @@ mod tests {
             data: "price=150.0".to_string(),
         };
         assert!(writer.write(entry).is_ok());
-
-        std::thread::sleep(Duration::from_millis(20));
-        let count = writer.write_count();
-        assert!(count > 0);
+        assert!(writer.flush_sync().is_ok());
+        assert_eq!(writer.write_count(), 1);
 
         writer.shutdown();
         let _ = fs::remove_dir_all(&tmp_dir);
