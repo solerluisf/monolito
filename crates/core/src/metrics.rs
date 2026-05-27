@@ -2,6 +2,35 @@ use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::collections::HashMap;
 use parking_lot::Mutex;
 
+/// Cache-line padded atomic counter to reduce false sharing between hot fields.
+#[repr(align(64))]
+pub struct CachePaddedAtomicU64 {
+    value: AtomicU64,
+}
+
+impl CachePaddedAtomicU64 {
+    pub fn new(value: u64) -> Self {
+        Self {
+            value: AtomicU64::new(value),
+        }
+    }
+
+    #[inline]
+    pub fn fetch_add(&self, val: u64, ordering: Ordering) -> u64 {
+        self.value.fetch_add(val, ordering)
+    }
+
+    #[inline]
+    pub fn load(&self, ordering: Ordering) -> u64 {
+        self.value.load(ordering)
+    }
+
+    #[inline]
+    pub fn store(&self, val: u64, ordering: Ordering) {
+        self.value.store(val, ordering);
+    }
+}
+
 /// Histogram buckets for latency measurements (in nanoseconds)
 /// Buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms
 pub const LATENCY_BUCKETS: [u64; 6] = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, u64::MAX];
@@ -54,27 +83,27 @@ impl LatencyHistogram {
 }
 
 pub struct GlobalMetrics {
-    pub ticks_processed: AtomicU64,
-    pub features_computed: AtomicU64,
-    pub inferences_run: AtomicU64,
-    pub intents_generated: AtomicU64,
-    pub intents_approved: AtomicU64,
-    pub intents_rejected: AtomicU64,
-    pub dropped_intents: AtomicU64,
-    pub stale_predictions: AtomicU64,
-    pub model_fallback_activations: AtomicU64,
-    pub orders_submitted: AtomicU64,
-    pub orders_filled: AtomicU64,
-    pub orders_cancelled: AtomicU64,
-    pub orders_rejected: AtomicU64,
-    pub orders_lifecycle_events: AtomicU64,
-    pub circuit_breaker_trips: AtomicU64,
-    pub kill_switch_activations: AtomicU64,
-    pub config_reloads: AtomicU64,
-    pub journal_writes: AtomicU64,
-    pub heartbeat_misses: AtomicU64,
-    pub errors: AtomicU64,
-    pub feed_gaps: AtomicU64,
+    pub ticks_processed: CachePaddedAtomicU64,
+    pub features_computed: CachePaddedAtomicU64,
+    pub inferences_run: CachePaddedAtomicU64,
+    pub intents_generated: CachePaddedAtomicU64,
+    pub intents_approved: CachePaddedAtomicU64,
+    pub intents_rejected: CachePaddedAtomicU64,
+    pub dropped_intents: CachePaddedAtomicU64,
+    pub stale_predictions: CachePaddedAtomicU64,
+    pub model_fallback_activations: CachePaddedAtomicU64,
+    pub orders_submitted: CachePaddedAtomicU64,
+    pub orders_filled: CachePaddedAtomicU64,
+    pub orders_cancelled: CachePaddedAtomicU64,
+    pub orders_rejected: CachePaddedAtomicU64,
+    pub orders_lifecycle_events: CachePaddedAtomicU64,
+    pub circuit_breaker_trips: CachePaddedAtomicU64,
+    pub kill_switch_activations: CachePaddedAtomicU64,
+    pub config_reloads: CachePaddedAtomicU64,
+    pub journal_writes: CachePaddedAtomicU64,
+    pub heartbeat_misses: CachePaddedAtomicU64,
+    pub errors: CachePaddedAtomicU64,
+    pub feed_gaps: CachePaddedAtomicU64,
     // Latency histograms
     pub tick_to_intent_latency: LatencyHistogram,
     pub risk_check_latency: LatencyHistogram,
@@ -100,27 +129,27 @@ pub struct GlobalMetrics {
 impl GlobalMetrics {
     pub fn new() -> Self {
         Self {
-            ticks_processed: AtomicU64::new(0),
-            features_computed: AtomicU64::new(0),
-            inferences_run: AtomicU64::new(0),
-            intents_generated: AtomicU64::new(0),
-            intents_approved: AtomicU64::new(0),
-            intents_rejected: AtomicU64::new(0),
-            dropped_intents: AtomicU64::new(0),
-            stale_predictions: AtomicU64::new(0),
-            model_fallback_activations: AtomicU64::new(0),
-            orders_submitted: AtomicU64::new(0),
-            orders_filled: AtomicU64::new(0),
-            orders_cancelled: AtomicU64::new(0),
-            orders_rejected: AtomicU64::new(0),
-            orders_lifecycle_events: AtomicU64::new(0),
-            circuit_breaker_trips: AtomicU64::new(0),
-            kill_switch_activations: AtomicU64::new(0),
-            config_reloads: AtomicU64::new(0),
-            journal_writes: AtomicU64::new(0),
-            heartbeat_misses: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
-            feed_gaps: AtomicU64::new(0),
+            ticks_processed: CachePaddedAtomicU64::new(0),
+            features_computed: CachePaddedAtomicU64::new(0),
+            inferences_run: CachePaddedAtomicU64::new(0),
+            intents_generated: CachePaddedAtomicU64::new(0),
+            intents_approved: CachePaddedAtomicU64::new(0),
+            intents_rejected: CachePaddedAtomicU64::new(0),
+            dropped_intents: CachePaddedAtomicU64::new(0),
+            stale_predictions: CachePaddedAtomicU64::new(0),
+            model_fallback_activations: CachePaddedAtomicU64::new(0),
+            orders_submitted: CachePaddedAtomicU64::new(0),
+            orders_filled: CachePaddedAtomicU64::new(0),
+            orders_cancelled: CachePaddedAtomicU64::new(0),
+            orders_rejected: CachePaddedAtomicU64::new(0),
+            orders_lifecycle_events: CachePaddedAtomicU64::new(0),
+            circuit_breaker_trips: CachePaddedAtomicU64::new(0),
+            kill_switch_activations: CachePaddedAtomicU64::new(0),
+            config_reloads: CachePaddedAtomicU64::new(0),
+            journal_writes: CachePaddedAtomicU64::new(0),
+            heartbeat_misses: CachePaddedAtomicU64::new(0),
+            errors: CachePaddedAtomicU64::new(0),
+            feed_gaps: CachePaddedAtomicU64::new(0),
             tick_to_intent_latency: LatencyHistogram::new(),
             risk_check_latency: LatencyHistogram::new(),
             journal_flush_latency: LatencyHistogram::new(),
@@ -332,6 +361,8 @@ impl Default for GlobalMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_metrics_initial_state() {
@@ -368,5 +399,38 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.intents_approved, 10);
         assert_eq!(snap.intents_rejected, 3);
+    }
+
+    /// Micro-benchmark style contention test:
+    /// - Two threads hammer two hot counters.
+    /// - With cache-line padding, counters should not false-share a cache line.
+    ///
+    /// For Linux perf validation (acceptance criteria), run:
+    /// `perf stat -e cache-misses,cache-references cargo test -p core metrics_false_sharing_hammer -- --nocapture`
+    /// (Adjust `-p` package name if needed by workspace manifest.)
+    #[test]
+    fn metrics_false_sharing_hammer() {
+        let metrics = Arc::new(GlobalMetrics::new());
+        let iterations = 2_000_000u64;
+
+        let m1 = Arc::clone(&metrics);
+        let t1 = thread::spawn(move || {
+            for _ in 0..iterations {
+                m1.ticks_processed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let m2 = Arc::clone(&metrics);
+        let t2 = thread::spawn(move || {
+            for _ in 0..iterations {
+                m2.features_computed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        t1.join().expect("thread 1 join failed");
+        t2.join().expect("thread 2 join failed");
+
+        assert_eq!(metrics.ticks_processed.load(Ordering::Relaxed), iterations);
+        assert_eq!(metrics.features_computed.load(Ordering::Relaxed), iterations);
     }
 }
