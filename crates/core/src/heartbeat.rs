@@ -26,6 +26,7 @@ pub struct ThreadHeartbeatMonitor {
     heartbeats: Arc<parking_lot::RwLock<HashMap<String, Arc<AtomicU64>>>>,
     handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    asset_watchdog_timeout_ns: u64,
 }
 
 impl ThreadHeartbeatMonitor {
@@ -44,12 +45,22 @@ impl ThreadHeartbeatMonitor {
         let m = Arc::clone(&metrics);
         let r = Arc::clone(&running);
 
+        let asset_watchdog_timeout_ns = timeout_ns.saturating_div(2).max(1);
+
         let handle = spawn_pinned(
             "heartbeat-monitor",
             core_id,
             ThreadPriority::Normal,
             move || {
-                Self::run_loop(&hb, &ks, &m, timeout_ns, check_interval_ms, &r);
+                Self::run_loop(
+                    &hb,
+                    &ks,
+                    &m,
+                    timeout_ns,
+                    asset_watchdog_timeout_ns,
+                    check_interval_ms,
+                    &r,
+                );
             },
         );
 
@@ -57,6 +68,7 @@ impl ThreadHeartbeatMonitor {
             heartbeats,
             handle: Some(handle.expect("spawn_pinned failed")),
             running,
+            asset_watchdog_timeout_ns,
         }
     }
 
@@ -65,6 +77,7 @@ impl ThreadHeartbeatMonitor {
         kill_switch: &KillSwitch,
         metrics: &GlobalMetrics,
         timeout_ns: u64,
+        asset_watchdog_timeout_ns: u64,
         check_interval_ms: u64,
         running: &AtomicBool,
     ) {
@@ -84,9 +97,34 @@ impl ThreadHeartbeatMonitor {
             let map = heartbeats.read();
             for (name, ts) in map.iter() {
                 let last = ts.load(Ordering::Relaxed);
-                if last > 0 && now.saturating_sub(last) > timeout_ns {
+                if last == 0 {
+                    continue;
+                }
+
+                let stale_ns = now.saturating_sub(last);
+                let watchdog_timeout_ns = if name.starts_with("asset-") {
+                    asset_watchdog_timeout_ns
+                } else {
+                    timeout_ns
+                };
+
+                if stale_ns > watchdog_timeout_ns {
                     metrics.heartbeat_misses.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("Thread {} heartbeat stale, triggering KillSwitch", name);
+                    if name.starts_with("asset-") {
+                        tracing::warn!(
+                            thread = %name,
+                            stale_ns = stale_ns,
+                            timeout_ns = watchdog_timeout_ns,
+                            "Asset watchdog heartbeat stale, triggering KillSwitch"
+                        );
+                    } else {
+                        tracing::warn!(
+                            thread = %name,
+                            stale_ns = stale_ns,
+                            timeout_ns = watchdog_timeout_ns,
+                            "Thread heartbeat stale, triggering KillSwitch"
+                        );
+                    }
                     kill_switch.activate();
                 }
             }
@@ -102,6 +140,10 @@ impl ThreadHeartbeatMonitor {
 
     pub fn heartbeats(&self) -> Arc<parking_lot::RwLock<HashMap<String, Arc<AtomicU64>>>> {
         Arc::clone(&self.heartbeats)
+    }
+
+    pub fn asset_watchdog_timeout_ns(&self) -> u64 {
+        self.asset_watchdog_timeout_ns
     }
 
     pub fn shutdown(&mut self) {

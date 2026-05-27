@@ -80,6 +80,8 @@ pub struct AssetProcessor {
     pub metrics: Arc<GlobalMetrics>,
     pub prediction_staleness_ns: u64,
     pub default_order_quantity: f64,
+    pub tick_processing_budget_us: u64,
+    pub heartbeat: Option<unified_trading_core::heartbeat::HeartbeatHandle>,
 }
 
 impl AssetProcessor {
@@ -94,13 +96,27 @@ impl AssetProcessor {
     }
 
     pub fn run_loop(&mut self, md_rx: &Receiver<RawTick>) {
-        let mut batch = Vec::with_capacity(32);
+        self.run_loop_with_options(md_rx, 32, None);
+    }
+
+    pub fn run_loop_with_options(
+        &mut self,
+        md_rx: &Receiver<RawTick>,
+        batch_capacity: usize,
+        on_budget_exceeded: Option<&dyn Fn(u64, u64, usize)>,
+    ) {
+        let mut batch = Vec::with_capacity(batch_capacity.max(1));
         let mut current_spread_bps = 0.0;
 
         while !self.kill_switch.is_active() {
-            let _count = recv_batch(md_rx, &mut batch, 32);
+            if let Some(ref hb) = self.heartbeat {
+                hb.pulse();
+            }
 
-            for tick in batch.drain(..) {
+            let _count = recv_batch(md_rx, &mut batch, batch_capacity.max(1));
+
+            let mut iter = batch.drain(..).peekable();
+            while let Some(tick) = iter.next() {
                 let tick_start = std::time::Instant::now();
                 let (normalized, gap) = match self.normalizer.process(tick.clone()) {
                     Some(result) => result,
@@ -170,6 +186,23 @@ impl AssetProcessor {
                     .as_nanos() as u64;
                 let latency = proc_ns.saturating_sub(tick.timestamp_ns);
                 self.metrics.feed_latency.record(latency);
+
+                let elapsed_us = tick_start.elapsed().as_micros() as u64;
+                if elapsed_us > self.tick_processing_budget_us {
+                    let skipped = iter.count();
+                    tracing::warn!(
+                        symbol = %self.symbol,
+                        elapsed_us = elapsed_us,
+                        budget_us = self.tick_processing_budget_us,
+                        skipped_ticks = skipped,
+                        "Tick processing budget exceeded; skipping remaining ticks in batch and yielding"
+                    );
+                    if let Some(cb) = on_budget_exceeded {
+                        cb(elapsed_us, self.tick_processing_budget_us, skipped);
+                    }
+                    std::thread::yield_now();
+                    break;
+                }
             }
         }
 
@@ -842,6 +875,8 @@ impl UnifiedEngine {
         let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
         let latest_pred = Arc::clone(&pred_engine.latest_pred);
 
+        let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", symbol)));
+
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
             symbol_id,
@@ -872,6 +907,8 @@ impl UnifiedEngine {
             metrics: Arc::clone(&metrics),
             prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
             default_order_quantity: config.execution_defaults.default_order_quantity,
+            tick_processing_budget_us: config.threading_config.tick_processing_budget_us,
+            heartbeat: hb_processor,
         };
 
         // Create inference, risk, exec managers as before
@@ -927,9 +964,8 @@ impl UnifiedEngine {
         );
         let exec_handle = exec_manager.start(exec_core_id);
 
-        // Start asset processor with heartbeat
+        // Start asset processor
         let sym = symbol.to_string();
-        let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", sym)));
         let asset_handle = spawn_pinned(
             &format!("asset-{}", sym),
             core_id,
