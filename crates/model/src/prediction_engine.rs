@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use feature::{FeatureVector, FeatureIndex};
+use unified_trading_core::symbol_registry::SymbolId;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 #[derive(Debug, Clone)]
 pub struct Prediction {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub forecast: f32,
     pub confidence: f32,
     pub action_score: f32,
@@ -25,9 +26,9 @@ impl Prediction {
         now.saturating_sub(self.computed_ns) > staleness_ns
     }
 
-    pub fn new_default(symbol: &str) -> Self {
+    pub fn new_default(symbol_id: SymbolId) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             forecast: 0.0,
             confidence: 0.0,
             action_score: 0.0,
@@ -37,7 +38,7 @@ impl Prediction {
         }
     }
 
-    pub fn from_features(features: &FeatureVector, symbol: &str) -> Self {
+    pub fn from_features(features: &FeatureVector, symbol_id: SymbolId) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -50,7 +51,7 @@ impl Prediction {
         let regime_strength = features.get(FeatureIndex::RegimeStrength);
 
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             forecast,
             confidence,
             action_score,
@@ -62,7 +63,7 @@ impl Prediction {
 
     /// Create a heuristic prediction from raw features when the model is stale or unavailable.
     /// Uses MACD histogram as a simple trend-following signal with fixed confidence.
-    pub fn heuristic_from_features(features: &FeatureVector, symbol: &str) -> Self {
+    pub fn heuristic_from_features(features: &FeatureVector, symbol_id: SymbolId) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -73,7 +74,7 @@ impl Prediction {
         let confidence = 0.6f32; // Fixed heuristic confidence above typical minimums
 
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             forecast: features.get(FeatureIndex::MidPrice),
             confidence,
             action_score,
@@ -87,19 +88,19 @@ impl Prediction {
 pub struct PredictionEngine {
     pub feature_rx: crossbeam_channel::Receiver<FeatureVector>,
     pub latest_pred: Arc<ArcSwap<Prediction>>,
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PredictionEngine {
     pub fn new(
         feature_rx: crossbeam_channel::Receiver<FeatureVector>,
-        symbol: &str,
+        symbol_id: SymbolId,
     ) -> Self {
         Self {
             feature_rx,
-            latest_pred: Arc::new(ArcSwap::new(Arc::new(Prediction::new_default(symbol)))),
-            symbol: symbol.to_string(),
+            latest_pred: Arc::new(ArcSwap::new(Arc::new(Prediction::new_default(symbol_id)))),
+            symbol_id,
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
@@ -127,13 +128,13 @@ impl PredictionEngine {
         let engine = Self {
             feature_rx: self.feature_rx.clone(),
             latest_pred: Arc::clone(&self.latest_pred),
-            symbol: self.symbol.clone(),
+            symbol_id: self.symbol_id,
             running: Arc::clone(&self.running),
         };
 
-        let symbol_name = self.symbol.clone();
+        let symbol_id_val = self.symbol_id;
         spawn_pinned(
-            &format!("prediction-{}", symbol_name),
+            &format!("prediction-{:?}", symbol_id_val),
             core_id,
             ThreadPriority::BelowNormal,
             move || {
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn test_prediction_is_stale() {
         let pred = Prediction {
-            symbol: "AAPL".to_string(),
+            symbol_id: SymbolId::from_raw(0),
             forecast: 0.5,
             confidence: 0.8,
             action_score: 0.3,
@@ -177,7 +178,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos() as u64;
         let pred = Prediction {
-            symbol: "AAPL".to_string(),
+            symbol_id: SymbolId::from_raw(0),
             forecast: 0.5,
             confidence: 0.8,
             action_score: 0.3,
@@ -191,9 +192,10 @@ mod tests {
     #[test]
     fn test_prediction_engine_default() {
         let (tx, rx) = bounded::<FeatureVector>(100);
-        let engine = PredictionEngine::new(rx, "AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let engine = PredictionEngine::new(rx, symbol_id);
         let pred = engine.get_prediction();
-        assert_eq!(pred.symbol, "AAPL");
+        assert_eq!(pred.symbol_id, symbol_id);
         assert_eq!(pred.forecast, 0.0);
         drop(tx);
     }
@@ -201,16 +203,17 @@ mod tests {
     #[test]
     fn test_prediction_engine_receives_features() {
         let (tx, rx) = bounded::<FeatureVector>(100);
-        let engine = PredictionEngine::new(rx, "AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let engine = PredictionEngine::new(rx, symbol_id);
 
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let mut fv = FeatureVector::new(symbol_id, 1000);
         fv.set(FeatureIndex::MidPrice, 150.0);
         tx.send(fv).unwrap();
 
         let handle = engine.start(|features| {
             let mid = features.get(FeatureIndex::MidPrice);
             Prediction {
-                symbol: features.symbol.clone(),
+                symbol_id: features.symbol_id,
                 forecast: mid as f32,
                 confidence: 0.8,
                 action_score: 0.5,

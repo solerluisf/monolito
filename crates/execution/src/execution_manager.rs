@@ -8,6 +8,7 @@ use unified_trading_core::journal::{JournalWriter, JournalEntry};
 use unified_trading_core::validator::RequestValidator;
 use unified_trading_core::idempotency::IdempotencyStore;
 use unified_trading_core::portfolio_manager::PortfolioManager;
+use unified_trading_core::symbol_registry::next_request_id;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use crate::order_tracker::{OrderTracker, OrderStatus};
@@ -107,34 +108,35 @@ impl ExecutionManager {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        let symbol = decision.request.symbol.clone();
+        let symbol_id = decision.request.symbol_id;
+        let symbol_key = symbol_id.as_u16().to_string();
 
-        if let Err(e) = self.validator.validate_symbol(&symbol) {
-            tracing::warn!("Validation failed for {}: {}", symbol, e);
+        if let Err(e) = self.validator.validate_symbol(&symbol_key) {
+            tracing::warn!("Validation failed for symbol_id {:?}: {}", symbol_id, e);
             self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
         {
             let mut rate_limiter = self.rate_limiter.lock();
-            if !rate_limiter.try_consume(&symbol, 1.0) {
+            if !rate_limiter.try_consume(&symbol_key, 1.0) {
                 self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(symbol = %symbol, "Rate limit exceeded");
+                tracing::warn!(symbol_id = ?symbol_id, "Rate limit exceeded");
                 return;
             }
         }
 
-        let idempotency_key = format!("{}-{}", symbol, decision.request_id);
+        let idempotency_key = format!("{:?}-{}", symbol_id, decision.request_id);
         if self.idempotency_store.is_processed(&idempotency_key) {
             tracing::warn!(idempotency_key = %idempotency_key, "Duplicate order detected");
             return;
         }
 
-        let order_id = uuid::Uuid::new_v4().to_string();
+        let order_id = next_request_id().to_string();
 
-        let side = match decision.request.side.as_str() {
-            "Long" | "CloseShort" | "Buy" | "buy" => OrderSide::Buy,
-            "Short" | "CloseLong" | "Sell" | "sell" => OrderSide::Sell,
+        let side = match decision.request.side {
+            0 | 2 | 4 => OrderSide::Buy,
+            1 | 3 | 5 => OrderSide::Sell,
             other => {
                 tracing::warn!("Unexpected side '{}', defaulting to Sell", other);
                 OrderSide::Sell
@@ -145,21 +147,21 @@ impl ExecutionManager {
 
         let cmd = OrderCommand {
             order_id: order_id.clone(),
-            symbol: symbol.clone(),
+            symbol: symbol_key.clone(),
             side: side.clone(),
             quantity,
             order_type: OrderType::Market,
             limit_price: None,
             stop_price: None,
             time_in_force: TimeInForce::Day,
-            correlation_id: decision.request_id.clone(),
+            correlation_id: decision.request_id.to_string(),
         };
 
         // Persist to journal BEFORE submitting to broker for critical commands
         // This ensures we can replay/recover if needed
         if let Some(ref journal) = self.journal {
             let entry = JournalEntry::Order {
-                symbol: symbol.clone(),
+                symbol: symbol_key.clone(),
                 timestamp_ns: now,
                 data: format!("order_id={},side={:?},qty={},decision={}", order_id, side, quantity, decision.request_id),
             };
@@ -196,7 +198,7 @@ impl ExecutionManager {
 
                 let lifecycle_event = OrderLifecycleEvent::new(
                     execution_id.clone(),
-                    symbol.clone(),
+                    symbol_key.clone(),
                     OrderLifecycleEventType::Submitted,
                     now,
                 )
@@ -205,7 +207,7 @@ impl ExecutionManager {
                 self.metrics.lifecycle_channel_depth.fetch_add(1, Ordering::Relaxed);
                 let _ = self.lifecycle_tx.send(lifecycle_event);
 
-                tracing::info!(order_id = %execution_id, symbol = %symbol, "Order submitted to broker");
+                tracing::info!(order_id = %execution_id, symbol = %symbol_key, "Order submitted to broker");
 
                 self.idempotency_store.mark_processed(idempotency_key, execution_id);
                 self.circuit_breaker.record_success();
@@ -213,14 +215,14 @@ impl ExecutionManager {
             Err(e) => {
                 self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
                 self.circuit_breaker.record_failure();
-                tracing::warn!(symbol = %symbol, error = %e, "Order submission failed");
+                tracing::warn!(symbol = %symbol_key, error = %e, "Order submission failed");
                 
                 // Write failure to journal
                 if let Some(ref journal) = self.journal {
                     let _ = journal.write(JournalEntry::Event {
                         event_type: "ORDER_FAILED".to_string(),
                         timestamp_ns: now,
-                        data: format!("symbol={},error={}", symbol, e),
+                        data: format!("symbol={},error={}", symbol_key, e),
                     });
                 }
             }
@@ -327,16 +329,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use gateway::MockExecutionPort;
 
+use unified_trading_core::symbol_registry::SymbolId;
+
     fn make_approved_decision() -> RiskDecision {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         let request = risk::RiskCheckRequest {
-            request_id: "req-1".to_string(),
-            symbol: "AAPL".to_string(),
-            intent_id: "intent-1".to_string(),
-            side: "buy".to_string(),
+            request_id: unified_trading_core::symbol_registry::next_request_id(),
+            symbol_id: SymbolId::from_raw(0),
+            intent_id: unified_trading_core::symbol_registry::next_intent_id(),
+            side: 1u8, // Buy
             quantity: 10.0,
             price: 150.0,
             timestamp_ns: now,
@@ -344,7 +348,7 @@ mod tests {
             current_spread_bps: 10.0,
         };
         RiskDecision {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             approved: true,
             rejection_reason: None,
             warnings: Vec::new(),

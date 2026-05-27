@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use unified_trading_core::symbol_registry::SymbolId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawTick {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub bid: f64,
     pub ask: f64,
@@ -15,7 +16,7 @@ pub struct RawTick {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedTick {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub mid_price: f64,
     pub spread: f64,
@@ -29,7 +30,7 @@ pub struct NormalizedTick {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedAlert {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub alert_type: FeedAlertType,
     pub message: String,
@@ -44,15 +45,15 @@ pub enum FeedAlertType {
 }
 
 pub struct Normalizer {
-    symbol: String,
+    symbol_id: SymbolId,
     last_sequence: u64,
     last_timestamp_ns: u64,
 }
 
 impl Normalizer {
-    pub fn new(symbol: &str) -> Self {
+    pub fn new(symbol_id: SymbolId) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             last_sequence: 0,
             last_timestamp_ns: 0,
         }
@@ -62,7 +63,7 @@ impl Normalizer {
     pub fn process(&mut self, raw: RawTick) -> Option<(NormalizedTick, bool)> {
         if !Self::validate_tick(&raw) {
             tracing::warn!(
-                symbol = %raw.symbol,
+                symbol_id = %raw.symbol_id,
                 bid = %raw.bid,
                 ask = %raw.ask,
                 last_price = %raw.last_price,
@@ -80,7 +81,7 @@ impl Normalizer {
         self.last_timestamp_ns = raw.timestamp_ns;
 
         Some((NormalizedTick {
-            symbol: raw.symbol,
+            symbol_id: raw.symbol_id,
             timestamp_ns: raw.timestamp_ns,
             mid_price,
             spread,
@@ -116,7 +117,7 @@ impl Normalizer {
 }
 
 pub struct FeedMonitor {
-    symbol: String,
+    symbol_id: SymbolId,
     tick_count: u64,
     last_tick_ns: u64,
     max_latency_ns: u64,
@@ -124,9 +125,9 @@ pub struct FeedMonitor {
 }
 
 impl FeedMonitor {
-    pub fn new(symbol: &str) -> Self {
+    pub fn new(symbol_id: SymbolId) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             tick_count: 0,
             last_tick_ns: 0,
             max_latency_ns: 0,
@@ -147,7 +148,7 @@ impl FeedMonitor {
         let age = now_ns.saturating_sub(self.last_tick_ns);
         if age > threshold_ns {
             Some(FeedAlert {
-                symbol: self.symbol.clone(),
+                symbol_id: self.symbol_id,
                 timestamp_ns: now_ns,
                 alert_type: FeedAlertType::LatencySpike,
                 message: format!("Feed latency {}ns exceeds threshold {}ns", age, threshold_ns),
@@ -169,12 +170,14 @@ impl FeedMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unified_trading_core::symbol_registry::SymbolId;
 
     #[test]
     fn test_normalizer_basic() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -185,16 +188,17 @@ mod tests {
             exchange: "IEX".to_string(),
         };
         let (normalized, _gap) = norm.process(raw).unwrap();
-        assert_eq!(normalized.symbol, "AAPL");
+        assert_eq!(normalized.symbol_id, symbol_id);
         assert!((normalized.mid_price - 150.025).abs() < 0.001);
         assert!((normalized.spread - 0.05).abs() < 0.001);
     }
 
     #[test]
     fn test_normalizer_spread_bps() {
-        let mut norm = Normalizer::new("MSFT");
+        let symbol_id = SymbolId::from_raw(1);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "MSFT".to_string(),
+            symbol_id,
             timestamp_ns: 2000,
             bid: 400.0,
             ask: 400.04,
@@ -210,9 +214,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_sequence_check() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         norm.process(RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -228,9 +233,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_staleness() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         norm.process(RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1_000_000_000,
             bid: 150.0,
             ask: 150.05,
@@ -246,7 +252,8 @@ mod tests {
 
     #[test]
     fn test_feed_monitor() {
-        let mut monitor = FeedMonitor::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut monitor = FeedMonitor::new(symbol_id);
         monitor.on_tick(1000, 2000);
         monitor.on_tick(2000, 2500);
         assert_eq!(monitor.tick_count(), 2);
@@ -255,7 +262,8 @@ mod tests {
 
     #[test]
     fn test_feed_monitor_latency_alert() {
-        let mut monitor = FeedMonitor::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut monitor = FeedMonitor::new(symbol_id);
         monitor.on_tick(1000, 1500);
         let alert = monitor.check_latency(10_000_000, 5_000_000);
         assert!(alert.is_some());
@@ -265,9 +273,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_rejects_nan_bid() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: f64::NAN,
             ask: 150.05,
@@ -282,9 +291,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_rejects_inf_ask() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: f64::INFINITY,
@@ -299,9 +309,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_rejects_zero_price() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -316,9 +327,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_rejects_negative_bid() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: -1.0,
             ask: 150.05,
@@ -333,9 +345,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_rejects_crossed_book() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 160.0,
             ask: 150.05,
@@ -350,9 +363,10 @@ mod tests {
 
     #[test]
     fn test_normalizer_accepts_valid_tick() {
-        let mut norm = Normalizer::new("AAPL");
+        let symbol_id = SymbolId::from_raw(0);
+        let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,

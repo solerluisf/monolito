@@ -70,7 +70,7 @@ impl InferenceEngine {
         let forecast = self.compute_forecast(macd_hist, rsi, volume_ratio);
 
         Prediction {
-            symbol: features.symbol.clone(),
+            symbol_id: features.symbol_id,
             forecast,
             confidence: confidence,
             action_score,
@@ -124,6 +124,8 @@ impl InferenceEngine {
 mod tests {
     use super::*;
 
+use unified_trading_core::symbol_registry::SymbolId;
+
     fn make_engine() -> InferenceEngine {
         InferenceEngine::new(
             128,
@@ -136,7 +138,7 @@ mod tests {
     }
 
     fn make_features() -> FeatureVector {
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 55.0);
         fv.set(FeatureIndex::MacdHistogram, 0.3);
@@ -154,7 +156,7 @@ mod tests {
         let features = make_features();
         let pred = engine.predict(&features);
 
-        assert_eq!(pred.symbol, "AAPL");
+        assert_eq!(pred.symbol_id, SymbolId::from_raw(0));
         assert!(pred.forecast >= -1.0 && pred.forecast <= 1.0);
         assert!(pred.action_score >= -1.0 && pred.action_score <= 1.0);
         assert!(pred.confidence > 0.0);
@@ -164,7 +166,7 @@ mod tests {
     #[test]
     fn test_inference_engine_bullish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 25.0);
         fv.set(FeatureIndex::MacdHistogram, 0.5);
@@ -181,7 +183,7 @@ mod tests {
     #[test]
     fn test_inference_engine_bearish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 75.0);
         fv.set(FeatureIndex::MacdHistogram, -0.5);
@@ -198,7 +200,7 @@ mod tests {
     #[test]
     fn test_inference_engine_missing_features() {
         let engine = make_engine();
-        let fv = FeatureVector::new("AAPL", 1000);
+        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
         let pred = engine.predict(&fv);
         assert!(pred.forecast >= -1.0 && pred.forecast <= 1.0);
     }

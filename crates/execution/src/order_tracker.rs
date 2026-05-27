@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::order_state_machine::{OrderStateMachine, OrderState, OrderEvent};
+use crate::order_state_machine::{OrderEvent, OrderState, OrderStateMachine};
+use unified_trading_core::symbol_registry::next_request_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -59,7 +60,7 @@ impl OrderTracker {
         limit_price: Option<f64>,
         correlation_id: &str,
     ) -> String {
-        let order_id = uuid::Uuid::new_v4().to_string();
+        let order_id = next_request_id().to_string();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

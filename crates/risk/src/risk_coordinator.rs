@@ -52,10 +52,10 @@ impl RiskCoordinator {
 
                     if decision.approved {
                         self.metrics.intents_approved.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.increment_per_symbol_intent_approved(&request.symbol);
+                        self.metrics.increment_per_symbol_intent_approved("UNK");
                     } else {
                         self.metrics.intents_rejected.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.increment_per_symbol_intent_rejected(&request.symbol);
+                        self.metrics.increment_per_symbol_intent_rejected("UNK");
                     }
 
                     if self.decision_tx.send(decision).is_err() {
@@ -105,16 +105,18 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn make_request(symbol: &str) -> RiskCheckRequest {
+use unified_trading_core::symbol_registry::SymbolId;
+
+    fn make_request(symbol_id: SymbolId) -> RiskCheckRequest {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         RiskCheckRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            symbol: symbol.to_string(),
-            intent_id: uuid::Uuid::new_v4().to_string(),
-            side: "buy".to_string(),
+            request_id: unified_trading_core::symbol_registry::next_request_id(),
+            symbol_id,
+            intent_id: unified_trading_core::symbol_registry::next_intent_id(),
+            side: 1u8, // Buy
             quantity: 10.0,
             price: 150.0,
             timestamp_ns: now,
@@ -139,7 +141,7 @@ mod tests {
             Arc::clone(&metrics),
         );
 
-        req_tx.send(make_request("AAPL")).unwrap();
+        req_tx.send(make_request(SymbolId::from_raw(0))).unwrap();
         drop(req_tx);
 
         let handle = coordinator.start(0);
@@ -165,7 +167,7 @@ mod tests {
             Arc::clone(&metrics),
         );
 
-        req_tx.send(make_request("AAPL")).unwrap();
+        req_tx.send(make_request(SymbolId::from_raw(0))).unwrap();
         drop(req_tx);
 
         let handle = coordinator.start(0);

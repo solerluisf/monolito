@@ -1,4 +1,5 @@
-use crate::strategy_engine::{TradeIntent, SignalSide, SizeHint, IntentType, StrategyEngine};
+use crate::{TradeIntent, SignalSide, SizeHint, IntentType};
+use crate::strategy_engine::StrategyEngine;
 use feature::{FeatureVector, FeatureIndex};
 
 pub trait StrategyEngineExt {
@@ -8,7 +9,7 @@ pub trait StrategyEngineExt {
 }
 
 impl StrategyEngineExt for StrategyEngine {
-    #[tracing::instrument(skip_all, fields(symbol = %features.symbol))]
+    #[tracing::instrument(skip_all, fields(symbol_id = %features.symbol_id))]
     fn evaluate_from_features(&mut self, features: &FeatureVector) -> Option<TradeIntent> {
         let rsi = features.get(FeatureIndex::Rsi14);
         let macd_hist = features.get(FeatureIndex::MacdHistogram);
@@ -25,7 +26,7 @@ impl StrategyEngineExt for StrategyEngine {
 
         if action_score > self.long_entry_threshold as f32 {
             Some(TradeIntent::new(
-                &self.symbol,
+                features.symbol_id,
                 SignalSide::Long,
                 SizeHint::Units(1),
                 IntentType::Entry,
@@ -35,7 +36,7 @@ impl StrategyEngineExt for StrategyEngine {
             ))
         } else if action_score < self.short_entry_threshold as f32 {
             Some(TradeIntent::new(
-                &self.symbol,
+                features.symbol_id,
                 SignalSide::Short,
                 SizeHint::Units(1),
                 IntentType::Entry,

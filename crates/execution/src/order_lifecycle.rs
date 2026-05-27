@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use unified_trading_core::symbol_registry::next_request_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderLifecycleEventType {
@@ -34,7 +35,7 @@ impl OrderLifecycleEvent {
         timestamp_ns: u64,
     ) -> Self {
         Self {
-            event_id: uuid::Uuid::new_v4().to_string(),
+            event_id: next_request_id().to_string(),
             execution_id,
             client_order_id: None,
             symbol,

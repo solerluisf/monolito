@@ -13,6 +13,7 @@ use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::config_watcher::ConfigWatcher;
 use unified_trading_core::idempotency::IdempotencyStore;
+use unified_trading_core::symbol_registry::{SymbolRegistry, SymbolId, next_request_id};
 use parking_lot::RwLock;
 
 use market_data::{Normalizer, RawTick};
@@ -37,6 +38,7 @@ pub struct ExecutionSharedState {
 /// shut down independently when a symbol is unsubscribed at runtime.
 pub struct AssetPipeline {
     pub symbol: String,
+    pub symbol_id: SymbolId,
     pub md_tx: crossbeam_channel::Sender<RawTick>,
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     pub strategy_ref: StrategySwapRef,
@@ -66,6 +68,7 @@ type PredictionRef = Arc<ArcSwap<Prediction>>;
 
 pub struct AssetProcessor {
     pub symbol: String,
+    pub symbol_id: SymbolId,
     pub normalizer: Normalizer,
     pub feature_engine: FeatureEngine,
     pub strategy: StrategySwapRef,
@@ -126,7 +129,7 @@ impl AssetProcessor {
                 let prediction = if prediction.is_stale(self.prediction_staleness_ns) {
                     self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(symbol = %self.symbol, "Model prediction stale; using heuristic fallback");
-                    Arc::new(Prediction::heuristic_from_features(&features, &self.symbol))
+                    Arc::new(Prediction::heuristic_from_features(&features, self.signal_ctx.symbol_id))
                 } else {
                     prediction
                 };
@@ -205,10 +208,17 @@ impl AssetProcessor {
         };
 
         RiskCheckRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            symbol: signal.symbol.clone(),
-            intent_id: signal.intent_id.clone(),
-            side: format!("{:?}", signal.side),
+            request_id: unified_trading_core::symbol_registry::next_request_id(),
+            symbol_id: signal.symbol_id,
+            intent_id: signal.intent_id,
+            side: match signal.side {
+                strategy::SignalSide::Long => 1u8,
+                strategy::SignalSide::Short => 2u8,
+                strategy::SignalSide::CloseLong => 3u8,
+                strategy::SignalSide::CloseShort => 4u8,
+                strategy::SignalSide::Flatten => 5u8,
+                strategy::SignalSide::Hold => 0u8,
+            },
             quantity,
             price: mid_price,
             timestamp_ns: now,
@@ -229,6 +239,7 @@ impl AssetProcessor {
     pub heartbeats: Option<Arc<parking_lot::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>>>,
     pub config_watcher: Option<ConfigWatcher>,
     pub strategy_registry: Arc<Mutex<HashMap<String, StrategySwapRef>>>,
+    pub symbol_registry: Arc<parking_lot::Mutex<SymbolRegistry>>,
     pub portfolio_manager: Arc<PortfolioManager>,
     pub execution_states: HashMap<String, ExecutionSharedState>,
     pub asset_pipelines: HashMap<String, AssetPipeline>,
@@ -246,6 +257,7 @@ impl UnifiedEngine {
         let metrics = Arc::new(GlobalMetrics::new());
         let command_channel = CommandChannel::new(config.channel_config.command_channel_capacity);
         let strategy_registry = Arc::new(Mutex::new(HashMap::new()));
+        let symbol_registry = Arc::new(Mutex::new(SymbolRegistry::new()));
         let initial_equity = config.risk_config.initial_equity;
         let flat_threshold = config.risk_config.portfolio_flat_threshold;
         let config = Arc::new(RwLock::new(config));
@@ -262,6 +274,7 @@ impl UnifiedEngine {
             heartbeats: None,
             config_watcher: None,
             strategy_registry,
+            symbol_registry: Arc::clone(&symbol_registry),
             portfolio_manager,
             execution_states: HashMap::new(),
             asset_pipelines: HashMap::new(),
@@ -777,12 +790,18 @@ impl UnifiedEngine {
         let (decision_tx, decision_rx) = bounded::<RiskDecision>(channel_cfg.decision_channel_capacity);
         let lifecycle_tx_clone = lifecycle_tx.clone();
 
+        // Register symbol and obtain SymbolId for this pipeline
+        let symbol_id = {
+            let mut reg = self.symbol_registry.lock();
+            reg.register(symbol).unwrap_or(SymbolId::from_raw(0))
+        };
+
         let ks = Arc::clone(&self.kill_switch);
         let metrics = Arc::clone(&self.metrics);
         let pm = Arc::clone(&self.portfolio_manager);
 
         let strategy = StrategyEngine::new(
-            symbol,
+            symbol_id,
             config.strategy_config.long_entry_threshold,
             config.strategy_config.short_entry_threshold,
             config.strategy_config.confidence_minimum,
@@ -817,15 +836,16 @@ impl UnifiedEngine {
             Arc::clone(&strategy_arc),
         );
 
-        let signal_ctx = strategy::SignalContext::new(symbol);
+        let signal_ctx = strategy::SignalContext::new(symbol_id);
 
         // Create prediction engine first to get the ArcSwap
-        let pred_engine = PredictionEngine::new(feature_rx, symbol);
+        let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
         let latest_pred = Arc::clone(&pred_engine.latest_pred);
 
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
-            normalizer: Normalizer::new(symbol),
+            symbol_id,
+            normalizer: Normalizer::new(symbol_id),
             feature_engine: FeatureEngine::new(
                 symbol,
                 config.feature_config.rsi_period,
@@ -853,6 +873,8 @@ impl UnifiedEngine {
             prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
             default_order_quantity: config.execution_defaults.default_order_quantity,
         };
+
+        // Create inference, risk, exec managers as before
 
         let inference_engine = InferenceEngine::new(
             config.model_config.feature_vector_size,
@@ -926,6 +948,7 @@ impl UnifiedEngine {
 
         AssetPipeline {
             symbol: symbol.to_string(),
+            symbol_id,
             md_tx,
             thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle.expect("spawn_pinned failed")],
             strategy_ref: strategy_arc,
@@ -1008,9 +1031,10 @@ impl UnifiedEngine {
                         }
                     };
 
+                    let sid = self.symbol_registry.lock().lookup(&symbol).unwrap_or(SymbolId::from_raw(0));
                     let new_strategy: Box<dyn strategy::Strategy> = Box::new(
                         StrategyEngine::new(
-                            &symbol, long_entry, short_entry, confidence, deadband,
+                            sid, long_entry, short_entry, confidence, deadband,
                             entry_cooldown, exit_cooldown, staleness, allow_short,
                             trade_intent_ttl_ns, max_long_units, max_short_units,
                             urgency_aggressive_threshold, urgency_normal_threshold,

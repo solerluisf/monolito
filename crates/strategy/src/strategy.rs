@@ -1,9 +1,10 @@
 use model::Prediction;
+use unified_trading_core::symbol_registry::SymbolId;
 
 use crate::{SignalSide, SizeHint, TradeIntent, IntentType, Urgency};
 
 pub struct SignalContext {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub net_position: f64,
     pub current_price: f64,
     pub volatility: f32,
@@ -11,9 +12,9 @@ pub struct SignalContext {
 }
 
 impl SignalContext {
-    pub fn new(symbol: &str) -> Self {
+    pub fn new(symbol_id: SymbolId) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             net_position: 0.0,
             current_price: 0.0,
             volatility: 0.0,
@@ -63,7 +64,7 @@ pub fn urgency_from_score(score: f32, aggressive_threshold: f32, normal_threshol
 }
 
 pub fn build_entry_intent(
-    symbol: &str,
+    symbol_id: SymbolId,
     side: SignalSide,
     confidence: f64,
     action_score: f64,
@@ -73,7 +74,7 @@ pub fn build_entry_intent(
     normal_threshold: f32,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
-        symbol,
+        symbol_id,
         side,
         SizeHint::Units(units),
         IntentType::Entry,
@@ -86,7 +87,7 @@ pub fn build_entry_intent(
 }
 
 pub fn build_exit_intent(
-    symbol: &str,
+    symbol_id: SymbolId,
     side: SignalSide,
     confidence: f64,
     action_score: f64,
@@ -95,7 +96,7 @@ pub fn build_exit_intent(
     normal_threshold: f32,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
-        symbol,
+        symbol_id,
         side,
         SizeHint::PortfolioPct(1.0),
         IntentType::Exit,
@@ -120,8 +121,9 @@ mod tests {
 
     #[test]
     fn test_build_entry_intent() {
-        let intent = build_entry_intent("TSLA", SignalSide::Long, 0.75, 0.67, 100, 30_000_000_000, 0.85, 0.5);
-        assert_eq!(intent.symbol, "TSLA");
+        let sid = SymbolId::from_raw(0);
+        let intent = build_entry_intent(sid, SignalSide::Long, 0.75, 0.67, 100, 30_000_000_000, 0.85, 0.5);
+        assert_eq!(intent.symbol_id.as_u16(), 0);
         assert!(matches!(intent.side, SignalSide::Long));
         assert!(matches!(intent.size_hint, SizeHint::Units(100)));
         assert!(matches!(intent.intent_type, IntentType::Entry));
@@ -129,8 +131,9 @@ mod tests {
 
     #[test]
     fn test_build_exit_intent() {
-        let intent = build_exit_intent("NFLX", SignalSide::Flatten, 0.90, 0.90, 30_000_000_000, 0.85, 0.5);
-        assert_eq!(intent.symbol, "NFLX");
+        let sid = SymbolId::from_raw(0);
+        let intent = build_exit_intent(sid, SignalSide::Flatten, 0.90, 0.90, 30_000_000_000, 0.85, 0.5);
+        assert_eq!(intent.symbol_id.as_u16(), 0);
         assert!(matches!(intent.side, SignalSide::Flatten));
         assert!(matches!(intent.intent_type, IntentType::Exit));
     }

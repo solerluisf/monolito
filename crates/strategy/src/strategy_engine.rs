@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use model::Prediction;
+use unified_trading_core::symbol_registry::SymbolId;
+use unified_trading_core::symbol_registry::next_intent_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SignalSide {
@@ -39,8 +41,8 @@ pub enum Urgency {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeIntent {
-    pub intent_id: String,
-    pub symbol: String,
+    pub intent_id: u64,
+    pub symbol_id: SymbolId,
     pub side: SignalSide,
     pub size_hint: SizeHint,
     pub intent_type: IntentType,
@@ -49,12 +51,12 @@ pub struct TradeIntent {
     pub action_score: f64,
     pub timestamp_ns: u64,
     pub expires_ns: u64,
-    pub trace_id: String,
+    pub trace_id: u64,
 }
 
 impl TradeIntent {
     pub fn new(
-        symbol: &str,
+        symbol_id: SymbolId,
         side: SignalSide,
         size_hint: SizeHint,
         intent_type: IntentType,
@@ -68,8 +70,8 @@ impl TradeIntent {
             .as_nanos() as u64;
 
         Self {
-            intent_id: uuid::Uuid::new_v4().to_string(),
-            symbol: symbol.to_string(),
+            intent_id: next_intent_id(),
+            symbol_id,
             side,
             size_hint,
             intent_type,
@@ -78,7 +80,7 @@ impl TradeIntent {
             action_score,
             timestamp_ns: now,
             expires_ns: now + ttl_ns,
-            trace_id: String::new(),
+            trace_id: 0,
         }
     }
 
@@ -92,7 +94,7 @@ impl TradeIntent {
 }
 
 pub struct StrategyEngine {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub long_entry_threshold: f64,
     pub short_entry_threshold: f64,
     pub exit_threshold: f64,
@@ -135,7 +137,7 @@ fn atomic_to_f64(val: &AtomicU64) -> f64 {
 
 impl StrategyEngine {
     pub fn new(
-        symbol: &str,
+        symbol_id: SymbolId,
         long_entry_threshold: f64,
         short_entry_threshold: f64,
         confidence_minimum: f64,
@@ -163,7 +165,7 @@ impl StrategyEngine {
         volume_ratio_clamp: f64,
     ) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id: symbol_id,
             long_entry_threshold,
             short_entry_threshold,
             exit_threshold: 0.1,
@@ -248,7 +250,7 @@ impl StrategyEngine {
                     self.hysteresis_state.store(1, Ordering::Relaxed);
                     self.last_entry_ns.store(now, Ordering::Relaxed);
                     Some(TradeIntent::new(
-                        &self.symbol,
+                        self.symbol_id,
                         SignalSide::Long,
                         SizeHint::Units(1),
                         IntentType::Entry,
@@ -260,7 +262,7 @@ impl StrategyEngine {
                     self.hysteresis_state.store(-1, Ordering::Relaxed);
                     self.last_entry_ns.store(now, Ordering::Relaxed);
                     Some(TradeIntent::new(
-                        &self.symbol,
+                        self.symbol_id,
                         SignalSide::Short,
                         SizeHint::Units(1),
                         IntentType::Entry,
@@ -277,7 +279,7 @@ impl StrategyEngine {
                     self.hysteresis_state.store(0, Ordering::Relaxed);
                     self.last_exit_ns.store(now, Ordering::Relaxed);
                     Some(TradeIntent::new(
-                        &self.symbol,
+                        self.symbol_id,
                         SignalSide::CloseLong,
                         SizeHint::Units(1),
                         IntentType::Exit,
@@ -294,7 +296,7 @@ impl StrategyEngine {
                     self.hysteresis_state.store(0, Ordering::Relaxed);
                     self.last_exit_ns.store(now, Ordering::Relaxed);
                     Some(TradeIntent::new(
-                        &self.symbol,
+                        self.symbol_id,
                         SignalSide::CloseShort,
                         SizeHint::Units(1),
                         IntentType::Exit,
@@ -370,7 +372,7 @@ impl Strategy for StrategyEngine {
 
     fn clone_box(&self) -> Box<dyn Strategy> {
         Box::new(Self {
-            symbol: self.symbol.clone(),
+            symbol_id: self.symbol_id,
             long_entry_threshold: self.long_entry_threshold,
             short_entry_threshold: self.short_entry_threshold,
             exit_threshold: self.exit_threshold,
@@ -413,7 +415,7 @@ mod tests {
 
     fn make_engine() -> StrategyEngine {
         StrategyEngine::new(
-            "AAPL", 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
+            SymbolId::from_raw(0), 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
             30_000_000_000, 100.0, 100.0, 0.85, 0.5,
             0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
             0.3, 0.4, 0.3, 0.3,
@@ -426,7 +428,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos() as u64;
         Prediction {
-            symbol: "AAPL".to_string(),
+            symbol_id: SymbolId::from_raw(0),
             forecast: score as f32,
             confidence: confidence as f32,
             action_score: score as f32,

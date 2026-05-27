@@ -57,6 +57,7 @@ impl MarketDataReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unified_trading_core::symbol_registry::SymbolId;
 
     #[test]
     fn test_recv_batch_empty() {
@@ -73,7 +74,7 @@ mod tests {
 
         for i in 0..10 {
             tx.send(RawTick {
-                symbol: "AAPL".to_string(),
+                symbol_id: SymbolId::from_raw(0),
                 timestamp_ns: i,
                 bid: 150.0,
                 ask: 150.05,
@@ -98,7 +99,7 @@ mod tests {
 
         for i in 0..20 {
             tx.send(RawTick {
-                symbol: "AAPL".to_string(),
+                symbol_id: SymbolId::from_raw(0),
                 timestamp_ns: i,
                 bid: 150.0,
                 ask: 150.05,

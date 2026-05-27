@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use serde::{Serialize, Deserialize};
 
 pub const MAX_SYMBOLS: usize = 10_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SymbolId(u16);
 
 impl SymbolId {
@@ -24,6 +26,17 @@ impl fmt::Display for SymbolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SymbolId({})", self.0)
     }
+}
+
+static INTENT_COUNTER: AtomicU64 = AtomicU64::new(1);
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_intent_id() -> u64 {
+    INTENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn next_request_id() -> u64 {
+    REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 pub struct SymbolRegistry {

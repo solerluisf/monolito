@@ -4,13 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use unified_trading_core::config::{RiskConfig, CheckSeverity, default_check_severities};
 use unified_trading_core::portfolio_manager::PortfolioManager;
+use unified_trading_core::symbol_registry::SymbolId;
 
 #[derive(Debug, Clone)]
 pub struct RiskCheckRequest {
-    pub request_id: String,
-    pub symbol: String,
-    pub intent_id: String,
-    pub side: String,
+    pub request_id: u64,
+    pub symbol_id: SymbolId,
+    pub intent_id: u64,
+    pub side: u8,
     pub quantity: f64,
     pub price: f64,
     pub timestamp_ns: u64,
@@ -20,7 +21,7 @@ pub struct RiskCheckRequest {
 
 #[derive(Debug, Clone)]
 pub struct RiskDecision {
-    pub request_id: String,
+    pub request_id: u64,
     pub approved: bool,
     pub rejection_reason: Option<String>,
     pub warnings: Vec<String>,
@@ -32,7 +33,7 @@ pub struct RiskDecision {
 impl RiskDecision {
     pub fn approved(request: &RiskCheckRequest) -> Self {
         Self {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             approved: true,
             rejection_reason: None,
             warnings: Vec::new(),
@@ -47,7 +48,7 @@ impl RiskDecision {
 
     pub fn rejected(request: &RiskCheckRequest, reason: &str, check_index: usize) -> Self {
         Self {
-            request_id: request.request_id.clone(),
+            request_id: request.request_id,
             approved: false,
             rejection_reason: Some(reason.to_string()),
             warnings: Vec::new(),
@@ -64,7 +65,7 @@ impl RiskDecision {
 pub struct RiskEngine {
     pub config: RiskConfig,
     pub portfolio: Arc<PortfolioManager>,
-    pub idempotency_store: std::collections::HashSet<String>,
+    pub idempotency_store: std::collections::HashSet<u64>,
     pub order_rate_tokens: f64,
     pub order_rate_last_refill: u64,
     pub severity_overrides: HashMap<String, CheckSeverity>,
@@ -90,7 +91,7 @@ impl RiskEngine {
             .unwrap_or(CheckSeverity::Veto)
     }
 
-    #[tracing::instrument(skip_all, fields(symbol = %request.symbol, intent_id = %request.intent_id))]
+    #[tracing::instrument(skip_all, fields(symbol_id = %request.symbol_id, intent_id = %request.intent_id))]
     pub fn check(&mut self, request: &RiskCheckRequest, kill_switch_active: bool) -> RiskDecision {
         let mut warnings: Vec<String> = Vec::new();
 
@@ -150,7 +151,7 @@ impl RiskEngine {
             }
         }
 
-        self.idempotency_store.insert(request.intent_id.clone());
+        self.idempotency_store.insert(request.intent_id);
         if warnings.is_empty() {
             RiskDecision::approved(request)
         } else {
@@ -211,13 +212,18 @@ impl RiskEngine {
     }
 
     fn check_position_limit(&self, request: &RiskCheckRequest) -> Option<String> {
-        let current = self.portfolio.net_position(&request.symbol);
+        let symbol_key = request.symbol_id.as_u16().to_string();
+        let current = self.portfolio.net_position(&symbol_key);
         let new_position = current + request.quantity;
         if new_position.abs() * request.price > self.config.max_position_per_symbol {
             Some("Position limit exceeded".to_string())
         } else {
             None
         }
+    }
+
+    fn get_symbol(&self, _symbol_id: SymbolId) -> Option<&str> {
+        None
     }
 
     fn check_portfolio_exposure(&self, request: &RiskCheckRequest) -> Option<String> {
@@ -281,17 +287,18 @@ impl RiskEngine {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use unified_trading_core::symbol_registry::{next_intent_id, next_request_id, SymbolId};
 
-    fn make_request(symbol: &str, quantity: f64, price: f64) -> RiskCheckRequest {
+    fn make_request(symbol_id: SymbolId, quantity: f64, price: f64) -> RiskCheckRequest {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
         RiskCheckRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            symbol: symbol.to_string(),
-            intent_id: uuid::Uuid::new_v4().to_string(),
-            side: "buy".to_string(),
+            request_id: next_request_id(),
+            symbol_id,
+            intent_id: next_intent_id(),
+            side: 1,
             quantity,
             price,
             timestamp_ns: now,
@@ -304,7 +311,8 @@ mod tests {
     fn test_risk_engine_approve() {
         let config = RiskConfig::default();
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
-        let request = make_request("AAPL", 10.0, 150.0);
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 10.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(decision.approved);
     }
@@ -313,7 +321,8 @@ mod tests {
     fn test_risk_engine_kill_switch() {
         let config = RiskConfig::default();
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
-        let request = make_request("AAPL", 10.0, 150.0);
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 10.0, 150.0);
         let decision = engine.check(&request, true);
         assert!(!decision.approved);
         assert!(decision.rejection_reason.unwrap().contains("Kill switch"));
@@ -323,13 +332,14 @@ mod tests {
     fn test_risk_engine_idempotency() {
         let config = RiskConfig::default();
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
-        let request = make_request("AAPL", 10.0, 150.0);
-        let id = request.intent_id.clone();
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 10.0, 150.0);
+        let id = request.intent_id;
 
         let decision1 = engine.check(&request, false);
         assert!(decision1.approved);
 
-        let mut request2 = make_request("AAPL", 10.0, 150.0);
+        let mut request2 = make_request(symbol_id, 10.0, 150.0);
         request2.intent_id = id;
         let decision2 = engine.check(&request2, false);
         assert!(!decision2.approved);
@@ -340,8 +350,10 @@ mod tests {
         let mut config = RiskConfig::default();
         config.max_position_per_symbol = 100.0;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+        engine.severity_overrides.insert("position_limit".to_string(), CheckSeverity::Veto);
 
-        let request = make_request("AAPL", 100.0, 150.0);
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 100.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
     }
@@ -352,7 +364,8 @@ mod tests {
         config.max_portfolio_exposure = 100.0;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let request = make_request("AAPL", 10.0, 150.0);
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 10.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
     }
@@ -363,7 +376,8 @@ mod tests {
         config.max_leverage = 0.001;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let request = make_request("AAPL", 100.0, 150.0);
+        let symbol_id = SymbolId::from_raw(0);
+        let request = make_request(symbol_id, 100.0, 150.0);
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
     }
@@ -374,11 +388,11 @@ mod tests {
         config.max_volatility = 0.02;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_volatility = 0.05; // Above threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_volatility = 0.05;
+
         let decision = engine.check(&request, false);
-        // By default volatility is Advisory, so it should be approved with a warning
         assert!(decision.approved);
         assert!(decision.warnings.iter().any(|w| w.contains("Volatility")));
     }
@@ -389,11 +403,11 @@ mod tests {
         config.max_spread_bps = 20.0;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_spread_bps = 50.0; // Above threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_spread_bps = 50.0;
+
         let decision = engine.check(&request, false);
-        // By default spread is Advisory, so it should be approved with a warning
         assert!(decision.approved);
         assert!(decision.warnings.iter().any(|w| w.contains("Spread")));
     }
@@ -405,9 +419,10 @@ mod tests {
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
         engine.severity_overrides.insert("volatility".to_string(), CheckSeverity::Veto);
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_volatility = 0.05; // Above threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_volatility = 0.05;
+
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
         assert!(decision.rejection_reason.unwrap().contains("Volatility"));
@@ -420,9 +435,10 @@ mod tests {
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
         engine.severity_overrides.insert("spread".to_string(), CheckSeverity::Veto);
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_spread_bps = 50.0; // Above threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_spread_bps = 50.0;
+
         let decision = engine.check(&request, false);
         assert!(!decision.approved);
         assert!(decision.rejection_reason.unwrap().contains("Spread"));
@@ -434,9 +450,10 @@ mod tests {
         config.max_volatility = 0.05;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_volatility = 0.01; // Below threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_volatility = 0.01;
+
         let decision = engine.check(&request, false);
         assert!(decision.approved);
         assert!(decision.warnings.is_empty());
@@ -448,9 +465,10 @@ mod tests {
         config.max_spread_bps = 50.0;
         let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
 
-        let mut request = make_request("AAPL", 10.0, 150.0);
-        request.current_spread_bps = 10.0; // Below threshold
-        
+        let symbol_id = SymbolId::from_raw(0);
+        let mut request = make_request(symbol_id, 10.0, 150.0);
+        request.current_spread_bps = 10.0;
+
         let decision = engine.check(&request, false);
         assert!(decision.approved);
         assert!(decision.warnings.is_empty());

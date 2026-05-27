@@ -138,7 +138,7 @@ impl FeatureEngine {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(symbol = %tick.symbol, ts = tick.timestamp_ns))]
+    #[tracing::instrument(skip_all, fields(symbol_id = %tick.symbol_id, ts = tick.timestamp_ns))]
     pub fn compute(&mut self, tick: &NormalizedTick) -> FeatureVector {
         self.window_manager.update(
             tick.mid_price,
@@ -146,7 +146,7 @@ impl FeatureEngine {
             tick.spread,
         );
 
-        let mut fv = FeatureVector::new(&self.symbol, tick.timestamp_ns);
+        let mut fv = FeatureVector::new(tick.symbol_id, tick.timestamp_ns);
 
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&self.window_manager, tick);
         // Clamp spread_bps to a sane max (500 bps = 5%) to avoid poisoning from corrupt data
@@ -197,7 +197,7 @@ impl FeatureEngine {
         let fv = self.compute(tick);
 
         FeatureSnapshot {
-            symbol: self.symbol.clone(),
+            symbol_id: tick.symbol_id,
             timestamp_ns: tick.timestamp_ns,
             mid_price: fv.get(FeatureIndex::MidPrice),
             spread_bps: fv.get(FeatureIndex::SpreadBps),
@@ -225,10 +225,11 @@ impl FeatureEngine {
 mod tests {
     use super::*;
     use market_data::NormalizedTick;
+    use unified_trading_core::symbol_registry::SymbolId;
 
-    fn make_tick(symbol: &str, ts: u64, mid: f64, spread: f64) -> NormalizedTick {
+    fn make_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> NormalizedTick {
         NormalizedTick {
-            symbol: symbol.to_string(),
+            symbol_id,
             timestamp_ns: ts,
             mid_price: mid,
             spread,
@@ -243,8 +244,9 @@ mod tests {
 
     #[test]
     fn test_feature_engine_compute() {
+        use unified_trading_core::symbol_registry::SymbolId;
         let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
-        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let tick = make_tick(SymbolId::from_raw(0), 1000, 150.0, 0.05);
         let fv = engine.compute(&tick);
         assert_eq!(fv.len(), FEATURE_COUNT);
         assert!(fv.get(FeatureIndex::MidPrice) > 0.0);
@@ -253,10 +255,11 @@ mod tests {
 
     #[test]
     fn test_feature_engine_snapshot() {
+        use unified_trading_core::symbol_registry::SymbolId;
         let mut engine = FeatureEngine::new("MSFT", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
-        let tick = make_tick("MSFT", 2000, 400.0, 0.04);
+        let tick = make_tick(SymbolId::from_raw(1), 2000, 400.0, 0.04);
         let snap = engine.compute_snapshot(&tick);
-        assert_eq!(snap.symbol, "MSFT");
+        assert_eq!(snap.symbol_id, SymbolId::from_raw(1));
         assert!((snap.mid_price - 400.0).abs() < 0.01);
     }
 
@@ -264,10 +267,10 @@ mod tests {
     fn test_feature_engine_multiple_ticks() {
         let mut engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
         for i in 0..20 {
-            let tick = make_tick("AAPL", i * 1000, 150.0 + (i as f64 * 0.01), 0.05);
+            let tick = make_tick(SymbolId::from_raw(0), i * 1000, 150.0 + (i as f64 * 0.01), 0.05);
             engine.compute(&tick);
         }
-        let tick = make_tick("AAPL", 20000, 150.2, 0.05);
+        let tick = make_tick(SymbolId::from_raw(0), 20000, 150.2, 0.05);
         let fv = engine.compute(&tick);
         assert!(fv.get(FeatureIndex::Ema9) > 0.0);
         assert!(fv.get(FeatureIndex::Atr14) > 0.0);
@@ -275,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_price_computer() {
-        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let tick = make_tick(SymbolId::from_raw(0), 1000, 150.0, 0.05);
         let wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&wm, &tick);
         assert!((mid - 150.0).abs() < 0.001);
@@ -285,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_volume_computer() {
-        let tick = make_tick("AAPL", 1000, 150.0, 0.05);
+        let tick = make_tick(SymbolId::from_raw(0), 1000, 150.0, 0.05);
         let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.volume_window.push(1000.0);
         let ratio = VolumeComputer::compute(&wm, &tick);

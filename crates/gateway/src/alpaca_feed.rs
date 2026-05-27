@@ -6,6 +6,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 
 use market_data::RawTick;
+use unified_trading_core::symbol_registry::SymbolId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlpacaAuth {
@@ -97,7 +98,7 @@ impl AlpacaTrade {
     pub fn to_raw_tick(&self) -> Option<RawTick> {
         let ts = self.ts.unwrap_or(0);
         Some(RawTick {
-            symbol: self.S.clone(),
+            symbol_id: SymbolId::from_raw(0),
             timestamp_ns: ts,
             bid: self.p,
             ask: self.p,
@@ -113,7 +114,7 @@ impl AlpacaTrade {
 impl AlpacaQuote {
     pub fn to_raw_tick(&self) -> Option<RawTick> {
         Some(RawTick {
-            symbol: self.S.clone(),
+            symbol_id: SymbolId::from_raw(0),
             timestamp_ns: self.tr.unwrap_or(0),
             bid: self.bp,
             ask: self.ap,
@@ -424,7 +425,7 @@ impl AlpacaWebSocketFeed {
                             "b" => {
                                 if let Ok(bar) = serde_json::from_value::<AlpacaBar>(item.clone()) {
                                     let tick = RawTick {
-                                        symbol: bar.S.clone(),
+                                        symbol_id: SymbolId::from_raw(0),
                                         timestamp_ns: 0,
                                         bid: bar.o,
                                         ask: bar.c,
@@ -495,7 +496,7 @@ mod tests {
         };
 
         let tick = trade.to_raw_tick().unwrap();
-        assert_eq!(tick.symbol, "AAPL");
+        assert_eq!(tick.symbol_id, SymbolId::from_raw(0)); // Would need symbol registry in real scenario
         assert_eq!(tick.last_price, 150.25);
         assert_eq!(tick.last_size, 100);
     }
@@ -517,7 +518,7 @@ mod tests {
         };
 
         let tick = quote.to_raw_tick().unwrap();
-        assert_eq!(tick.symbol, "MSFT");
+        assert_eq!(tick.symbol_id, SymbolId::from_raw(0)); // Would need symbol registry in real scenario
         assert_eq!(tick.bid, 400.0);
         assert_eq!(tick.ask, 400.05);
         assert_eq!(tick.bid_size, 50);

@@ -7,7 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
-use unified_trading_core::symbol_registry::{SymbolRegistry, SymbolIdArray};
+use unified_trading_core::symbol_registry::{SymbolId, SymbolRegistry, SymbolIdArray};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use market_data::RawTick;
@@ -30,7 +30,7 @@ pub struct TickReactor {
     tick_rx: Receiver<RawTick>,
     control_rx: Receiver<ReactorCommand>,
     control_tx: Sender<ReactorCommand>,
-    handlers: HashMap<String, SymbolHandler>,
+    handlers: HashMap<SymbolId, SymbolHandler>,
     registry: SymbolRegistry,
     handler_array: SymbolIdArray<Sender<RawTick>>,
     kill_switch: Arc<KillSwitch>,
@@ -78,19 +78,22 @@ impl TickReactor {
     }
 
     pub fn subscribe(&mut self, symbol: String, tx: Sender<RawTick>) {
-        if self.registry.lookup(&symbol).is_some() {
+        if let Some(existing_id) = self.registry.lookup(&symbol) {
             tracing::warn!("Symbol {} already subscribed, replacing handler", symbol);
-            self.handlers.remove(&symbol);
+            self.handlers.remove(&existing_id);
         }
 
         if let Some(id) = self.registry.register(&symbol) {
             self.handler_array.set(id, tx.clone());
-            self.handlers.insert(symbol.clone(), SymbolHandler {
-                tx,
-                tick_count: 0,
-                last_tick_ns: 0,
-                dropped_count: 0,
-            });
+            self.handlers.insert(
+                id,
+                SymbolHandler {
+                    tx,
+                    tick_count: 0,
+                    last_tick_ns: 0,
+                    dropped_count: 0,
+                },
+            );
             tracing::info!("Subscribed to symbol {} (ID: {:?})", symbol, id);
         } else {
             tracing::error!("Failed to register symbol {} - registry full", symbol);
@@ -98,8 +101,8 @@ impl TickReactor {
     }
 
     pub fn unsubscribe(&mut self, symbol: &str) {
-        if self.registry.lookup(symbol).is_some() {
-            self.handlers.remove(symbol);
+        if let Some(id) = self.registry.lookup(symbol) {
+            self.handlers.remove(&id);
             tracing::info!("Unsubscribed from symbol {}", symbol);
         }
     }
@@ -159,51 +162,52 @@ impl TickReactor {
 
         for tick in batch.drain(..) {
             self.total_ticks.fetch_add(1, Ordering::Relaxed);
-            let symbol = tick.symbol.clone();
+            let symbol_id = tick.symbol_id;
 
-            if let Some(id) = self.registry.lookup(&symbol) {
-                if let Some(tx) = self.handler_array.get(id) {
-                    match tx.try_send(tick) {
-                        Ok(()) => {
-                            if let Some(handler) = self.handlers.get_mut(&symbol) {
-                                handler.tick_count += 1;
-                                handler.last_tick_ns = now;
+            if let Some(tx) = self.handler_array.get(symbol_id) {
+                match tx.try_send(tick) {
+                    Ok(()) => {
+                        if let Some(handler) = self.handlers.get_mut(&symbol_id) {
+                            handler.tick_count += 1;
+                            handler.last_tick_ns = now;
+                        }
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.total_dropped.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
+                        if let Some(handler) = self.handlers.get_mut(&symbol_id) {
+                            handler.dropped_count += 1;
+                            if handler.dropped_count % self.backpressure_log_interval == 0 {
+                                tracing::warn!(
+                                    symbol_id = %symbol_id,
+                                    dropped = handler.dropped_count,
+                                    "Back-pressure: tick channel full"
+                                );
                             }
                         }
-                        Err(TrySendError::Full(_)) => {
-                            self.total_dropped.fetch_add(1, Ordering::Relaxed);
-                            self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
-                            if let Some(handler) = self.handlers.get_mut(&symbol) {
-                                handler.dropped_count += 1;
-                                if handler.dropped_count % self.backpressure_log_interval == 0 {
-                                    tracing::warn!(
-                                        symbol = %symbol,
-                                        dropped = handler.dropped_count,
-                                        "Back-pressure: tick channel full"
-                                    );
-                                }
-                            }
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
-                            tracing::warn!("Handler for {} disconnected, unsubscribing", symbol);
-                            self.unsubscribe(&symbol);
-                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        tracing::warn!(symbol_id = %symbol_id, "Handler disconnected");
                     }
                 }
             } else {
-                tracing::debug!("Received tick for unregistered symbol: {}", symbol);
+                tracing::debug!(symbol_id = %symbol_id, "Received tick for unregistered symbol_id");
             }
         }
     }
 
-    pub fn get_handler_stats(&self) -> HashMap<String, (u64, u64)> {
-        self.handlers.iter()
-            .map(|(sym, h)| (sym.clone(), (h.tick_count, h.dropped_count)))
+    pub fn get_handler_stats(&self) -> HashMap<SymbolId, (u64, u64)> {
+        self.handlers
+            .iter()
+            .map(|(sid, h)| (*sid, (h.tick_count, h.dropped_count)))
             .collect()
     }
 
     pub fn subscribed_symbols(&self) -> Vec<String> {
-        self.handlers.keys().cloned().collect()
+        self.handlers
+            .keys()
+            .filter_map(|sid| self.registry.get_symbol(*sid).map(|s| s.to_string()))
+            .collect()
     }
 
     pub fn control_tx(&self) -> Sender<ReactorCommand> {
@@ -265,8 +269,9 @@ mod tests {
         let (handler_tx, handler_rx) = bounded::<RawTick>(100);
         reactor.subscribe("AAPL".to_string(), handler_tx);
 
+        let symbol_id = reactor.registry.lookup("AAPL").unwrap();
         let tick = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,
@@ -282,7 +287,7 @@ mod tests {
         reactor.process_tick_batch();
 
         let received = handler_rx.try_recv().unwrap();
-        assert_eq!(received.symbol, "AAPL");
+        assert_eq!(received.symbol_id, symbol_id);
     }
 
     #[test]
@@ -298,8 +303,9 @@ mod tests {
         reactor.unsubscribe("AAPL");
         assert_eq!(reactor.subscribed_symbols().len(), 0);
 
+        let symbol_id = SymbolId::from_raw(0);
         let tick = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,
@@ -324,8 +330,9 @@ mod tests {
         let (handler_tx, _handler_rx) = bounded::<RawTick>(1);
         reactor.subscribe("AAPL".to_string(), handler_tx);
 
+        let symbol_id = reactor.registry.lookup("AAPL").unwrap();
         let tick = RawTick {
-            symbol: "AAPL".to_string(),
+            symbol_id,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use unified_trading_core::symbol_registry::SymbolId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FeatureIndex {
@@ -23,17 +24,37 @@ pub enum FeatureIndex {
 
 pub const FEATURE_COUNT: usize = 17;
 
+static FEATURE_NAMES: [&str; FEATURE_COUNT] = [
+    "mid_price",
+    "spread_bps",
+    "spread_abs",
+    "rsi_14",
+    "macd_line",
+    "macd_signal",
+    "macd_histogram",
+    "atr_14",
+    "rolling_std",
+    "volume_ratio",
+    "order_flow_imbalance",
+    "regime",
+    "regime_strength",
+    "ema_9",
+    "ema_21",
+    "ema_50",
+    "confidence",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureVector {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub values: [f32; FEATURE_COUNT],
 }
 
 impl FeatureVector {
-    pub fn new(symbol: &str, timestamp_ns: u64) -> Self {
+    pub fn new(symbol_id: SymbolId, timestamp_ns: u64) -> Self {
         Self {
-            symbol: symbol.to_string(),
+            symbol_id,
             timestamp_ns,
             values: [0.0f32; FEATURE_COUNT],
         }
@@ -61,11 +82,15 @@ impl FeatureVector {
         arr[..len].copy_from_slice(&self.values[..len]);
         arr
     }
+
+    pub fn feature_name(index: FeatureIndex) -> &'static str {
+        FEATURE_NAMES[index as usize]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureSnapshot {
-    pub symbol: String,
+    pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub mid_price: f32,
     pub spread_bps: f32,
@@ -359,10 +384,12 @@ mod proptest_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unified_trading_core::symbol_registry::SymbolId;
 
     #[test]
     fn test_feature_vector() {
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let symbol_id = SymbolId::from_raw(0);
+        let mut fv = FeatureVector::new(symbol_id, 1000);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 65.0);
         assert_eq!(fv.len(), FEATURE_COUNT);
@@ -423,7 +450,8 @@ mod tests {
 
     #[test]
     fn test_feature_vector_to_array() {
-        let mut fv = FeatureVector::new("AAPL", 1000);
+        let symbol_id = SymbolId::from_raw(0);
+        let mut fv = FeatureVector::new(symbol_id, 1000);
         fv.set(FeatureIndex::MidPrice, 1.0);
         fv.set(FeatureIndex::Rsi14, 2.0);
         let arr: [f32; 5] = fv.to_array();

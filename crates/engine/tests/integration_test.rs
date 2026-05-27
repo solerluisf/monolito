@@ -7,6 +7,7 @@ use crossbeam_channel::bounded;
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::portfolio_manager::PortfolioManager;
+use unified_trading_core::symbol_registry::{next_request_id, SymbolId};
 use market_data::{Normalizer, RawTick};
 use feature::FeatureEngine;
 use model::{InferenceEngine, PredictionEngine};
@@ -16,9 +17,9 @@ use execution::{ExecutionManager, OrderLifecycleEvent};
 use gateway::MockExecutionPort;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
-fn make_raw_tick(symbol: &str, ts: u64, mid: f64, spread: f64) -> RawTick {
+fn make_raw_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> RawTick {
     RawTick {
-        symbol: symbol.to_string(),
+        symbol_id,
         timestamp_ns: ts,
         bid: mid - spread / 2.0,
         ask: mid + spread / 2.0,
@@ -67,10 +68,10 @@ fn run_processor(
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 let request = RiskCheckRequest {
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                    symbol: signal.symbol.clone(),
-                    intent_id: signal.intent_id.clone(),
-                    side: format!("{:?}", signal.side),
+                    request_id: next_request_id(),
+                    symbol_id: signal.symbol_id,
+                    intent_id: signal.intent_id,
+                    side: signal.side as u8,
                     quantity: 1.0,
                     price: 150.0,
                     timestamp_ns: now,
@@ -101,16 +102,17 @@ fn test_full_pipeline_tick_to_intent() {
     let (decision_tx, decision_rx) = bounded::<RiskDecision>(1000);
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
-    let normalizer = Normalizer::new("AAPL");
+    let symbol_id = SymbolId::from_raw(0);
+    let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
-        "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
         30_000_000_000, 100.0, 100.0, 0.85, 0.5,
         0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
         0.3, 0.4, 0.3, 0.3,
     );
 
-    let pred_engine = PredictionEngine::new(feature_rx, "AAPL");
+    let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
         128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
     );
@@ -161,7 +163,7 @@ fn test_full_pipeline_tick_to_intent() {
     ).expect("spawn_pinned failed");
 
     for i in 0..50 {
-        let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
+        let tick = make_raw_tick(symbol_id, i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
         md_tx.send(tick).unwrap();
     }
 
@@ -185,16 +187,17 @@ fn test_pipeline_with_burst_ticks() {
     let (decision_tx, decision_rx) = bounded::<RiskDecision>(1000);
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
-    let normalizer = Normalizer::new("MSFT");
+    let symbol_id = SymbolId::from_raw(1);
+    let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("MSFT", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
-        "MSFT", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
         30_000_000_000, 100.0, 100.0, 0.85, 0.5,
         0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
         0.3, 0.4, 0.3, 0.3,
     );
 
-    let pred_engine = PredictionEngine::new(feature_rx, "MSFT");
+    let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
         128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
     );
@@ -245,7 +248,7 @@ fn test_pipeline_with_burst_ticks() {
     ).expect("spawn_pinned failed");
 
     for i in 0..500 {
-        let tick = make_raw_tick("MSFT", i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
+        let tick = make_raw_tick(symbol_id, i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
         md_tx.send(tick).unwrap();
     }
 
@@ -269,16 +272,17 @@ fn test_kill_switch_stops_pipeline() {
     let (decision_tx, decision_rx) = bounded::<RiskDecision>(1000);
     let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(1000);
 
-    let normalizer = Normalizer::new("AAPL");
+    let symbol_id = SymbolId::from_raw(0);
+    let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
     let strategy_engine = StrategyEngine::new(
-        "AAPL", 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
+        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
         30_000_000_000, 100.0, 100.0, 0.85, 0.5,
         0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
         0.3, 0.4, 0.3, 0.3,
     );
 
-    let pred_engine = PredictionEngine::new(feature_rx, "AAPL");
+    let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
         128, 0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
     );
@@ -329,7 +333,7 @@ fn test_kill_switch_stops_pipeline() {
     ).expect("spawn_pinned failed");
 
     for i in 0..100 {
-        let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0, 0.05);
+        let tick = make_raw_tick(symbol_id, i * 1_000_000, 150.0, 0.05);
         md_tx.send(tick).unwrap();
     }
 
@@ -345,3 +349,5 @@ fn test_kill_switch_stops_pipeline() {
 
     let _ = proc_handle.join();
 }
+
+

@@ -11,8 +11,9 @@ use arc_swap::ArcSwap;
 #[test]
 fn test_arc_swap_prediction_concurrent() {
     use model::Prediction;
+    use unified_trading_core::symbol_registry::SymbolId;
     
-    let prediction = Arc::new(ArcSwap::new(Arc::new(Prediction::new_default("TEST"))));
+    let prediction = Arc::new(ArcSwap::new(Arc::new(Prediction::new_default(SymbolId::from_raw(0)))));
     let read_count = Arc::new(AtomicU64::new(0));
     let write_count = Arc::new(AtomicU64::new(0));
     
@@ -24,7 +25,7 @@ fn test_arc_swap_prediction_concurrent() {
         let handle = std::thread::spawn(move || {
             for j in 0..1000 {
                 let new_pred = Prediction {
-                    symbol: "TEST".to_string(),
+                    symbol_id: SymbolId::from_raw(0),
                     forecast: i as f32 * 1000.0 + j as f32,
                     confidence: 0.5 + (j as f32 / 2000.0),
                     action_score: 0.0,
@@ -68,7 +69,6 @@ fn test_arc_swap_prediction_concurrent() {
     
     // Verify final prediction is valid (no corruption)
     let final_pred = prediction.load_full();
-    assert!(!final_pred.symbol.is_empty());
     assert!(final_pred.computed_ns > 0);
 }
 
@@ -89,7 +89,7 @@ fn test_arc_swap_strategy_hot_swap() {
         fn evaluate(&self, prediction: &Prediction, _ctx: &SignalContext) -> Option<TradeIntent> {
             if prediction.action_score > self.threshold {
                 Some(TradeIntent::new(
-                    &prediction.symbol,
+                    prediction.symbol_id,
                     SignalSide::Long,
                     strategy::SizeHint::Units(1),
                     strategy::IntentType::Entry,
@@ -125,10 +125,11 @@ fn test_arc_swap_strategy_hot_swap() {
     let strat = Arc::clone(&strategy);
     let ec = Arc::clone(&evaluate_count);
     let eval_handle = std::thread::spawn(move || {
-        let ctx = SignalContext::new("TEST");
+        use unified_trading_core::symbol_registry::SymbolId;
+        let ctx = SignalContext::new(SymbolId::from_raw(0));
         for i in 0..10000 {
             let pred = Prediction {
-                symbol: "TEST".to_string(),
+                symbol_id: SymbolId::from_raw(0),
                 forecast: 0.5,
                 confidence: 0.8,
                 action_score: 0.5 + (i as f32 / 10000.0),
