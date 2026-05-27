@@ -3,16 +3,26 @@ use parking_lot::Mutex;
 use std::time::Instant;
 
 pub const DEFAULT_CAPACITY: usize = 100_000;
+pub const DEFAULT_MAX_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
 struct Entry {
     result: String,
     last_accessed: Instant,
 }
 
+impl Entry {
+    fn estimated_bytes_for(key: &str, result: &str) -> usize {
+        // Approximate in-memory footprint (string payloads + Entry metadata estimate).
+        key.len() + result.len() + 64
+    }
+}
+
 pub struct IdempotencyStore {
     processed: Mutex<HashMap<String, Entry>>,
     access_order: Mutex<VecDeque<String>>,
     capacity: usize,
+    max_memory_bytes: usize,
+    current_memory_bytes: Mutex<usize>,
     persist_path: Option<std::path::PathBuf>,
 }
 
@@ -20,14 +30,20 @@ impl IdempotencyStore {
     pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY;
 
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_CAPACITY)
+        Self::with_limits(DEFAULT_CAPACITY, DEFAULT_MAX_MEMORY_BYTES)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_MAX_MEMORY_BYTES)
+    }
+
+    pub fn with_limits(capacity: usize, max_memory_bytes: usize) -> Self {
         Self {
             processed: Mutex::new(HashMap::with_capacity(capacity)),
             access_order: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            max_memory_bytes,
+            current_memory_bytes: Mutex::new(0),
             persist_path: None,
         }
     }
@@ -37,6 +53,8 @@ impl IdempotencyStore {
             processed: Mutex::new(HashMap::with_capacity(capacity)),
             access_order: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            current_memory_bytes: Mutex::new(0),
             persist_path: Some(path.to_path_buf()),
         };
         store.load_from_disk();
@@ -56,6 +74,7 @@ impl IdempotencyStore {
 
         let mut processed = self.processed.lock();
         let mut access_order = self.access_order.lock();
+        let mut current_memory_bytes = self.current_memory_bytes.lock();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -67,6 +86,7 @@ impl IdempotencyStore {
             }
             let key = parts[0].to_string();
             let result = parts[1].to_string();
+            *current_memory_bytes += Entry::estimated_bytes_for(&key, &result);
             let entry = Entry {
                 result,
                 last_accessed: std::time::Instant::now(),
@@ -107,15 +127,27 @@ impl IdempotencyStore {
     pub fn mark_processed(&self, key: String, result: String) {
         let mut processed = self.processed.lock();
         let mut access_order = self.access_order.lock();
+        let mut current_memory_bytes = self.current_memory_bytes.lock();
 
-        if !processed.contains_key(&key) && processed.len() >= self.capacity {
-            if let Some(lru_key) = access_order.pop_back() {
-                processed.remove(&lru_key);
-            }
+        if let Some(existing) = processed.remove(&key) {
+            *current_memory_bytes = current_memory_bytes.saturating_sub(
+                Entry::estimated_bytes_for(&key, &existing.result),
+            );
+            access_order.retain(|k| k != &key);
         }
 
-        if processed.contains_key(&key) {
-            access_order.retain(|k| k != &key);
+        let new_entry_bytes = Entry::estimated_bytes_for(&key, &result);
+
+        while (processed.len() >= self.capacity || *current_memory_bytes + new_entry_bytes > self.max_memory_bytes)
+            && !access_order.is_empty()
+        {
+            if let Some(lru_key) = access_order.pop_back() {
+                if let Some(evicted) = processed.remove(&lru_key) {
+                    *current_memory_bytes = current_memory_bytes.saturating_sub(
+                        Entry::estimated_bytes_for(&lru_key, &evicted.result),
+                    );
+                }
+            }
         }
 
         let entry = Entry {
@@ -123,10 +155,17 @@ impl IdempotencyStore {
             last_accessed: Instant::now(),
         };
 
+        if new_entry_bytes > self.max_memory_bytes {
+            return;
+        }
+
         processed.insert(key.clone(), entry);
         access_order.push_front(key.clone());
+        *current_memory_bytes += new_entry_bytes;
+
         drop(processed);
         drop(access_order);
+        drop(current_memory_bytes);
         self.append_to_disk(&key, &result);
     }
 
@@ -156,13 +195,24 @@ impl IdempotencyStore {
         self.capacity
     }
 
+    pub fn memory_usage_bytes(&self) -> usize {
+        *self.current_memory_bytes.lock()
+    }
+
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.max_memory_bytes
+    }
+
     pub fn clear(&self) {
         let mut processed = self.processed.lock();
         let mut access_order = self.access_order.lock();
+        let mut current_memory_bytes = self.current_memory_bytes.lock();
         processed.clear();
         access_order.clear();
+        *current_memory_bytes = 0;
         drop(processed);
         drop(access_order);
+        drop(current_memory_bytes);
         if let Some(ref path) = self.persist_path {
             let _ = std::fs::remove_file(path);
         }
@@ -252,6 +302,17 @@ mod tests {
         assert_eq!(store.len(), 2);
         store.clear();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_memory_cap_enforced() {
+        let store = IdempotencyStore::with_limits(10_000, 256);
+
+        for i in 0..200 {
+            store.mark_processed(format!("key{}", i), "x".repeat(32));
+        }
+
+        assert!(store.memory_usage_bytes() <= store.memory_limit_bytes());
     }
 
     #[test]

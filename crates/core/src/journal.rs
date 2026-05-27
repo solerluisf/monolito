@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::metrics::GlobalMetrics;
 use crate::threading::{spawn_pinned, ThreadPriority};
@@ -271,6 +271,24 @@ impl JournalWriter {
         self.tx.send(JournalCommand::Write(entry)).map_err(|_| "Journal channel closed")
     }
 
+    /// Non-blocking write for hot paths.
+    /// If the channel is full, entry is dropped to avoid stalling safety-critical execution.
+    pub fn try_write(&self, entry: JournalEntry) -> Result<(), &'static str> {
+        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(JournalCommand::Write(entry)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                Err("Journal channel full")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
+                Err("Journal channel closed")
+            }
+        }
+    }
+
     pub fn flush_sync(&self) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = bounded::<()>(1);
         self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
@@ -461,6 +479,32 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let count = writer.write_count();
         assert_eq!(count, 10);
+
+        writer.shutdown();
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_journal_try_write_non_blocking() {
+        let metrics = Arc::new(GlobalMetrics::new());
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("journal_try_write_test_{}", std::process::id()));
+        let writer = JournalWriter::new(
+            tmp_dir.to_str().unwrap(),
+            1000,
+            Arc::clone(&metrics),
+            0,
+            168,
+            10_000,
+        );
+
+        for i in 0..20_000 {
+            let _ = writer.try_write(JournalEntry::Event {
+                event_type: "TEST".to_string(),
+                timestamp_ns: i,
+                data: "payload".to_string(),
+            });
+        }
 
         writer.shutdown();
         let _ = fs::remove_dir_all(&tmp_dir);

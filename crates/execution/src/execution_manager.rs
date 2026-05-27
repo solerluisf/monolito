@@ -166,15 +166,9 @@ impl ExecutionManager {
                 data: format!("order_id={},side={:?},qty={},decision={}", order_id, side, quantity, decision.request_id),
             };
             
-            // Write to journal first
-            if let Err(e) = journal.write(entry) {
-                tracing::error!("Failed to write to journal: {}", e);
-                // Continue anyway - journal failure shouldn't block trading
-            } else {
-                // Sync flush for critical orders to ensure durability
-                if let Err(e) = journal.flush_sync() {
-                    tracing::error!("Failed to flush journal: {}", e);
-                }
+            // Hot path is non-blocking: drop if journal queue is full/slow.
+            if let Err(e) = journal.try_write(entry) {
+                tracing::warn!("Non-blocking journal write dropped/failed: {}", e);
             }
         }
 
