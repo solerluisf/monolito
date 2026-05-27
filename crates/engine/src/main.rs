@@ -35,10 +35,10 @@ fn load_config() -> EngineConfig {
     let mut config = EngineConfig::default();
 
     if let Ok(api_key) = std::env::var("ALPACA_API_KEY") {
-        config.broker_config.api_key = api_key;
+        config.broker_config.api_key = unified_trading_core::config::SecretString::new(api_key);
     }
     if let Ok(api_secret) = std::env::var("ALPACA_API_SECRET") {
-        config.broker_config.api_secret = api_secret;
+        config.broker_config.api_secret = unified_trading_core::config::SecretString::new(api_secret);
     }
     if let Ok(paper) = std::env::var("ALPACA_PAPER") {
         config.broker_config.paper_trading = paper.parse().unwrap_or(true);

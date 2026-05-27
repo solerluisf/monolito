@@ -1,5 +1,47 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt;
+
+/// A wrapper type for sensitive strings that masks values in Debug and Serialize output.
+/// Use .expose_secret() to access the raw value only when necessary.
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Create a new SecretString from a string.
+    pub fn new(value: impl Into<String>) -> Self {
+        SecretString(value.into())
+    }
+
+    /// Expose the raw secret value. Use sparingly and only where absolutely necessary.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretString(\"********\")")
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("********")
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(SecretString)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckSeverity {
@@ -98,8 +140,8 @@ pub struct StrategyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerConfig {
     pub broker_type: String,
-    pub api_key: String,
-    pub api_secret: String,
+    pub api_key: SecretString,
+    pub api_secret: SecretString,
     pub paper_trading: bool,
     pub ws_url: String,
     pub rest_url: String,
@@ -310,8 +352,8 @@ impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             broker_type: "alpaca".to_string(),
-            api_key: String::new(),
-            api_secret: String::new(),
+            api_key: SecretString::new(""),
+            api_secret: SecretString::new(""),
             paper_trading: true,
             ws_url: "wss://stream.data.alpaca.markets/v2/iex".to_string(),
             rest_url: "https://paper-api.alpaca.markets".to_string(),
@@ -497,5 +539,64 @@ mod tests {
         let strat = StrategyConfig::default();
         assert_eq!(strat.prediction_staleness_ns, 150_000_000);
         assert_eq!(strat.confidence_minimum, 0.5);
+    }
+
+    #[test]
+    fn test_secret_string_debug_masking() {
+        let secret = SecretString::new("my-secret-key");
+        let debug_output = format!("{:?}", secret);
+        assert_eq!(debug_output, "SecretString(\"********\")");
+        assert!(!debug_output.contains("my-secret-key"));
+    }
+
+    #[test]
+    fn test_secret_string_expose_secret() {
+        let secret = SecretString::new("my-secret-key");
+        assert_eq!(secret.expose_secret(), "my-secret-key");
+    }
+
+    #[test]
+    fn test_secret_string_serialization_masking() {
+        let secret = SecretString::new("my-secret-key");
+        let json = serde_json::to_string(&secret).unwrap();
+        assert_eq!(json, "\"********\"");
+        assert!(!json.contains("my-secret-key"));
+    }
+
+    #[test]
+    fn test_broker_config_debug_masking() {
+        let broker = BrokerConfig {
+            broker_type: "alpaca".to_string(),
+            api_key: SecretString::new("test-key-123"),
+            api_secret: SecretString::new("test-secret-456"),
+            paper_trading: true,
+            ws_url: "wss://example.com".to_string(),
+            rest_url: "https://example.com".to_string(),
+            max_retries: 3,
+            retry_backoff_ms: 1000,
+        };
+        let debug_output = format!("{:?}", broker);
+        assert!(!debug_output.contains("test-key-123"));
+        assert!(!debug_output.contains("test-secret-456"));
+        assert!(debug_output.contains("********"));
+    }
+
+    #[test]
+    fn test_broker_config_serialization_masking() {
+        let broker = BrokerConfig {
+            broker_type: "alpaca".to_string(),
+            api_key: SecretString::new("test-key-123"),
+            api_secret: SecretString::new("test-secret-456"),
+            paper_trading: true,
+            ws_url: "wss://example.com".to_string(),
+            rest_url: "https://example.com".to_string(),
+            max_retries: 3,
+            retry_backoff_ms: 1000,
+        };
+        let json = serde_json::to_string(&broker).unwrap();
+        assert!(!json.contains("test-key-123"));
+        assert!(!json.contains("test-secret-456"));
+        // The serialized form should contain the masked secret
+        assert!(json.contains("\"**"));
     }
 }

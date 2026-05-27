@@ -398,7 +398,7 @@ impl UnifiedEngine {
 
         let config = self.config.read();
         let broker = &config.broker_config;
-        if broker.api_key.is_empty() || broker.api_secret.is_empty() {
+        if broker.api_key.expose_secret().is_empty() || broker.api_secret.expose_secret().is_empty() {
             tracing::warn!("Alpaca API credentials not configured, skipping live feed");
             return None;
         }
@@ -406,8 +406,8 @@ impl UnifiedEngine {
         let (feed_tx, feed_rx) = bounded::<RawTick>(10_000);
 
         let feed_config = AlpacaFeedConfig {
-            api_key: broker.api_key.clone(),
-            api_secret: broker.api_secret.clone(),
+            api_key: broker.api_key.expose_secret().to_string(),
+            api_secret: broker.api_secret.expose_secret().to_string(),
             paper_trading: broker.paper_trading,
             symbols: symbols.to_vec(),
             subscribe_trades: true,
@@ -462,8 +462,8 @@ impl UnifiedEngine {
         let execution_defaults = config.execution_defaults.clone();
         let circuit_breaker_cfg = config.circuit_breaker_config.clone();
         let reactor_cfg = config.reactor_config.clone();
-        let execution_port: Arc<dyn IExecutionPort> = if !broker.api_key.is_empty() && !broker.api_secret.is_empty() {
-            match AlpacaExecutionPort::new(&broker.api_key, &broker.api_secret, broker.paper_trading) {
+        let execution_port: Arc<dyn IExecutionPort> = if !broker.api_key.expose_secret().is_empty() && !broker.api_secret.expose_secret().is_empty() {
+            match AlpacaExecutionPort::new(broker.api_key.expose_secret(), broker.api_secret.expose_secret(), broker.paper_trading) {
                 Ok(port) => {
                     tracing::info!("Alpaca execution port initialized (paper={})", broker.paper_trading);
                     Arc::new(port)
