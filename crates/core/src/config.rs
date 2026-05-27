@@ -49,6 +49,7 @@ pub struct EngineConfig {
     pub validator_config: ValidatorConfig,
     pub api_key: String,
     pub control_plane_rate_limit: u32,
+    pub safe_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +158,8 @@ pub struct JournalConfig {
     pub flush_interval_ms: u64,
     pub snapshot_interval_sec: u64,
     pub max_file_size_mb: u64,
+    pub retention_hours: u32,
+    pub max_size_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +246,7 @@ impl Default for EngineConfig {
             validator_config: ValidatorConfig::default(),
             api_key: String::new(),
             control_plane_rate_limit: 10,
+            safe_mode: false,
         }
     }
 }
@@ -361,6 +365,8 @@ impl Default for JournalConfig {
             flush_interval_ms: 100,
             snapshot_interval_sec: 60,
             max_file_size_mb: 100,
+            retention_hours: 168,
+            max_size_mb: 10_000,
         }
     }
 }

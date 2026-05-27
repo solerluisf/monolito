@@ -1,10 +1,10 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -25,6 +25,7 @@ pub enum JournalEntry {
 pub enum JournalCommand {
     Write(JournalEntry),
     Flush { ack: Sender<()> },
+    Compaction,
 }
 
 pub struct JournalWriter {
@@ -33,6 +34,8 @@ pub struct JournalWriter {
     write_count: Arc<AtomicU64>,
     metrics: Arc<GlobalMetrics>,
     journal_dir: PathBuf,
+    retention_hours: u32,
+    max_size_mb: u64,
 }
 
 impl JournalWriter {
@@ -41,12 +44,14 @@ impl JournalWriter {
         flush_interval_ms: u64,
         metrics: Arc<GlobalMetrics>,
         core_id: usize,
+        retention_hours: u32,
+        max_size_mb: u64,
     ) -> Self {
         let (tx, rx) = bounded::<JournalCommand>(10_000);
         let write_count = Arc::new(AtomicU64::new(0));
 
         let path = PathBuf::from(journal_dir);
-        std::fs::create_dir_all(&path).ok();
+        fs::create_dir_all(&path).ok();
         let file_path = path.join(format!(
             "journal_{}.log",
             chrono::Utc::now().format("%Y%m%d_%H%M%S")
@@ -54,21 +59,36 @@ impl JournalWriter {
 
         let wc = Arc::clone(&write_count);
         let metrics_clone = Arc::clone(&metrics);
+        let journal_dir_clone = path.clone();
+        let retention_hours_clone = retention_hours;
+        let max_size_mb_clone = max_size_mb;
+
         let handle = spawn_pinned(
             "journal",
             core_id,
             ThreadPriority::Normal,
             move || {
-                Self::run_loop(rx, &file_path, flush_interval_ms, &metrics_clone, &wc);
+                Self::run_loop(
+                    rx,
+                    &file_path,
+                    flush_interval_ms,
+                    &metrics_clone,
+                    &wc,
+                    retention_hours_clone,
+                    max_size_mb_clone,
+                    &journal_dir_clone,
+                );
             },
         );
 
         Self {
             tx,
-            handle: Some(handle),
+            handle: Some(handle.expect("spawn_pinned failed")),
             write_count,
             metrics,
             journal_dir: path,
+            retention_hours,
+            max_size_mb,
         }
     }
 
@@ -79,8 +99,7 @@ impl JournalWriter {
         let mut entries_read: u64 = 0;
         let mut files: Vec<std::path::PathBuf> = Vec::new();
 
-        // Collect all journal files in the directory
-        if let Ok(entries) = std::fs::read_dir(&self.journal_dir) {
+        if let Ok(entries) = fs::read_dir(&self.journal_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name() {
@@ -92,12 +111,11 @@ impl JournalWriter {
             }
         }
 
-        // Sort by file name (which includes timestamp) for deterministic replay order
         files.sort();
 
         for file_path in files {
-            let content = std::fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read journal file {:?}: {}", file_path, e))?;
+            let content =
+                fs::read_to_string(&file_path).map_err(|e| format!("Failed to read {:?}: {}", file_path, e))?;
 
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -119,6 +137,9 @@ impl JournalWriter {
         flush_interval_ms: u64,
         metrics: &GlobalMetrics,
         write_count: &AtomicU64,
+        retention_hours: u32,
+        max_size_mb: u64,
+        journal_dir: &PathBuf,
     ) {
         let file = OpenOptions::new()
             .create(true)
@@ -129,6 +150,8 @@ impl JournalWriter {
 
         let mut last_flush = std::time::Instant::now();
         let flush_dur = Duration::from_millis(flush_interval_ms);
+        let mut last_compaction_check = std::time::Instant::now();
+        let compaction_check_interval = Duration::from_secs(3600);
 
         loop {
             match rx.recv_timeout(Duration::from_millis(10)) {
@@ -154,10 +177,19 @@ impl JournalWriter {
                     let _ = ack.send(());
                     last_flush = std::time::Instant::now();
                 }
+                Ok(JournalCommand::Compaction) => {
+                    let _ = writer.flush();
+                    Self::run_compaction(journal_dir, retention_hours, max_size_mb);
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if last_flush.elapsed() >= flush_dur {
                         let _ = writer.flush();
                         last_flush = std::time::Instant::now();
+                    }
+                    if last_compaction_check.elapsed() >= compaction_check_interval {
+                        let _ = writer.flush();
+                        Self::run_compaction(journal_dir, retention_hours, max_size_mb);
+                        last_compaction_check = std::time::Instant::now();
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -168,25 +200,83 @@ impl JournalWriter {
         }
     }
 
-    pub fn write(&self, entry: JournalEntry) -> Result<(), &'static str> {
-        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
-        self.tx
-            .send(JournalCommand::Write(entry))
-            .map_err(|_| "Journal channel closed")
+    fn run_compaction(journal_dir: &PathBuf, retention_hours: u32, max_size_mb: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u64;
+        let retention_secs = retention_hours as u64 * 3600;
+        let cutoff = now.saturating_sub(retention_secs);
+        let max_bytes = max_size_mb as u64 * 1024 * 1024;
+
+        if let Ok(entries) = fs::read_dir(journal_dir) {
+            let mut journal_files: Vec<(u64, std::path::PathBuf)> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("journal_") && name_str.ends_with(".log") {
+                        if let Ok(metadata) = path.metadata() {
+                            let modified = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            journal_files.push((modified, path));
+                        }
+                    }
+                }
+            }
+
+            journal_files.sort_by_key(|k| k.0);
+
+            let mut total_size: u64 = journal_files.iter().map(|(_, p)| {
+                p.metadata().map(|m| m.len()).unwrap_or(0)
+            }).sum();
+
+            for (modified, path) in journal_files {
+                if modified < cutoff {
+                    tracing::info!("Deleting expired journal file: {:?}", path);
+                    if fs::remove_file(&path).is_ok() {
+                        if let Ok(meta) = path.metadata() {
+                            total_size = total_size.saturating_sub(meta.len());
+                        }
+                    }
+                    continue;
+                }
+
+                if total_size > max_bytes {
+                    tracing::info!("Deleting oldest journal file to reduce size: {:?}", path);
+                    if fs::remove_file(&path).is_ok() {
+                        if let Ok(meta) = path.metadata() {
+                            total_size = total_size.saturating_sub(meta.len());
+                        }
+                    }
+                }
+
+                if total_size <= max_bytes {
+                    break;
+                }
+            }
+        }
     }
 
-    /// Synchronously flush the journal to disk.
-    /// Blocks until the flush is complete.
+    pub fn trigger_compaction(&self) {
+        let _ = self.tx.send(JournalCommand::Compaction);
+    }
+
+    pub fn write(&self, entry: JournalEntry) -> Result<(), &'static str> {
+        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
+        self.tx.send(JournalCommand::Write(entry)).map_err(|_| "Journal channel closed")
+    }
+
     pub fn flush_sync(&self) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = bounded::<()>(1);
         self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
         let flush_start = std::time::Instant::now();
-        self.tx
-            .send(JournalCommand::Flush { ack: ack_tx })
-            .map_err(|_| "Journal channel closed")?;
-        let result = ack_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Flush timeout");
+        self.tx.send(JournalCommand::Flush { ack: ack_tx }).map_err(|_| "Journal channel closed")?;
+        let result = ack_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "Flush timeout");
         let elapsed_ns = flush_start.elapsed().as_nanos() as u64;
         self.metrics.journal_flush_latency.record(elapsed_ns);
         result
@@ -280,31 +370,30 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
 
 fn format_entry(entry: &JournalEntry) -> String {
     match entry {
-        JournalEntry::Tick { symbol, timestamp_ns, data } => {
-            format!("TICK|{}|{}|{}", symbol, timestamp_ns, data)
-        }
-        JournalEntry::Intent { symbol, timestamp_ns, data } => {
-            format!("INTENT|{}|{}|{}", symbol, timestamp_ns, data)
-        }
-        JournalEntry::Fill { symbol, timestamp_ns, data } => {
-            format!("FILL|{}|{}|{}", symbol, timestamp_ns, data)
-        }
-        JournalEntry::Order { symbol, timestamp_ns, data } => {
-            format!("ORDER|{}|{}|{}", symbol, timestamp_ns, data)
-        }
+        JournalEntry::Tick {
+            symbol, timestamp_ns, data
+        } => format!("TICK|{}|{}|{}", symbol, timestamp_ns, data),
+        JournalEntry::Intent {
+            symbol, timestamp_ns, data
+        } => format!("INTENT|{}|{}|{}", symbol, timestamp_ns, data),
+        JournalEntry::Fill {
+            symbol, timestamp_ns, data
+        } => format!("FILL|{}|{}|{}", symbol, timestamp_ns, data),
+        JournalEntry::Order {
+            symbol, timestamp_ns, data
+        } => format!("ORDER|{}|{}|{}", symbol, timestamp_ns, data),
         JournalEntry::Snapshot { timestamp_ns, data } => {
             format!("SNAPSHOT|{}|{}", timestamp_ns, data)
         }
-        JournalEntry::Event { event_type, timestamp_ns, data } => {
-            format!("EVENT|{}|{}|{}", event_type, timestamp_ns, data)
-        }
+        JournalEntry::Event {
+            event_type, timestamp_ns, data
+        } => format!("EVENT|{}|{}|{}", event_type, timestamp_ns, data),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_journal_write_and_shutdown() {
@@ -315,7 +404,9 @@ mod tests {
             tmp_dir.to_str().unwrap(),
             50,
             Arc::clone(&metrics),
-            0, // core_id
+            0,
+            168,
+            10_000,
         );
 
         let entry = JournalEntry::Tick {
@@ -325,12 +416,12 @@ mod tests {
         };
         assert!(writer.write(entry).is_ok());
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
         let count = writer.write_count();
         assert!(count > 0);
 
         writer.shutdown();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -353,7 +444,9 @@ mod tests {
             tmp_dir.to_str().unwrap(),
             10,
             Arc::clone(&metrics),
-            0, // core_id
+            0,
+            168,
+            10_000,
         );
 
         for i in 0..10 {
@@ -370,7 +463,7 @@ mod tests {
         assert_eq!(count, 10);
 
         writer.shutdown();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -380,9 +473,11 @@ mod tests {
             .join(format!("journal_test3_{}", std::process::id()));
         let writer = JournalWriter::new(
             tmp_dir.to_str().unwrap(),
-            5000, // Long flush interval to ensure sync flush works
+            5000,
             Arc::clone(&metrics),
-            0, // core_id
+            0,
+            168,
+            10_000,
         );
 
         let entry = JournalEntry::Tick {
@@ -391,15 +486,13 @@ mod tests {
             data: "price=150.0".to_string(),
         };
         assert!(writer.write(entry).is_ok());
-        
-        // Sync flush should complete without error
         assert!(writer.flush_sync().is_ok());
 
         let count = writer.write_count();
         assert_eq!(count, 1);
 
         writer.shutdown();
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
@@ -407,12 +500,7 @@ mod tests {
         let metrics = Arc::new(GlobalMetrics::new());
         let tmp_dir = std::env::temp_dir()
             .join(format!("journal_replay_test_{}", std::process::id()));
-        let writer = JournalWriter::new(
-            tmp_dir.to_str().unwrap(),
-            10,
-            Arc::clone(&metrics),
-            0,
-        );
+        let writer = JournalWriter::new(tmp_dir.to_str().unwrap(), 10, Arc::clone(&metrics), 0, 168, 10_000);
 
         let entries = vec![
             JournalEntry::Order {
@@ -438,17 +526,14 @@ mod tests {
         assert!(writer.flush_sync().is_ok());
         writer.shutdown();
 
-        let writer2 = JournalWriter::new(
-            tmp_dir.to_str().unwrap(),
-            10,
-            Arc::clone(&metrics),
-            0,
-        );
+        let writer2 = JournalWriter::new(tmp_dir.to_str().unwrap(), 10, Arc::clone(&metrics), 0, 168, 10_000);
 
         let mut replayed = Vec::new();
-        let count = writer2.replay(|entry| {
-            replayed.push(entry.clone());
-        }).expect("replay should succeed");
+        let count = writer2
+            .replay(|entry| {
+                replayed.push(entry.clone());
+            })
+            .expect("replay should succeed");
 
         assert_eq!(count, 3);
         assert_eq!(replayed.len(), 3);
@@ -457,6 +542,33 @@ mod tests {
         assert!(matches!(replayed[2], JournalEntry::Tick { .. }));
 
         writer2.shutdown();
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_compactionTrigger() {
+        let metrics = Arc::new(GlobalMetrics::new());
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("journal_compact_test_{}", std::process::id()));
+
+        std::fs::create_dir(&tmp_dir).ok();
+
+        let old_file = tmp_dir.join("journal_20200101_000000.log");
+        std::fs::write(&old_file, "TICK|AAPL|100|old_data\n").ok();
+
+        let writer = JournalWriter::new(
+            tmp_dir.to_str().unwrap(),
+            10,
+            Arc::clone(&metrics),
+            0,
+            1,
+            10_000,
+        );
+
+        writer.trigger_compaction();
+        std::thread::sleep(Duration::from_millis(50));
+
+        writer.shutdown();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

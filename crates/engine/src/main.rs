@@ -6,6 +6,7 @@ use model::ModelRegistry;
 use unified_trading_core::config::EngineConfig;
 use unified_trading_core::ws::{create_ws_router, WsState};
 use unified_trading_core::large_pages::{enable_large_pages, log_large_page_result};
+use unified_trading_core::CrashDetector;
 use unified_trading_engine::{UnifiedEngine, ApiState, create_router};
 
 fn load_config() -> EngineConfig {
@@ -77,23 +78,55 @@ fn main() {
 
     tracing::info!("Unified Trading Engine starting");
 
-    let config = load_config();
-    let mut engine = UnifiedEngine::new(config);
+    let crash_detector = CrashDetector::new(
+        std::path::PathBuf::from("crash_state.json")
+    );
+    let enter_safe_mode = crash_detector.check_and_record_startup();
 
-    let kill_switch = Arc::clone(&engine.kill_switch);
-    let metrics = Arc::clone(&engine.metrics);
-    let command_tx = engine.command_channel.tx.clone();
-    let config = Arc::clone(&engine.config);
-    let portfolio_manager = Arc::clone(&engine.portfolio_manager);
-    let strategy_registry = Arc::clone(&engine.strategy_registry);
+    let mut config = load_config();
+    if enter_safe_mode {
+        tracing::error!("Crash loop detected. Entering safe mode.");
+        if let Some(reverted) = crash_detector.get_last_known_good_config() {
+            tracing::info!("Reverting to last-known-good configuration");
+            config = reverted;
+        }
+        config.safe_mode = true;
+        for asset in &mut config.asset_configs {
+            asset.enabled = false;
+        }
+    }
+    let engine = Arc::new(parking_lot::Mutex::new(UnifiedEngine::new(config)));
 
-    engine.start();
-
-    let heartbeats = engine.heartbeats.clone();
-    let execution_states = {
-        let states = engine.execution_states.clone();
-        Arc::new(parking_lot::Mutex::new(states))
+    let (kill_switch, metrics, command_tx, config, portfolio_manager, strategy_registry, heartbeats, execution_states) = {
+        let e = engine.lock();
+        let kill_switch = Arc::clone(&e.kill_switch);
+        let metrics = Arc::clone(&e.metrics);
+        let command_tx = e.command_channel.tx.clone();
+        let config = Arc::clone(&e.config);
+        let portfolio_manager = Arc::clone(&e.portfolio_manager);
+        let strategy_registry = Arc::clone(&e.strategy_registry);
+        let heartbeats = e.heartbeats.clone();
+        let execution_states = {
+            let states = e.execution_states.clone();
+            Arc::new(parking_lot::Mutex::new(states))
+        };
+        (kill_switch, metrics, command_tx, config, portfolio_manager, strategy_registry, heartbeats, execution_states)
     };
+
+    {
+        let mut e = engine.lock();
+        e.start();
+    }
+
+    // Startup succeeded — save working config and clear crash counter
+    crash_detector.save_working_config(&config.read());
+    crash_detector.clear();
+
+    let command_actor = UnifiedEngine::start_command_actor(Arc::clone(&engine));
+    {
+        let mut e = engine.lock();
+        e.command_actor = Some(command_actor);
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -168,7 +201,13 @@ fn main() {
             }
         }
 
-        engine.shutdown();
+        {
+            let mut e = engine.lock();
+            e.shutdown();
+        }
+
+        crash_detector.save_working_config(&config.read());
+        crash_detector.clear();
 
         api_handle.abort();
         ws_handle.abort();

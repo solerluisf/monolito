@@ -162,7 +162,11 @@ impl<T: Clone + Default> RollingWindow<T> {
         if vals.is_empty() {
             return 0.0;
         }
-        vals.iter().map(|v| Into::<f64>::into(*v)).sum::<f64>() / vals.len() as f64
+        let sum = vals.iter().map(|v| Into::<f64>::into(*v)).sum::<f64>();
+        if !sum.is_finite() {
+            return 0.0;
+        }
+        sum / vals.len() as f64
     }
 
     pub fn std_dev(&self) -> f64

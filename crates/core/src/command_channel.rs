@@ -228,7 +228,7 @@ impl CommandActor {
         );
 
         Self {
-            handle: Some(handle),
+            handle: Some(handle.expect("spawn_pinned failed")),
             running,
         }
     }

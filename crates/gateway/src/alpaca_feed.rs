@@ -135,6 +135,7 @@ pub struct AlpacaFeedConfig {
     pub subscribe_trades: bool,
     pub subscribe_quotes: bool,
     pub subscribe_bars: bool,
+    pub replay_buffer_max_bytes: usize,
 }
 
 impl AlpacaFeedConfig {
@@ -177,6 +178,7 @@ pub struct AlpacaWebSocketFeed {
     /// Buffer of recent ticks for replay on reconnect
     pub replay_buffer: parking_lot::Mutex<std::collections::VecDeque<RawTick>>,
     pub max_replay_ticks: usize,
+    current_buffer_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl AlpacaWebSocketFeed {
@@ -184,6 +186,7 @@ impl AlpacaWebSocketFeed {
         config: AlpacaFeedConfig,
         tick_tx: crossbeam_channel::Sender<RawTick>,
     ) -> Self {
+        let max_bytes = config.replay_buffer_max_bytes.max(1024);
         Self {
             config,
             tick_tx,
@@ -193,6 +196,7 @@ impl AlpacaWebSocketFeed {
             max_reconnect_attempts: 10,
             replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: 1000,
+            current_buffer_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -361,18 +365,29 @@ impl AlpacaWebSocketFeed {
     }
 
     fn buffer_tick(&self, tick: RawTick) {
+        let tick_bytes = 200;
+        let max_bytes = self.config.replay_buffer_max_bytes.max(1024);
         let mut buf = self.replay_buffer.lock();
+        let mut current_bytes = self.current_buffer_bytes.load(Ordering::Relaxed);
+
+        while current_bytes + tick_bytes > max_bytes && !buf.is_empty() {
+            buf.pop_front();
+            current_bytes = current_bytes.saturating_sub(tick_bytes);
+        }
         if buf.len() >= self.max_replay_ticks {
             buf.pop_front();
+            current_bytes = current_bytes.saturating_sub(tick_bytes);
         }
         buf.push_back(tick);
+        self.current_buffer_bytes.store(current_bytes + tick_bytes, Ordering::Relaxed);
     }
 
     fn replay_ticks(&self) {
         let ticks: Vec<RawTick> = {
-        let mut buf = self.replay_buffer.lock();
+            let mut buf = self.replay_buffer.lock();
             buf.drain(..).collect()
         };
+        self.current_buffer_bytes.store(0, Ordering::Relaxed);
         if !ticks.is_empty() {
             tracing::info!("Replaying {} buffered ticks post-reconnect", ticks.len());
             for tick in ticks {
@@ -443,6 +458,7 @@ impl AlpacaWebSocketFeed {
             max_reconnect_attempts: self.max_reconnect_attempts,
             replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: self.max_replay_ticks,
+            current_buffer_bytes: std::sync::atomic::AtomicUsize::new(0),
         };
 
         tokio::spawn(async move {
@@ -518,6 +534,7 @@ mod tests {
             subscribe_trades: true,
             subscribe_quotes: false,
             subscribe_bars: false,
+            replay_buffer_max_bytes: 10 * 1024 * 1024,
         };
 
         let channels = config.channels();
@@ -536,6 +553,7 @@ mod tests {
             subscribe_trades: true,
             subscribe_quotes: true,
             subscribe_bars: true,
+            replay_buffer_max_bytes: 10 * 1024 * 1024,
         };
 
         let channels = config.channels();
@@ -555,6 +573,7 @@ mod tests {
             subscribe_trades: false,
             subscribe_quotes: false,
             subscribe_bars: false,
+            replay_buffer_max_bytes: 10 * 1024 * 1024,
         };
         assert!(config.ws_url().contains("alpaca.markets"));
     }

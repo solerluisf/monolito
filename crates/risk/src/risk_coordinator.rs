@@ -92,7 +92,7 @@ impl RiskCoordinator {
             move || {
                 self.run_loop();
             },
-        )
+        ).expect("spawn_pinned failed")
     }
 
     pub fn stop(&self) {

@@ -16,23 +16,52 @@ pub enum ThreadPriority {
     TimeCritical,
 }
 
-pub fn pin_to_core(core_id: usize) -> Result<(), String> {
+#[derive(Debug)]
+pub struct PinError {
+    pub message: String,
+}
+
+impl std::fmt::Display for PinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PinError {}
+
+pub fn pin_to_core(core_id: usize) -> Result<(), PinError> {
     #[cfg(windows)]
     {
         let current_thread = unsafe { windows::Win32::System::Threading::GetCurrentThread() };
         let mask = 1usize << core_id;
         let result = unsafe { SetThreadAffinityMask(current_thread, mask) };
         if result == 0 {
-            return Err(format!("Failed to pin thread to core {}", core_id));
+            return Err(PinError {
+                message: format!("Failed to pin thread to core {}", core_id),
+            });
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        let thread_id = unsafe { libc::pthread_self() };
+        let mask = 1u64 << core_id;
+        let result = unsafe {
+            libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<u64>(), &mask)
+        };
+        if result != 0 {
+            return Err(PinError {
+                message: format!("Failed to pin thread to core {} (errno: {})", core_id, result),
+            });
         }
         Ok(())
     }
     #[cfg(not(windows))]
+    #[cfg(not(unix))]
     {
-        // On Linux, core pinning would use libc::sched_setaffinity or the core_affinity crate.
-        // For this Windows 11 target, this path is dead code at compile time.
-        let _ = core_id;
-        Err("Core pinning not implemented for this platform".to_string())
+        Err(PinError {
+            message: "Core pinning not implemented for this platform".to_string(),
+        })
     }
 }
 
@@ -50,10 +79,15 @@ pub fn set_thread_priority(priority: ThreadPriority) {
             let _ = SetThreadPriority(current_thread, win_priority);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        // On Linux, use nice() or sched_setscheduler
-        let _ = priority;
+        let nice_value: i32 = match priority {
+            ThreadPriority::BelowNormal => 2,
+            ThreadPriority::Normal => 0,
+            ThreadPriority::High => -2,
+            ThreadPriority::TimeCritical => -10,
+        };
+        let _ = unsafe { libc::nice(nice_value) };
     }
 }
 
@@ -62,20 +96,22 @@ pub fn spawn_pinned<F, T>(
     core_id: usize,
     priority: ThreadPriority,
     f: F,
-) -> thread::JoinHandle<T>
+) -> Result<thread::JoinHandle<T>, PinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     let thread_name = name.to_string();
-    thread::Builder::new()
-        .name(thread_name)
+    let builder = thread::Builder::new().name(thread_name);
+    Ok(builder
         .spawn(move || {
-            let _ = pin_to_core(core_id);
+            if let Err(e) = pin_to_core(core_id) {
+                tracing::warn!("Failed to pin thread to core {}: {}", core_id, e);
+            }
             set_thread_priority(priority);
             f()
         })
-        .expect("Failed to spawn thread")
+        .expect("spawn_pinned failed"))
 }
 
 #[cfg(test)]
@@ -92,8 +128,15 @@ mod tests {
                 42
             },
         );
-        let result = handle.join().unwrap();
+        assert!(handle.is_ok());
+        let result = handle.unwrap().join().unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_pin_to_core() {
+        let result = pin_to_core(0);
+        assert!(result.is_ok());
     }
 
     #[test]

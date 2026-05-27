@@ -235,6 +235,8 @@ impl AssetProcessor {
     pub tick_reactor_tx: Option<crossbeam_channel::Sender<crate::tick_reactor::ReactorCommand>>,
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     pub command_actor: Option<CommandActor>,
+    pub lifecycle_tx: Option<crossbeam_channel::Sender<execution::OrderLifecycleEvent>>,
+    pub execution_port: Option<Arc<dyn IExecutionPort>>,
     next_asset_core: usize,
 }
 
@@ -266,6 +268,8 @@ impl UnifiedEngine {
             tick_reactor_tx: None,
             thread_handles: Vec::new(),
             command_actor: None,
+            lifecycle_tx: None,
+            execution_port: None,
             next_asset_core: 1,
         }
     }
@@ -273,14 +277,30 @@ impl UnifiedEngine {
     pub fn start(&mut self) {
         tracing::info!("Unified Trading Engine starting...");
 
-        let config = self.config.read();
-        let threading_config = config.threading_config.clone();
+        let (safe_mode, threading_config, journal_dir, flush_interval_ms, symbols, alpaca_core_id, journal_retention_hours, journal_max_size_mb) = {
+            let config = self.config.read();
+            let safe_mode = config.safe_mode;
+            let threading_config = config.threading_config.clone();
+            let journal_dir = config.journal_config.journal_dir.clone();
+            let flush_interval_ms = config.journal_config.flush_interval_ms;
+            let journal_retention_hours = config.journal_config.retention_hours;
+            let journal_max_size_mb = config.journal_config.max_size_mb;
+            let symbols: Vec<String> = config.asset_configs
+                .iter()
+                .filter(|c| c.enabled)
+                .map(|c| c.symbol.clone())
+                .collect();
+            let alpaca_core_id = config.threading_config.alpaca_feed_core_id;
+            (safe_mode, threading_config, journal_dir, flush_interval_ms, symbols, alpaca_core_id, journal_retention_hours, journal_max_size_mb)
+        };
         
         let journal = JournalWriter::new(
-            &config.journal_config.journal_dir,
-            config.journal_config.flush_interval_ms,
+            &journal_dir,
+            flush_interval_ms,
             Arc::clone(&self.metrics),
             threading_config.journal_core_id,
+            journal_retention_hours,
+            journal_max_size_mb,
         );
         self.journal_tx = Some(journal.tx.clone());
         self.journal = Some(journal);
@@ -295,20 +315,14 @@ impl UnifiedEngine {
         self.heartbeats = Some(heartbeat_monitor.heartbeats());
         self.heartbeat_monitor = Some(heartbeat_monitor);
 
-        let symbols: Vec<String> = config.asset_configs
-            .iter()
-            .filter(|c| c.enabled)
-            .map(|c| c.symbol.clone())
-            .collect();
-        
-        let alpaca_core_id = threading_config.alpaca_feed_core_id;
-        drop(config);
+        if safe_mode {
+            tracing::error!("SAFE MODE ACTIVE — asset processors and feed will not start. API and health endpoints are available.");
+        } else {
+            let feed_rx = self.start_alpaca_feed(&symbols, alpaca_core_id);
+            self.start_assets(feed_rx);
+        }
 
-        let feed_rx = self.start_alpaca_feed(&symbols, alpaca_core_id);
-
-        self.start_assets(feed_rx);
         self.start_config_watcher();
-        self.command_actor = Some(self.start_command_actor());
 
         tracing::info!("Unified Trading Engine running");
     }
@@ -335,6 +349,7 @@ impl UnifiedEngine {
             subscribe_trades: true,
             subscribe_quotes: true,
             subscribe_bars: false,
+            replay_buffer_max_bytes: 10 * 1024 * 1024,
         };
 
         let feed = AlpacaWebSocketFeed::new(feed_config, feed_tx);
@@ -366,7 +381,7 @@ impl UnifiedEngine {
                 });
             },
         );
-        self.thread_handles.push(handle);
+        self.thread_handles.push(handle.expect("spawn_pinned failed"));
 
         tracing::info!("Alpaca WebSocket feed started for {:?} on core {}", symbols, core_id);
         Some(feed_rx)
@@ -398,6 +413,10 @@ impl UnifiedEngine {
             tracing::warn!("Alpaca API credentials not configured, using mock execution port");
             Arc::new(MockExecutionPort::default())
         };
+
+        // Store shared handles for runtime subscription/unsubscription
+        self.execution_port = Some(Arc::clone(&execution_port));
+        self.lifecycle_tx = Some(lifecycle_tx.clone());
 
         // Start lifecycle handler with heartbeat
         let pm_clone = Arc::clone(&self.portfolio_manager);
@@ -443,7 +462,7 @@ impl UnifiedEngine {
                 tracing::info!("Order lifecycle handler stopped");
             },
         );
-        self.thread_handles.push(lifecycle_handle);
+        self.thread_handles.push(lifecycle_handle.expect("spawn_pinned failed"));
 
         // Pre-create execution shared states for all enabled assets
         let mut prebuilt_states: HashMap<String, ExecutionSharedState> = HashMap::new();
@@ -725,7 +744,7 @@ impl UnifiedEngine {
                 }
             },
         );
-        self.thread_handles.push(handle);
+        self.thread_handles.push(handle.expect("spawn_pinned failed"));
     }
 
     /// Spawn the complete per-asset pipeline (Normalizer → FeatureEngine → PredictionEngine
@@ -908,333 +927,390 @@ impl UnifiedEngine {
         AssetPipeline {
             symbol: symbol.to_string(),
             md_tx,
-            thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle],
+            thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle.expect("spawn_pinned failed")],
             strategy_ref: strategy_arc,
         }
     }
 
     fn start_config_watcher(&mut self) {
         let config_path = std::env::var("TRADING_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+        if !std::path::Path::new(&config_path).exists() {
+            tracing::info!("No config file at {}, skipping config watcher", config_path);
+            self.config_watcher = None;
+            return;
+        }
         let mut watcher = ConfigWatcher::new(Arc::clone(&self.config));
         if let Err(e) = watcher.start(&config_path) {
             tracing::warn!("Failed to start config watcher: {}", e);
+            self.config_watcher = None;
         } else {
             tracing::info!("Config watcher started for {}", config_path);
+            self.config_watcher = Some(watcher);
         }
-        self.config_watcher = Some(watcher);
     }
 
-    fn start_command_actor(&self) -> CommandActor {
-        let config = self.config.read();
-        let command_core_id = config.threading_config.command_core_id;
-        drop(config);
-
-        let metrics = Arc::clone(&self.metrics);
-        let metrics_for_actor = Arc::clone(&metrics);
-        let kill_switch = Arc::clone(&self.kill_switch);
-        let strategy_registry = Arc::clone(&self.strategy_registry);
-        let config_arc = Arc::clone(&self.config);
-        let execution_states = Arc::new(parking_lot::Mutex::new(self.execution_states.clone()));
-        let portfolio_manager = Arc::clone(&self.portfolio_manager);
-        let journal_tx_opt = self.journal_tx.clone();
-        let tick_reactor_tx_opt = self.tick_reactor_tx.clone();
-
-        CommandActor::new(self.command_channel.rx.clone(), move |cmd| {
-            match cmd {
-                ControlCommand::SetKillSwitch(active) => {
-                    if active {
-                        kill_switch.activate();
-                    } else {
-                        kill_switch.clear();
-                    }
-                    ControlResponse::Ok
+    pub fn handle_command(&mut self, cmd: ControlCommand) -> ControlResponse {
+        match cmd {
+            ControlCommand::SetKillSwitch(active) => {
+                if active {
+                    self.kill_switch.activate();
+                } else {
+                    self.kill_switch.clear();
                 }
-                ControlCommand::GetStatus => {
-                    let snap = metrics.snapshot();
-                    ControlResponse::Status(format!("{:?}", snap))
-                }
-                ControlCommand::Shutdown => {
-                    kill_switch.activate();
-                    ControlResponse::Ok
-                }
-                ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
-                    let registry = strategy_registry.lock();
-                    if let Some(strategy_ref) = registry.get(&symbol) {
-                        let old_name = strategy_ref.load().name().to_string();
+                ControlResponse::Ok
+            }
+            ControlCommand::GetStatus => {
+                let snap = self.metrics.snapshot();
+                ControlResponse::Status(format!("{:?}", snap))
+            }
+            ControlCommand::Shutdown => {
+                self.kill_switch.activate();
+                ControlResponse::Ok
+            }
+            ControlCommand::SwapStrategy { symbol, strategy_type, params } => {
+                let registry = self.strategy_registry.lock();
+                if let Some(strategy_ref) = registry.get(&symbol) {
+                    let old_name = strategy_ref.load().name().to_string();
 
-                        let cfg = config_arc.read();
-                        let model_cfg = cfg.model_config.clone();
-                        let feature_cfg = cfg.feature_config.clone();
-                        drop(cfg);
+                    let cfg = self.config.read();
+                    let model_cfg = cfg.model_config.clone();
+                    let feature_cfg = cfg.feature_config.clone();
+                    drop(cfg);
 
-                        let (
-                            long_entry, short_entry, confidence, deadband,
+                    let (
+                        long_entry, short_entry, confidence, deadband,
+                        entry_cooldown, exit_cooldown, staleness, allow_short,
+                        trade_intent_ttl_ns, max_long_units, max_short_units,
+                        urgency_aggressive_threshold, urgency_normal_threshold,
+                    ) = match params {
+                        Some(p) => (
+                            p.long_entry_threshold,
+                            p.short_entry_threshold,
+                            p.confidence_minimum,
+                            p.hysteresis_deadband,
+                            p.entry_cooldown_ms,
+                            p.exit_cooldown_ms,
+                            p.prediction_staleness_ns,
+                            p.allow_short,
+                            p.trade_intent_ttl_ns,
+                            p.max_long_units,
+                            p.max_short_units,
+                            p.urgency_aggressive_threshold as f64,
+                            p.urgency_normal_threshold as f64,
+                        ),
+                        None => match strategy_type.as_str() {
+                            "hysteresis" => (0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true, 30_000_000_000, 100.0, 100.0, 0.85, 0.5),
+                            "conservative" => (0.8, -0.8, 0.6, 0.2, 10000, 5000, 200_000_000, false, 60_000_000_000, 50.0, 50.0, 0.9, 0.6),
+                            "aggressive" => (0.4, -0.4, 0.3, 0.1, 2000, 1000, 100_000_000, true, 15_000_000_000, 200.0, 200.0, 0.75, 0.4),
+                            _ => {
+                                return ControlResponse::Error(format!("Unknown strategy type: {}", strategy_type));
+                            }
+                        }
+                    };
+
+                    let new_strategy: Box<dyn strategy::Strategy> = Box::new(
+                        StrategyEngine::new(
+                            &symbol, long_entry, short_entry, confidence, deadband,
                             entry_cooldown, exit_cooldown, staleness, allow_short,
                             trade_intent_ttl_ns, max_long_units, max_short_units,
                             urgency_aggressive_threshold, urgency_normal_threshold,
-                        ) = match params {
-                            Some(p) => (
-                                p.long_entry_threshold,
-                                p.short_entry_threshold,
-                                p.confidence_minimum,
-                                p.hysteresis_deadband,
-                                p.entry_cooldown_ms,
-                                p.exit_cooldown_ms,
-                                p.prediction_staleness_ns,
-                                p.allow_short,
-                                p.trade_intent_ttl_ns,
-                                p.max_long_units,
-                                p.max_short_units,
-                                p.urgency_aggressive_threshold as f64,
-                                p.urgency_normal_threshold as f64,
-                            ),
-                            None => match strategy_type.as_str() {
-                                "hysteresis" => (0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true, 30_000_000_000, 100.0, 100.0, 0.85, 0.5),
-                                "conservative" => (0.8, -0.8, 0.6, 0.2, 10000, 5000, 200_000_000, false, 60_000_000_000, 50.0, 50.0, 0.9, 0.6),
-                                "aggressive" => (0.4, -0.4, 0.3, 0.1, 2000, 1000, 100_000_000, true, 15_000_000_000, 200.0, 200.0, 0.75, 0.4),
-                                _ => {
-                                    return ControlResponse::Error(format!("Unknown strategy type: {}", strategy_type));
-                                }
-                            }
-                        };
-
-                        let new_strategy: Box<dyn strategy::Strategy> = Box::new(
-                            StrategyEngine::new(
-                                &symbol, long_entry, short_entry, confidence, deadband,
-                                entry_cooldown, exit_cooldown, staleness, allow_short,
-                                trade_intent_ttl_ns, max_long_units, max_short_units,
-                                urgency_aggressive_threshold, urgency_normal_threshold,
-                                model_cfg.action_score_rsi_weight,
-                                model_cfg.action_score_macd_weight,
-                                model_cfg.action_score_volatility_weight,
-                                model_cfg.atr_penalty_threshold,
-                                model_cfg.atr_penalty_value,
-                                model_cfg.rsi_overbought,
-                                model_cfg.rsi_oversold,
-                                model_cfg.rsi_neutral,
-                                model_cfg.confidence_rsi_weight,
-                                model_cfg.confidence_macd_weight,
-                                model_cfg.confidence_regime_weight,
-                                feature_cfg.volume_ratio_clamp,
-                            )
-                        );
-                        strategy_ref.store(Arc::new(new_strategy));
-                        tracing::info!(symbol = %symbol, from = %old_name, to = %strategy_type, "Strategy swapped");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error(format!("Symbol not found: {}", symbol))
-                    }
-                }
-                ControlCommand::PauseAsset(sym) => {
-                    let mut cfg = config_arc.write();
-                    if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == sym) {
-                        asset.enabled = false;
-                        tracing::info!(symbol = %sym, "Asset paused");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error(format!("Symbol not found: {}", sym))
-                    }
-                }
-                ControlCommand::ResumeAsset(sym) => {
-                    let mut cfg = config_arc.write();
-                    if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == sym) {
-                        asset.enabled = true;
-                        tracing::info!(symbol = %sym, "Asset resumed");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error(format!("Symbol not found: {}", sym))
-                    }
-                }
-                ControlCommand::SetMode(mode) => {
-                    let mut cfg = config_arc.write();
-                    cfg.broker_config.paper_trading = mode == "paper";
-                    tracing::info!(mode = %mode, "Trading mode updated");
+                            model_cfg.action_score_rsi_weight,
+                            model_cfg.action_score_macd_weight,
+                            model_cfg.action_score_volatility_weight,
+                            model_cfg.atr_penalty_threshold,
+                            model_cfg.atr_penalty_value,
+                            model_cfg.rsi_overbought,
+                            model_cfg.rsi_oversold,
+                            model_cfg.rsi_neutral,
+                            model_cfg.confidence_rsi_weight,
+                            model_cfg.confidence_macd_weight,
+                            model_cfg.confidence_regime_weight,
+                            feature_cfg.volume_ratio_clamp,
+                        )
+                    );
+                    strategy_ref.store(Arc::new(new_strategy));
+                    tracing::info!(symbol = %symbol, from = %old_name, to = %strategy_type, "Strategy swapped");
                     ControlResponse::Ok
-                }
-                ControlCommand::SetRiskParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.risk_config.max_portfolio_exposure = update.max_portfolio_exposure;
-                    cfg.risk_config.max_leverage = update.max_leverage;
-                    cfg.risk_config.max_drawdown_pct = update.max_drawdown_pct;
-                    cfg.risk_config.max_order_rate_per_sec = update.max_order_rate_per_sec;
-                    cfg.risk_config.max_position_per_symbol = update.max_position_per_symbol;
-                    cfg.risk_config.max_volatility = update.max_volatility;
-                    cfg.risk_config.max_spread_bps = update.max_spread_bps;
-                    cfg.risk_config.max_slippage_bps = update.max_slippage_bps;
-                    cfg.risk_config.allow_short = update.allow_short;
-                    cfg.risk_config.kill_switch_on_drawdown = update.kill_switch_on_drawdown;
-                    tracing::info!("Risk parameters updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetBrokerParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.broker_config.broker_type = update.broker_type;
-                    cfg.broker_config.paper_trading = update.paper_trading;
-                    cfg.broker_config.ws_url = update.ws_url;
-                    cfg.broker_config.rest_url = update.rest_url;
-                    cfg.broker_config.max_retries = update.max_retries;
-                    cfg.broker_config.retry_backoff_ms = update.retry_backoff_ms;
-                    tracing::info!("Broker parameters updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetFeatureParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.feature_config.rsi_period = update.rsi_period;
-                    cfg.feature_config.macd_fast = update.macd_fast;
-                    cfg.feature_config.macd_slow = update.macd_slow;
-                    cfg.feature_config.macd_signal = update.macd_signal;
-                    cfg.feature_config.atr_period = update.atr_period;
-                    cfg.feature_config.ema_periods = update.ema_periods;
-                    cfg.feature_config.rolling_window_sizes = update.rolling_window_sizes;
-                    tracing::info!("Feature parameters updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetModelParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.model_config.model_dir = update.model_dir;
-                    cfg.model_config.inference_threads = update.inference_threads;
-                    cfg.model_config.max_inference_latency_ms = update.max_inference_latency_ms;
-                    cfg.model_config.feature_vector_size = update.feature_vector_size;
-                    tracing::info!("Model parameters updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetJournalParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.journal_config.journal_dir = update.journal_dir;
-                    cfg.journal_config.flush_interval_ms = update.flush_interval_ms;
-                    cfg.journal_config.snapshot_interval_sec = update.snapshot_interval_sec;
-                    cfg.journal_config.max_file_size_mb = update.max_file_size_mb;
-                    tracing::info!("Journal parameters updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetAssetConfig { symbol, config: asset_update } => {
-                    let mut cfg = config_arc.write();
-                    if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == symbol) {
-                        asset.enabled = asset_update.enabled;
-                        asset.max_position = asset_update.max_position;
-                        asset.tick_size = asset_update.tick_size;
-                        tracing::info!(symbol = %symbol, "Asset config updated via API");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error(format!("Symbol not found: {}", symbol))
-                    }
-                }
-                ControlCommand::SetExecutionDefaults(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.execution_defaults.default_order_quantity = update.default_order_quantity;
-                    cfg.execution_defaults.execution_per_symbol_rate_divisor = update.execution_per_symbol_rate_divisor;
-                    tracing::info!("Execution defaults updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetCircuitBreakerParams(update) => {
-                    let states = execution_states.lock();
-                    for (_, exec_state) in states.iter() {
-                        exec_state.circuit_breaker.set_failure_threshold(update.failure_threshold);
-                        exec_state.circuit_breaker.set_cooldown_ms(update.cooldown_ms);
-                    }
-                    let mut cfg = config_arc.write();
-                    cfg.circuit_breaker_config.failure_threshold = update.failure_threshold;
-                    cfg.circuit_breaker_config.cooldown_ms = update.cooldown_ms;
-                    tracing::info!("Circuit breaker config updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetRateLimits(update) => {
-                    let states = execution_states.lock();
-                    for (_, exec_state) in states.iter() {
-                        let mut rl = exec_state.rate_limiter.lock();
-                        rl.set_global_rate(update.global_rate);
-                        rl.set_default_per_symbol_rate(update.per_symbol_rate);
-                    }
-                    tracing::info!("Rate limits updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetChannelParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.channel_config.per_asset_tick_channel_capacity = update.per_asset_tick_channel_capacity;
-                    cfg.channel_config.feature_channel_capacity = update.feature_channel_capacity;
-                    cfg.channel_config.risk_channel_capacity = update.risk_channel_capacity;
-                    cfg.channel_config.decision_channel_capacity = update.decision_channel_capacity;
-                    cfg.channel_config.lifecycle_channel_capacity = update.lifecycle_channel_capacity;
-                    cfg.channel_config.command_channel_capacity = update.command_channel_capacity;
-                    cfg.channel_config.journal_channel_capacity = update.journal_channel_capacity;
-                    tracing::info!("Channel config updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetReactorParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.reactor_config.max_batch_size = update.max_batch_size;
-                    cfg.reactor_config.control_batch_size = update.control_batch_size;
-                    cfg.reactor_config.sleep_on_empty_us = update.sleep_on_empty_us;
-                    cfg.reactor_config.backpressure_log_interval = update.backpressure_log_interval;
-                    tracing::info!("Reactor config updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SetValidatorParams(update) => {
-                    let mut cfg = config_arc.write();
-                    cfg.validator_config.max_symbol_length = update.max_symbol_length;
-                    cfg.validator_config.max_quantity = update.max_quantity;
-                    cfg.validator_config.max_order_id_length = update.max_order_id_length;
-                    tracing::info!("Validator config updated via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::CircuitBreakerTrip => {
-                    let states = execution_states.lock();
-                    for (_, exec_state) in states.iter() {
-                        exec_state.circuit_breaker.trip();
-                    }
-                    ControlResponse::Ok
-                }
-                ControlCommand::CircuitBreakerReset => {
-                    let states = execution_states.lock();
-                    for (_, exec_state) in states.iter() {
-                        exec_state.circuit_breaker.reset();
-                    }
-                    ControlResponse::Ok
-                }
-                ControlCommand::ReloadConfig => {
-                    tracing::info!("Config reload requested via API (filesystem watcher handles live reload)");
-                    ControlResponse::Ok
-                }
-                ControlCommand::FlushJournal => {
-                    if let Some(ref tx) = journal_tx_opt {
-                        let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
-                        if let Err(_) = tx.send(unified_trading_core::JournalCommand::Flush { ack: ack_tx }) {
-                            tracing::warn!("Journal channel closed");
-                        } else if let Err(_) = ack_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                            tracing::warn!("Journal flush timeout");
-                        }
-                    }
-                    ControlResponse::Ok
-                }
-                ControlCommand::ModelSwap(model_id) => {
-                    tracing::info!(model_id = %model_id, "Model swap requested via API (not yet implemented)");
-                    ControlResponse::Ok
-                }
-                ControlCommand::UpdateConfig(path) => {
-                    tracing::info!(path = %path, "UpdateConfig requested via API");
-                    ControlResponse::Ok
-                }
-                ControlCommand::SubscribeFeed { symbol } => {
-                    if let Some(ref reactor_tx) = tick_reactor_tx_opt {
-                        let (md_tx, md_rx) = bounded::<RawTick>(config_arc.read().channel_config.per_asset_tick_channel_capacity);
-                        let _ = reactor_tx.send(ReactorCommand::Subscribe { symbol: symbol.clone(), tx: md_tx });
-                        tracing::info!(symbol = %symbol, "Subscribe feed sent to tick reactor");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error("Tick reactor not running".to_string())
-                    }
-                }
-                ControlCommand::UnsubscribeFeed { symbol } => {
-                    if let Some(ref reactor_tx) = tick_reactor_tx_opt {
-                        let _ = reactor_tx.send(ReactorCommand::Unsubscribe { symbol: symbol.clone() });
-                        tracing::info!(symbol = %symbol, "Unsubscribe feed sent to tick reactor");
-                        ControlResponse::Ok
-                    } else {
-                        ControlResponse::Error("Tick reactor not running".to_string())
-                    }
+                } else {
+                    ControlResponse::Error(format!("Symbol not found: {}", symbol))
                 }
             }
-        }, command_core_id, Some(metrics_for_actor))
+            ControlCommand::PauseAsset(sym) => {
+                let mut cfg = self.config.write();
+                if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == sym) {
+                    asset.enabled = false;
+                    tracing::info!(symbol = %sym, "Asset paused");
+                    ControlResponse::Ok
+                } else {
+                    ControlResponse::Error(format!("Symbol not found: {}", sym))
+                }
+            }
+            ControlCommand::ResumeAsset(sym) => {
+                let mut cfg = self.config.write();
+                if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == sym) {
+                    asset.enabled = true;
+                    tracing::info!(symbol = %sym, "Asset resumed");
+                    ControlResponse::Ok
+                } else {
+                    ControlResponse::Error(format!("Symbol not found: {}", sym))
+                }
+            }
+            ControlCommand::SetMode(mode) => {
+                let mut cfg = self.config.write();
+                cfg.broker_config.paper_trading = mode == "paper";
+                tracing::info!(mode = %mode, "Trading mode updated");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetRiskParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.risk_config.max_portfolio_exposure = update.max_portfolio_exposure;
+                cfg.risk_config.max_leverage = update.max_leverage;
+                cfg.risk_config.max_drawdown_pct = update.max_drawdown_pct;
+                cfg.risk_config.max_order_rate_per_sec = update.max_order_rate_per_sec;
+                cfg.risk_config.max_position_per_symbol = update.max_position_per_symbol;
+                cfg.risk_config.max_volatility = update.max_volatility;
+                cfg.risk_config.max_spread_bps = update.max_spread_bps;
+                cfg.risk_config.max_slippage_bps = update.max_slippage_bps;
+                cfg.risk_config.allow_short = update.allow_short;
+                cfg.risk_config.kill_switch_on_drawdown = update.kill_switch_on_drawdown;
+                tracing::info!("Risk parameters updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetBrokerParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.broker_config.broker_type = update.broker_type;
+                cfg.broker_config.paper_trading = update.paper_trading;
+                cfg.broker_config.ws_url = update.ws_url;
+                cfg.broker_config.rest_url = update.rest_url;
+                cfg.broker_config.max_retries = update.max_retries;
+                cfg.broker_config.retry_backoff_ms = update.retry_backoff_ms;
+                tracing::info!("Broker parameters updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetFeatureParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.feature_config.rsi_period = update.rsi_period;
+                cfg.feature_config.macd_fast = update.macd_fast;
+                cfg.feature_config.macd_slow = update.macd_slow;
+                cfg.feature_config.macd_signal = update.macd_signal;
+                cfg.feature_config.atr_period = update.atr_period;
+                cfg.feature_config.ema_periods = update.ema_periods;
+                cfg.feature_config.rolling_window_sizes = update.rolling_window_sizes;
+                tracing::info!("Feature parameters updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetModelParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.model_config.model_dir = update.model_dir;
+                cfg.model_config.inference_threads = update.inference_threads;
+                cfg.model_config.max_inference_latency_ms = update.max_inference_latency_ms;
+                cfg.model_config.feature_vector_size = update.feature_vector_size;
+                tracing::info!("Model parameters updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetJournalParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.journal_config.journal_dir = update.journal_dir;
+                cfg.journal_config.flush_interval_ms = update.flush_interval_ms;
+                cfg.journal_config.snapshot_interval_sec = update.snapshot_interval_sec;
+                cfg.journal_config.max_file_size_mb = update.max_file_size_mb;
+                tracing::info!("Journal parameters updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetAssetConfig { symbol, config: asset_update } => {
+                let mut cfg = self.config.write();
+                if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == symbol) {
+                    asset.enabled = asset_update.enabled;
+                    asset.max_position = asset_update.max_position;
+                    asset.tick_size = asset_update.tick_size;
+                    tracing::info!(symbol = %symbol, "Asset config updated via API");
+                    ControlResponse::Ok
+                } else {
+                    ControlResponse::Error(format!("Symbol not found: {}", symbol))
+                }
+            }
+            ControlCommand::SetExecutionDefaults(update) => {
+                let mut cfg = self.config.write();
+                cfg.execution_defaults.default_order_quantity = update.default_order_quantity;
+                cfg.execution_defaults.execution_per_symbol_rate_divisor = update.execution_per_symbol_rate_divisor;
+                tracing::info!("Execution defaults updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetCircuitBreakerParams(update) => {
+                for (_, exec_state) in self.execution_states.iter() {
+                    exec_state.circuit_breaker.set_failure_threshold(update.failure_threshold);
+                    exec_state.circuit_breaker.set_cooldown_ms(update.cooldown_ms);
+                }
+                let mut cfg = self.config.write();
+                cfg.circuit_breaker_config.failure_threshold = update.failure_threshold;
+                cfg.circuit_breaker_config.cooldown_ms = update.cooldown_ms;
+                tracing::info!("Circuit breaker config updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetRateLimits(update) => {
+                for (_, exec_state) in self.execution_states.iter() {
+                    let mut rl = exec_state.rate_limiter.lock();
+                    rl.set_global_rate(update.global_rate);
+                    rl.set_default_per_symbol_rate(update.per_symbol_rate);
+                }
+                tracing::info!("Rate limits updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetChannelParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.channel_config.per_asset_tick_channel_capacity = update.per_asset_tick_channel_capacity;
+                cfg.channel_config.feature_channel_capacity = update.feature_channel_capacity;
+                cfg.channel_config.risk_channel_capacity = update.risk_channel_capacity;
+                cfg.channel_config.decision_channel_capacity = update.decision_channel_capacity;
+                cfg.channel_config.lifecycle_channel_capacity = update.lifecycle_channel_capacity;
+                cfg.channel_config.command_channel_capacity = update.command_channel_capacity;
+                cfg.channel_config.journal_channel_capacity = update.journal_channel_capacity;
+                tracing::info!("Channel config updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetReactorParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.reactor_config.max_batch_size = update.max_batch_size;
+                cfg.reactor_config.control_batch_size = update.control_batch_size;
+                cfg.reactor_config.sleep_on_empty_us = update.sleep_on_empty_us;
+                cfg.reactor_config.backpressure_log_interval = update.backpressure_log_interval;
+                tracing::info!("Reactor config updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SetValidatorParams(update) => {
+                let mut cfg = self.config.write();
+                cfg.validator_config.max_symbol_length = update.max_symbol_length;
+                cfg.validator_config.max_quantity = update.max_quantity;
+                cfg.validator_config.max_order_id_length = update.max_order_id_length;
+                tracing::info!("Validator config updated via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::CircuitBreakerTrip => {
+                for (_, exec_state) in self.execution_states.iter() {
+                    exec_state.circuit_breaker.trip();
+                }
+                ControlResponse::Ok
+            }
+            ControlCommand::CircuitBreakerReset => {
+                for (_, exec_state) in self.execution_states.iter() {
+                    exec_state.circuit_breaker.reset();
+                }
+                ControlResponse::Ok
+            }
+            ControlCommand::ReloadConfig => {
+                tracing::info!("Config reload requested via API (filesystem watcher handles live reload)");
+                ControlResponse::Ok
+            }
+            ControlCommand::FlushJournal => {
+                if let Some(ref tx) = self.journal_tx {
+                    let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+                    if let Err(_) = tx.send(unified_trading_core::JournalCommand::Flush { ack: ack_tx }) {
+                        tracing::warn!("Journal channel closed");
+                    } else if let Err(_) = ack_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        tracing::warn!("Journal flush timeout");
+                    }
+                }
+                ControlResponse::Ok
+            }
+            ControlCommand::ModelSwap(model_id) => {
+                tracing::info!(model_id = %model_id, "Model swap requested via API (not yet implemented)");
+                ControlResponse::Ok
+            }
+            ControlCommand::UpdateConfig(path) => {
+                tracing::info!(path = %path, "UpdateConfig requested via API");
+                ControlResponse::Ok
+            }
+            ControlCommand::SubscribeFeed { symbol } => {
+                if self.asset_pipelines.contains_key(&symbol) {
+                    return ControlResponse::Error(format!("Symbol {} already subscribed", symbol));
+                }
+
+                let reactor_tx = match &self.tick_reactor_tx {
+                    Some(tx) => tx.clone(),
+                    None => return ControlResponse::Error("Tick reactor not running".to_string()),
+                };
+                let lifecycle_tx = match &self.lifecycle_tx {
+                    Some(tx) => tx.clone(),
+                    None => return ControlResponse::Error("Lifecycle handler not running".to_string()),
+                };
+                let execution_port = match &self.execution_port {
+                    Some(port) => Arc::clone(port),
+                    None => return ControlResponse::Error("Execution port not initialized".to_string()),
+                };
+
+                let config = self.config.read().clone();
+                let global_rate = config.risk_config.max_order_rate_per_sec as f64;
+                let per_symbol_rate = global_rate / config.execution_defaults.execution_per_symbol_rate_divisor;
+                let idempotency_path = std::path::PathBuf::from(&config.journal_config.journal_dir)
+                    .join(format!("idempotency_{}.log", symbol));
+                let exec_shared = ExecutionSharedState {
+                    order_tracker: Arc::new(parking_lot::Mutex::new(OrderTracker::new())),
+                    rate_limiter: Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate))),
+                    circuit_breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker_config.failure_threshold, config.circuit_breaker_config.cooldown_ms)),
+                    idempotency_store: Arc::new(IdempotencyStore::new_with_path(
+                        IdempotencyStore::DEFAULT_CAPACITY,
+                        &idempotency_path,
+                    )),
+                };
+
+                let asset_idx = self.asset_pipelines.len();
+                let pipeline = self.spawn_asset_pipeline(
+                    &symbol,
+                    &lifecycle_tx,
+                    &execution_port,
+                    &config,
+                    asset_idx,
+                    exec_shared,
+                );
+
+                let _ = reactor_tx.send(ReactorCommand::Subscribe { symbol: symbol.clone(), tx: pipeline.md_tx.clone() });
+                self.asset_pipelines.insert(symbol.clone(), pipeline);
+                tracing::info!(symbol = %symbol, "Asset pipeline subscribed dynamically");
+                ControlResponse::Ok
+            }
+            ControlCommand::UnsubscribeFeed { symbol } => {
+                if let Some(mut pipeline) = self.asset_pipelines.remove(&symbol) {
+                    // Drop md_tx to trigger channel disconnect cascade
+                    drop(pipeline.md_tx);
+                    // Remove execution state
+                    self.execution_states.remove(&symbol);
+                    // Join pipeline threads with timeout
+                    let timeout = std::time::Duration::from_secs(5);
+                    for handle in pipeline.thread_handles.drain(..) {
+                        if let Err(_) = Self::join_with_timeout(handle, timeout) {
+                            tracing::warn!(symbol = %symbol, "Pipeline thread failed to join during unsubscribe");
+                        }
+                    }
+                    // Unsubscribe from tick reactor
+                    if let Some(ref reactor_tx) = self.tick_reactor_tx {
+                        let _ = reactor_tx.send(ReactorCommand::Unsubscribe { symbol: symbol.clone() });
+                    }
+                    // Remove from strategy registry
+                    self.strategy_registry.lock().remove(&symbol);
+                    tracing::info!(symbol = %symbol, "Asset pipeline unsubscribed");
+                    ControlResponse::Ok
+                } else {
+                    ControlResponse::Error(format!("Symbol not found: {}", symbol))
+                }
+            }
+        }
+    }
+
+    pub fn start_command_actor(engine_arc: Arc<parking_lot::Mutex<UnifiedEngine>>) -> CommandActor {
+        let (command_core_id, rx, metrics) = {
+            let engine = engine_arc.lock();
+            let config = engine.config.read();
+            let command_core_id = config.threading_config.command_core_id;
+            drop(config);
+            let rx = engine.command_channel.rx.clone();
+            let metrics = Some(Arc::clone(&engine.metrics));
+            (command_core_id, rx, metrics)
+        };
+
+        CommandActor::new(rx, move |cmd| {
+            let mut engine = engine_arc.lock();
+            engine.handle_command(cmd)
+        }, command_core_id, metrics)
     }
 
     pub fn shutdown(&mut self) {
@@ -1296,5 +1372,66 @@ impl UnifiedEngine {
             Ok(result) => result.map_err(|_| ()),
             Err(_) => Err(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unified_trading_core::config::EngineConfig;
+    use unified_trading_core::command_channel::ControlCommand;
+    use crossbeam_channel::bounded;
+    use crate::tick_reactor::ReactorCommand;
+
+    #[test]
+    fn test_dynamic_subscribe_unsubscribe() {
+        let mut engine = UnifiedEngine::new(EngineConfig::default());
+
+        // Set up minimal shared state so handle_command can subscribe
+        let (reactor_tx, _reactor_rx) = bounded::<ReactorCommand>(100);
+        let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        engine.tick_reactor_tx = Some(reactor_tx);
+        engine.lifecycle_tx = Some(lifecycle_tx);
+        engine.execution_port = Some(Arc::new(MockExecutionPort::default()));
+
+        // Subscribe a new symbol
+        let resp = engine.handle_command(ControlCommand::SubscribeFeed { symbol: "TSLA".to_string() });
+        assert!(matches!(resp, ControlResponse::Ok), "Subscribe should succeed");
+        assert!(engine.asset_pipelines.contains_key("TSLA"), "Pipeline should exist after subscribe");
+        assert!(engine.execution_states.contains_key("TSLA"), "Execution state should exist after subscribe");
+
+        // Subscribing the same symbol again should fail
+        let resp2 = engine.handle_command(ControlCommand::SubscribeFeed { symbol: "TSLA".to_string() });
+        assert!(matches!(resp2, ControlResponse::Error(_)), "Duplicate subscribe should error");
+
+        // Unsubscribe the symbol
+        let resp3 = engine.handle_command(ControlCommand::UnsubscribeFeed { symbol: "TSLA".to_string() });
+        assert!(matches!(resp3, ControlResponse::Ok), "Unsubscribe should succeed");
+        assert!(!engine.asset_pipelines.contains_key("TSLA"), "Pipeline should be removed after unsubscribe");
+        assert!(!engine.execution_states.contains_key("TSLA"), "Execution state should be removed after unsubscribe");
+
+        // Unsubscribing a non-existent symbol should fail
+        let resp4 = engine.handle_command(ControlCommand::UnsubscribeFeed { symbol: "NONEXISTENT".to_string() });
+        assert!(matches!(resp4, ControlResponse::Error(_)), "Unsubscribe of missing symbol should error");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_safe_mode_skips_asset_spawning() {
+        let mut config = EngineConfig::default();
+        config.safe_mode = true;
+
+        let mut engine = UnifiedEngine::new(config);
+        engine.start();
+
+        // In safe mode, no asset pipelines should be created
+        assert!(engine.asset_pipelines.is_empty(), "Safe mode should not spawn asset pipelines");
+        assert!(engine.execution_states.is_empty(), "Safe mode should not create execution states");
+        assert!(engine.tick_reactor_tx.is_none(), "Safe mode should not start tick reactor");
+
+        // But command actor and config watcher can still be started
+        assert!(engine.heartbeat_monitor.is_some(), "Heartbeat monitor should still start in safe mode");
+
+        engine.shutdown();
     }
 }

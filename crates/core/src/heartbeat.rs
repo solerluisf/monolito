@@ -55,7 +55,7 @@ impl ThreadHeartbeatMonitor {
 
         Self {
             heartbeats,
-            handle: Some(handle),
+            handle: Some(handle.expect("spawn_pinned failed")),
             running,
         }
     }

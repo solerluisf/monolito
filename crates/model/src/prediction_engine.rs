@@ -131,14 +131,15 @@ impl PredictionEngine {
             running: Arc::clone(&self.running),
         };
 
+        let symbol_name = self.symbol.clone();
         spawn_pinned(
-            &format!("prediction-{}", self.symbol),
+            &format!("prediction-{}", symbol_name),
             core_id,
             ThreadPriority::BelowNormal,
             move || {
                 engine.run_loop(infer_fn);
             },
-        )
+        ).expect("spawn_pinned failed")
     }
 
     pub fn stop(&self) {

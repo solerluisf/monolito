@@ -158,7 +158,7 @@ fn test_full_pipeline_tick_to_intent() {
                 md_rx, feature_tx, risk_tx, ks, m,
             );
         },
-    );
+    ).expect("spawn_pinned failed");
 
     for i in 0..50 {
         let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
@@ -242,7 +242,7 @@ fn test_pipeline_with_burst_ticks() {
                 md_rx, feature_tx, risk_tx, ks, m,
             );
         },
-    );
+    ).expect("spawn_pinned failed");
 
     for i in 0..500 {
         let tick = make_raw_tick("MSFT", i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
@@ -326,7 +326,7 @@ fn test_kill_switch_stops_pipeline() {
                 md_rx, feature_tx, risk_tx, ks, m,
             );
         },
-    );
+    ).expect("spawn_pinned failed");
 
     for i in 0..100 {
         let tick = make_raw_tick("AAPL", i * 1_000_000, 150.0, 0.05);

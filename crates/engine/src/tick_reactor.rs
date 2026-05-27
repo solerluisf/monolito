@@ -241,7 +241,7 @@ pub fn spawn_reactor(
         move || {
             reactor.run();
         },
-    );
+    ).expect("spawn_pinned failed");
 
     (control_tx, handle)
 }
