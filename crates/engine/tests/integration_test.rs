@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crossbeam_channel::bounded;
 
+use unified_trading_core::config::BackpressurePolicy;
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::portfolio_manager::PortfolioManager;
@@ -128,6 +129,7 @@ fn test_full_pipeline_tick_to_intent() {
         Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
+        BackpressurePolicy::BlockWithTimeoutMs(10),
     );
     let _risk_handle = risk_coordinator.start(0);
 
@@ -213,6 +215,7 @@ fn test_pipeline_with_burst_ticks() {
         Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
+        BackpressurePolicy::BlockWithTimeoutMs(10),
     );
     let _risk_handle = risk_coordinator.start(0);
 
@@ -298,6 +301,7 @@ fn test_kill_switch_stops_pipeline() {
         Arc::new(PortfolioManager::new(100_000.0, 0.001)),
         Arc::clone(&kill_switch),
         Arc::clone(&metrics),
+        BackpressurePolicy::BlockWithTimeoutMs(10),
     );
     let _risk_handle = risk_coordinator.start(0);
 

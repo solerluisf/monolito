@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use unified_trading_core::kill_switch::KillSwitch;
-use unified_trading_core::config::RiskConfig;
+use unified_trading_core::config::{BackpressurePolicy, RiskConfig};
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 use unified_trading_core::portfolio_manager::PortfolioManager;
+use unified_trading_core::channel_utils::{send_with_policy, PolicySendError};
 
 use crate::risk_checks::{RiskCheckRequest, RiskDecision, RiskEngine};
 
@@ -16,6 +17,7 @@ pub struct RiskCoordinator {
     pub engine: RiskEngine,
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
+    pub decision_backpressure_policy: BackpressurePolicy,
     running: Arc<AtomicBool>,
 }
 
@@ -27,6 +29,7 @@ impl RiskCoordinator {
         portfolio: Arc<PortfolioManager>,
         kill_switch: Arc<KillSwitch>,
         metrics: Arc<GlobalMetrics>,
+        decision_backpressure_policy: BackpressurePolicy,
     ) -> Self {
         let severity_overrides = config.severity_overrides.clone();
         let mut engine = RiskEngine::new(config, portfolio);
@@ -37,6 +40,7 @@ impl RiskCoordinator {
             engine,
             kill_switch,
             metrics,
+            decision_backpressure_policy,
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -58,10 +62,19 @@ impl RiskCoordinator {
                         self.metrics.increment_per_symbol_intent_rejected("UNK");
                     }
 
-                    if self.decision_tx.send(decision).is_err() {
-                        break;
+                    match send_with_policy(
+                        &self.decision_tx,
+                        None,
+                        decision,
+                        &self.decision_backpressure_policy,
+                        &self.metrics,
+                    ) {
+                        Ok(()) => {
+                            self.metrics.decision_channel_depth.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(PolicySendError::Disconnected(_)) => break,
+                        Err(PolicySendError::Dropped(_)) | Err(PolicySendError::Timeout(_)) => {}
                     }
-                    self.metrics.decision_channel_depth.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = check_start.elapsed().as_nanos() as u64;
                     self.metrics.risk_check_latency.record(elapsed_ns);
                     let decision_latency_ns = std::time::SystemTime::now()
@@ -80,7 +93,13 @@ impl RiskCoordinator {
         while let Ok(request) = self.request_rx.try_recv() {
             self.metrics.risk_channel_depth.fetch_sub(1, Ordering::Relaxed);
             let decision = self.engine.check(&request, true); // reject under shutdown
-            let _ = self.decision_tx.try_send(decision);
+            let _ = send_with_policy(
+                &self.decision_tx,
+                None,
+                decision,
+                &self.decision_backpressure_policy,
+                &self.metrics,
+            );
         }
     }
 
@@ -139,6 +158,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             Arc::clone(&kill_switch),
             Arc::clone(&metrics),
+            BackpressurePolicy::BlockWithTimeoutMs(10),
         );
 
         req_tx.send(make_request(SymbolId::from_raw(0))).unwrap();
@@ -165,6 +185,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::new(PortfolioManager::new(100_000.0, 0.001)),
             Arc::clone(&kill_switch),
             Arc::clone(&metrics),
+            BackpressurePolicy::BlockWithTimeoutMs(10),
         );
 
         req_tx.send(make_request(SymbolId::from_raw(0))).unwrap();

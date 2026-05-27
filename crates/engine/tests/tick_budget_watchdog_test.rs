@@ -11,6 +11,7 @@ use market_data::{Normalizer, RawTick};
 use model::Prediction;
 use risk::RiskCheckRequest;
 use strategy::{SignalContext, Strategy, TradeIntent};
+use unified_trading_core::config::BackpressurePolicy;
 use unified_trading_core::heartbeat::ThreadHeartbeatMonitor;
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
@@ -90,8 +91,8 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
     let latest_pred = Arc::new(ArcSwap::new(prediction));
 
     let (md_tx, md_rx) = bounded::<RawTick>(16);
-    let (feature_tx, _feature_rx) = bounded::<FeatureVector>(16);
-    let (risk_tx, _risk_rx) = bounded::<RiskCheckRequest>(16);
+    let (feature_tx, feature_rx) = bounded::<FeatureVector>(16);
+    let (risk_tx, risk_rx) = bounded::<RiskCheckRequest>(16);
 
     for i in 0..4_u64 {
         md_tx.send(make_tick(symbol_id, i * 1_000_000)).expect("tick send");
@@ -108,7 +109,11 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         latest_pred,
         signal_ctx: SignalContext::new(symbol_id),
         coordinator_tx: risk_tx,
+        coordinator_rx: risk_rx,
         feature_tx,
+        feature_rx,
+        feature_backpressure_policy: BackpressurePolicy::DropNewest,
+        risk_backpressure_policy: BackpressurePolicy::DropNewest,
         kill_switch: Arc::clone(&kill_switch),
         metrics: Arc::clone(&metrics),
         prediction_staleness_ns: 1_000_000_000,

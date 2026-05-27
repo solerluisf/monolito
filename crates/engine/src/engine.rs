@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use unified_trading_core::config::EngineConfig;
+use unified_trading_core::config::{BackpressurePolicy, EngineConfig};
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::journal::{JournalWriter, JournalEntry};
+use unified_trading_core::channel_utils::{send_with_policy, PolicySendError};
 use unified_trading_core::heartbeat::ThreadHeartbeatMonitor;
 use unified_trading_core::command_channel::{CommandChannel, CommandActor, ControlCommand, ControlResponse};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
@@ -75,12 +76,16 @@ pub struct AssetProcessor {
     pub latest_pred: PredictionRef,
     pub signal_ctx: strategy::SignalContext,
     pub coordinator_tx: Sender<RiskCheckRequest>,
+    pub coordinator_rx: Receiver<RiskCheckRequest>,
     pub feature_tx: Sender<FeatureVector>,
+    pub feature_rx: Receiver<FeatureVector>,
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
     pub prediction_staleness_ns: u64,
     pub default_order_quantity: f64,
     pub tick_processing_budget_us: u64,
+    pub feature_backpressure_policy: BackpressurePolicy,
+    pub risk_backpressure_policy: BackpressurePolicy,
     pub heartbeat: Option<unified_trading_core::heartbeat::HeartbeatHandle>,
 }
 
@@ -129,8 +134,15 @@ impl AssetProcessor {
                     self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
                 }
                 let features = self.feature_engine.compute(&normalized);
-                let _ = self.feature_tx.try_send(features.clone());
-                self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
+                if send_with_policy(
+                    &self.feature_tx,
+                    Some(&self.feature_rx),
+                    features.clone(),
+                    &self.feature_backpressure_policy,
+                    &self.metrics,
+                ).is_ok() {
+                    self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
+                }
 
                 self.signal_ctx.update_price(normalized.mid_price);
                 if normalized.mid_price > 0.0 {
@@ -158,17 +170,23 @@ impl AssetProcessor {
                 let strat = self.strategy.load_full();
                 if let Some(signal) = strat.evaluate(&prediction, &self.signal_ctx) {
                     let request = self.build_risk_request(&signal, &prediction, current_spread_bps, normalized.mid_price);
-                    match self.coordinator_tx.try_send(request) {
+                    match send_with_policy(
+                        &self.coordinator_tx,
+                        Some(&self.coordinator_rx),
+                        request,
+                        &self.risk_backpressure_policy,
+                        &self.metrics,
+                    ) {
                         Ok(()) => {
                             self.metrics.intents_generated.fetch_add(1, Ordering::Relaxed);
                             self.metrics.risk_channel_depth.fetch_add(1, Ordering::Relaxed);
                             let elapsed_ns = tick_start.elapsed().as_nanos() as u64;
                             self.metrics.tick_to_intent_latency.record(elapsed_ns);
                         }
-                        Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        Err(PolicySendError::Dropped(_)) | Err(PolicySendError::Timeout(_)) => {
                             self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        Err(PolicySendError::Disconnected(_)) => {
                             self.kill_switch.activate();
                         }
                     }
@@ -872,7 +890,7 @@ impl UnifiedEngine {
         let signal_ctx = strategy::SignalContext::new(symbol_id);
 
         // Create prediction engine first to get the ArcSwap
-        let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
+        let pred_engine = PredictionEngine::new(feature_rx.clone(), symbol_id);
         let latest_pred = Arc::clone(&pred_engine.latest_pred);
 
         let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", symbol)));
@@ -902,12 +920,16 @@ impl UnifiedEngine {
             latest_pred,
             signal_ctx,
             coordinator_tx: risk_tx,
+            coordinator_rx: risk_rx.clone(),
             feature_tx: feature_tx.clone(),
+            feature_rx: feature_rx.clone(),
             kill_switch: Arc::clone(&ks),
             metrics: Arc::clone(&metrics),
             prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
             default_order_quantity: config.execution_defaults.default_order_quantity,
             tick_processing_budget_us: config.threading_config.tick_processing_budget_us,
+            feature_backpressure_policy: config.channel_config.feature_backpressure_policy.clone(),
+            risk_backpressure_policy: config.channel_config.risk_backpressure_policy.clone(),
             heartbeat: hb_processor,
         };
 
@@ -939,6 +961,7 @@ impl UnifiedEngine {
             Arc::clone(&pm),
             Arc::clone(&ks),
             Arc::clone(&metrics),
+            config.channel_config.decision_backpressure_policy.clone(),
         );
         let risk_handle = risk_coordinator.start(risk_core_id);
 

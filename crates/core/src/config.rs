@@ -190,6 +190,14 @@ pub struct CircuitBreakerConfig {
     pub cooldown_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackpressurePolicy {
+    DropOldest,
+    DropNewest,
+    BlockWithTimeoutMs(u64),
+    PrioritizeCritical,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
     pub per_asset_tick_channel_capacity: usize,
@@ -199,6 +207,10 @@ pub struct ChannelConfig {
     pub lifecycle_channel_capacity: usize,
     pub command_channel_capacity: usize,
     pub journal_channel_capacity: usize,
+    pub per_asset_tick_backpressure_policy: BackpressurePolicy,
+    pub feature_backpressure_policy: BackpressurePolicy,
+    pub risk_backpressure_policy: BackpressurePolicy,
+    pub decision_backpressure_policy: BackpressurePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +435,10 @@ impl Default for ChannelConfig {
             lifecycle_channel_capacity: 1_000,
             command_channel_capacity: 1_000,
             journal_channel_capacity: 10_000,
+            per_asset_tick_backpressure_policy: BackpressurePolicy::DropOldest,
+            feature_backpressure_policy: BackpressurePolicy::DropNewest,
+            risk_backpressure_policy: BackpressurePolicy::DropNewest,
+            decision_backpressure_policy: BackpressurePolicy::BlockWithTimeoutMs(10),
         }
     }
 }
