@@ -36,6 +36,7 @@ impl std::error::Error for SchemaMismatchError {}
 pub struct ModelRegistry {
     models: RwLock<HashMap<String, ModelInfo>>,
     active_model: RwLock<String>,
+    shadow_model: RwLock<Option<String>>,
 }
 
 impl ModelRegistry {
@@ -43,6 +44,7 @@ impl ModelRegistry {
         Self {
             models: RwLock::new(HashMap::new()),
             active_model: RwLock::new(String::new()),
+            shadow_model: RwLock::new(None),
         }
     }
 
@@ -103,7 +105,92 @@ impl ModelRegistry {
             Ok(())
         }
     }
+
+    /// Set a shadow model by ID. The model must already be registered.
+    /// Returns None if the model exists, or the model_id back if not found.
+    pub fn set_shadow(&self, model_id: &str) -> Option<String> {
+        let models = self.models.read();
+        if !models.contains_key(model_id) {
+            return Some(model_id.to_string());
+        }
+        drop(models);
+        let mut shadow = self.shadow_model.write();
+        *shadow = Some(model_id.to_string());
+        None
+    }
+
+    /// Get the shadow model info, if one is set
+    pub fn get_shadow(&self) -> Option<ModelInfo> {
+        let shadow = self.shadow_model.read();
+        if let Some(ref id) = *shadow {
+            let models = self.models.read();
+            models.get(id).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Check if a shadow model is currently loaded
+    pub fn has_shadow(&self) -> bool {
+        self.shadow_model.read().is_some()
+    }
+
+    /// Clear the shadow model slot
+    pub fn clear_shadow(&self) {
+        let mut shadow = self.shadow_model.write();
+        *shadow = None;
+    }
+
+    /// Promote the shadow model to active. Validates schema before promoting.
+    /// Returns Err if no shadow model is set, or if schema validation fails.
+    pub fn promote_shadow(&self) -> Result<(), PromotionError> {
+        let shadow_id = {
+            let shadow = self.shadow_model.read();
+            shadow.clone()
+        };
+        let shadow_id = match shadow_id {
+            Some(id) => id,
+            None => return Err(PromotionError::NoShadowModel),
+        };
+        let model_info = {
+            let models = self.models.read();
+            models.get(&shadow_id).cloned()
+        };
+        let model_info = match model_info {
+            Some(info) => info,
+            None => return Err(PromotionError::NoShadowModel),
+        };
+        if model_info.feature_schema_version != FEATURE_SCHEMA_VERSION {
+            return Err(PromotionError::SchemaMismatch(SchemaMismatchError {
+                model_id: model_info.model_id.clone(),
+                model_schema_version: model_info.feature_schema_version,
+                engine_schema_version: FEATURE_SCHEMA_VERSION,
+            }));
+        }
+        self.set_active(&shadow_id);
+        let mut shadow = self.shadow_model.write();
+        *shadow = None;
+        tracing::info!(shadow_model_id = %shadow_id, "Shadow model promoted to active");
+        Ok(())
+    }
 }
+
+#[derive(Debug)]
+pub enum PromotionError {
+    NoShadowModel,
+    SchemaMismatch(SchemaMismatchError),
+}
+
+impl std::fmt::Display for PromotionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromotionError::NoShadowModel => write!(f, "No shadow model is set"),
+            PromotionError::SchemaMismatch(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl std::error::Error for PromotionError {}
 
 impl Default for ModelRegistry {
     fn default() -> Self {
@@ -196,6 +283,92 @@ mod tests {
         // Active model should not have changed
         let active = registry.get_active();
         assert!(active.is_none());
+    }
+
+    #[test]
+    fn test_shadow_model_set_and_get() {
+        let registry = ModelRegistry::new();
+        let info = ModelInfo {
+            model_id: "v2".to_string(),
+            version: 2,
+            input_features: vec![],
+            applicable_regimes: vec![],
+            priority: 2,
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
+        };
+        registry.register(info);
+        assert!(!registry.has_shadow());
+        let err = registry.set_shadow("v2");
+        assert!(err.is_none());
+        assert!(registry.has_shadow());
+        let shadow = registry.get_shadow().unwrap();
+        assert_eq!(shadow.model_id, "v2");
+        assert_eq!(shadow.version, 2);
+    }
+
+    #[test]
+    fn test_shadow_model_not_registered() {
+        let registry = ModelRegistry::new();
+        let err = registry.set_shadow("nonexistent");
+        assert_eq!(err, Some("nonexistent".to_string()));
+    }
+
+    #[test]
+    fn test_shadow_model_clear() {
+        let registry = ModelRegistry::new();
+        let info = ModelInfo {
+            model_id: "v2".to_string(),
+            version: 2,
+            input_features: vec![],
+            applicable_regimes: vec![],
+            priority: 2,
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
+        };
+        registry.register(info);
+        registry.set_shadow("v2");
+        assert!(registry.has_shadow());
+        registry.clear_shadow();
+        assert!(!registry.has_shadow());
+    }
+
+    #[test]
+    fn test_shadow_promotion() {
+        let registry = ModelRegistry::new();
+        let info1 = ModelInfo {
+            model_id: "v1".to_string(),
+            version: 1,
+            input_features: vec![],
+            applicable_regimes: vec![],
+            priority: 1,
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
+        };
+        registry.register(info1);
+        registry.set_active("v1");
+
+        let info2 = ModelInfo {
+            model_id: "v2".to_string(),
+            version: 2,
+            input_features: vec![],
+            applicable_regimes: vec![],
+            priority: 2,
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
+        };
+        registry.register(info2);
+        assert!(registry.set_shadow("v2").is_none());
+
+        let result = registry.promote_shadow();
+        assert!(result.is_ok());
+
+        let active = registry.get_active().unwrap();
+        assert_eq!(active.model_id, "v2");
+        assert!(!registry.has_shadow());
+    }
+
+    #[test]
+    fn test_shadow_promotion_no_shadow() {
+        let registry = ModelRegistry::new();
+        let result = registry.promote_shadow();
+        assert!(result.is_err());
     }
 
     #[test]

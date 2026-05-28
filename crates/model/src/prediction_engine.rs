@@ -1,10 +1,14 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use feature::{FeatureVector, FeatureIndex};
+use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::symbol_registry::SymbolId;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
+
+use crate::model_registry::ModelRegistry;
 
 #[derive(Debug, Clone)]
 pub struct Prediction {
@@ -90,11 +94,69 @@ impl Prediction {
     }
 }
 
+/// Configuration for shadow model evaluation and promotion.
+#[derive(Debug, Clone)]
+pub struct ShadowConfig {
+    /// Maximum allowed absolute forecast delta between active and shadow models
+    pub forecast_delta_threshold: f32,
+    /// Maximum allowed absolute confidence delta between active and shadow models
+    pub confidence_delta_threshold: f32,
+    /// Maximum allowed absolute action_score delta between active and shadow models
+    pub action_score_delta_threshold: f32,
+    /// Number of consecutive ticks where all deltas stay below thresholds before promoting
+    pub promote_after_ticks: u64,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            forecast_delta_threshold: 0.1,
+            confidence_delta_threshold: 0.1,
+            action_score_delta_threshold: 0.1,
+            promote_after_ticks: 1000,
+        }
+    }
+}
+
+/// Recorded divergence between active and shadow model predictions for a single tick.
+#[derive(Debug, Clone)]
+pub struct DivergenceMetrics {
+    pub forecast_delta: f32,
+    pub confidence_delta: f32,
+    pub action_score_delta: f32,
+}
+
+impl DivergenceMetrics {
+    pub fn compute(active: &Prediction, shadow: &Prediction) -> Self {
+        Self {
+            forecast_delta: (active.forecast - shadow.forecast).abs(),
+            confidence_delta: (active.confidence - shadow.confidence).abs(),
+            action_score_delta: (active.action_score - shadow.action_score).abs(),
+        }
+    }
+
+    /// Returns the maximum of all delta values
+    pub fn max_delta(&self) -> f32 {
+        self.forecast_delta
+            .max(self.confidence_delta)
+            .max(self.action_score_delta)
+    }
+
+    /// Returns true if all deltas are below the given thresholds
+    pub fn below_threshold(&self, config: &ShadowConfig) -> bool {
+        self.forecast_delta <= config.forecast_delta_threshold
+            && self.confidence_delta <= config.confidence_delta_threshold
+            && self.action_score_delta <= config.action_score_delta_threshold
+    }
+}
+
 pub struct PredictionEngine {
     pub feature_rx: crossbeam_channel::Receiver<FeatureVector>,
     pub latest_pred: Arc<ArcSwap<Prediction>>,
     pub symbol_id: SymbolId,
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    running: Arc<AtomicBool>,
+    /// Optional shadow model prediction output (not used for downstream decisions)
+    pub shadow_pred: Arc<ArcSwap<Prediction>>,
 }
 
 impl PredictionEngine {
@@ -106,7 +168,8 @@ impl PredictionEngine {
             feature_rx,
             latest_pred: Arc::new(ArcSwap::new(Arc::new(Prediction::new_default(symbol_id)))),
             symbol_id,
-            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            running: Arc::new(AtomicBool::new(true)),
+            shadow_pred: Arc::new(ArcSwap::new(Arc::new(Prediction::new_default(symbol_id)))),
         }
     }
 
@@ -133,6 +196,7 @@ impl PredictionEngine {
         let engine = Self {
             feature_rx: self.feature_rx.clone(),
             latest_pred: Arc::clone(&self.latest_pred),
+            shadow_pred: Arc::clone(&self.shadow_pred),
             symbol_id: self.symbol_id,
             running: Arc::clone(&self.running),
         };
@@ -154,6 +218,129 @@ impl PredictionEngine {
 
     pub fn get_prediction(&self) -> Arc<Prediction> {
         Arc::clone(&self.latest_pred.load())
+    }
+
+    /// Run loop that evaluates both active and shadow models on every FeatureVector.
+    /// The active model's prediction is stored in `latest_pred` (used by downstream consumers).
+    /// The shadow model's prediction is stored in `shadow_pred` (monitoring only).
+    /// Divergence between the two is recorded in metrics.
+    /// If the shadow model produces acceptable divergence for N consecutive ticks,
+    /// it is automatically promoted to active via the registry.
+    pub fn run_shadow_loop<F, G>(
+        &self,
+        mut active_infer_fn: F,
+        mut shadow_infer_fn: G,
+        shadow_config: ShadowConfig,
+        metrics: &GlobalMetrics,
+        registry: &ModelRegistry,
+        shadow_model_id: &str,
+    )
+    where
+        F: FnMut(&FeatureVector) -> Prediction + Send,
+        G: FnMut(&FeatureVector) -> Prediction + Send,
+    {
+        let mut consecutive_good_ticks: u64 = 0;
+
+        while self.running.load(Ordering::Relaxed) {
+            match self.feature_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(features) => {
+                    let active_pred = active_infer_fn(&features);
+                    let shadow_pred_val = shadow_infer_fn(&features);
+
+                    let active_arc = Arc::new(active_pred);
+                    let shadow_arc = Arc::new(shadow_pred_val);
+
+                    // Always store active prediction for downstream use
+                    self.latest_pred.store(Arc::clone(&active_arc));
+                    // Store shadow prediction for monitoring
+                    self.shadow_pred.store(Arc::clone(&shadow_arc));
+
+                    // Compute and record divergence
+                    let divergence = DivergenceMetrics::compute(&active_arc, &shadow_arc);
+                    metrics.model_divergence.record(
+                        (divergence.max_delta() * 1_000_000.0) as u64,
+                    );
+
+                    tracing::trace!(
+                        symbol = ?self.symbol_id,
+                        shadow_model = %shadow_model_id,
+                        forecast_delta = %divergence.forecast_delta,
+                        confidence_delta = %divergence.confidence_delta,
+                        action_score_delta = %divergence.action_score_delta,
+                        consecutive_good_ticks = %consecutive_good_ticks,
+                        "Shadow model divergence"
+                    );
+
+                    if divergence.below_threshold(&shadow_config) {
+                        consecutive_good_ticks += 1;
+                        if consecutive_good_ticks >= shadow_config.promote_after_ticks {
+                            tracing::info!(
+                                symbol = ?self.symbol_id,
+                                shadow_model = %shadow_model_id,
+                                ticks = %consecutive_good_ticks,
+                                "Shadow model divergence acceptable, promoting to active"
+                            );
+                            if let Err(e) = registry.promote_shadow() {
+                                tracing::error!(
+                                    symbol = ?self.symbol_id,
+                                    shadow_model = %shadow_model_id,
+                                    error = %e,
+                                    "Failed to promote shadow model"
+                                );
+                            }
+                            // Reset counter regardless of outcome to avoid repeated attempts
+                            consecutive_good_ticks = 0;
+                        }
+                    } else {
+                        consecutive_good_ticks = 0;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Start the shadow model inference thread.
+    /// Returns a JoinHandle that must be joined for clean shutdown.
+    pub fn start_shadow<F, G>(
+        &self,
+        active_infer_fn: F,
+        shadow_infer_fn: G,
+        shadow_config: ShadowConfig,
+        metrics: Arc<GlobalMetrics>,
+        registry: Arc<ModelRegistry>,
+        shadow_model_id: String,
+        core_id: usize,
+    ) -> std::thread::JoinHandle<()>
+    where
+        F: FnMut(&FeatureVector) -> Prediction + Send + 'static,
+        G: FnMut(&FeatureVector) -> Prediction + Send + 'static,
+    {
+        let engine = Self {
+            feature_rx: self.feature_rx.clone(),
+            latest_pred: Arc::clone(&self.latest_pred),
+            shadow_pred: Arc::clone(&self.shadow_pred),
+            symbol_id: self.symbol_id,
+            running: Arc::clone(&self.running),
+        };
+
+        let symbol_id_val = self.symbol_id;
+        spawn_pinned(
+            &format!("shadow-{:?}", symbol_id_val),
+            core_id,
+            ThreadPriority::BelowNormal,
+            move || {
+                engine.run_shadow_loop(
+                    active_infer_fn,
+                    shadow_infer_fn,
+                    shadow_config,
+                    &*metrics,
+                    &*registry,
+                    &shadow_model_id,
+                );
+            },
+        ).expect("spawn_pinned failed")
     }
 }
 
@@ -205,6 +392,65 @@ mod tests {
         assert_eq!(pred.symbol_id, symbol_id);
         assert_eq!(pred.forecast, 0.0);
         drop(tx);
+    }
+
+    #[test]
+    fn test_divergence_metrics_compute() {
+        let active = Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: 0.5,
+            confidence: 0.8,
+            action_score: 0.3,
+            regime_label: 0,
+            regime_strength: 0.5,
+            computed_ns: 1000,
+            trace_id: 1,
+        };
+        let shadow = Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: 0.7,
+            confidence: 0.6,
+            action_score: 0.4,
+            regime_label: 0,
+            regime_strength: 0.5,
+            computed_ns: 1000,
+            trace_id: 1,
+        };
+        let dm = DivergenceMetrics::compute(&active, &shadow);
+        assert!((dm.forecast_delta - 0.2).abs() < 1e-6);
+        assert!((dm.confidence_delta - 0.2).abs() < 1e-6);
+        assert!((dm.action_score_delta - 0.1).abs() < 1e-6);
+        assert!((dm.max_delta() - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_divergence_below_threshold() {
+        let config = ShadowConfig {
+            forecast_delta_threshold: 0.1,
+            confidence_delta_threshold: 0.1,
+            action_score_delta_threshold: 0.1,
+            promote_after_ticks: 100,
+        };
+        let active = Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: 0.5, confidence: 0.8, action_score: 0.3,
+            regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+        };
+        let shadow = Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: 0.45, confidence: 0.85, action_score: 0.32,
+            regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+        };
+        let dm = DivergenceMetrics::compute(&active, &shadow);
+        assert!(dm.below_threshold(&config));
+
+        let divergent_shadow = Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: 0.9, confidence: 0.3, action_score: 0.9,
+            regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+        };
+        let dm2 = DivergenceMetrics::compute(&active, &divergent_shadow);
+        assert!(!dm2.below_threshold(&config));
     }
 
     #[test]

@@ -118,6 +118,8 @@ pub struct MetricsBatch {
     pub feed_latency: [u64; 6],
     pub broker_round_trip_latency: [u64; 6],
     pub decision_latency: [u64; 6],
+    // Model divergence histogram buckets (forecast delta, confidence delta)
+    pub model_divergence: [u64; 6],
     // Channel depth deltas (positive = sent, negative = received)
     pub feature_channel_depth_delta: i64,
     pub risk_channel_depth_delta: i64,
@@ -180,6 +182,9 @@ impl MetricsBatch {
         }
         for (i, &v) in other.decision_latency.iter().enumerate() {
             self.decision_latency[i] += v;
+        }
+        for (i, &v) in other.model_divergence.iter().enumerate() {
+            self.model_divergence[i] += v;
         }
 
         self.feature_channel_depth_delta += other.feature_channel_depth_delta;
@@ -307,6 +312,15 @@ impl ThreadLocalMetrics {
     #[inline]
     pub fn record_feed_latency(&mut self, latency_ns: u64) {
         Self::record_latency(latency_ns, &mut self.batch.feed_latency);
+    }
+
+    /// Record model divergence magnitude (absolute difference between active and shadow predictions).
+    /// The divergence value is scaled to u64 before bucketing: multiply by 1_000_000 so that
+    /// a divergence of 0.001 maps to 1000, 0.01 to 10_000, 0.1 to 100_000, etc.
+    #[inline]
+    pub fn record_model_divergence(&mut self, divergence: f32) {
+        let scaled = (divergence.abs() * 1_000_000.0) as u64;
+        Self::record_latency(scaled, &mut self.batch.model_divergence);
     }
 
     /// Check if we should flush based on tick count or time
@@ -450,6 +464,11 @@ impl MetricsAggregator {
                 m.decision_latency.buckets[i].fetch_add(v, Ordering::Relaxed);
             }
         }
+        for (i, &v) in batch.model_divergence.iter().enumerate() {
+            if v > 0 {
+                m.model_divergence.buckets[i].fetch_add(v, Ordering::Relaxed);
+            }
+        }
 
         // Apply channel depth deltas
         if batch.feature_channel_depth_delta != 0 {
@@ -537,6 +556,8 @@ pub struct GlobalMetrics {
     pub feed_latency: LatencyHistogram,
     pub broker_round_trip_latency: LatencyHistogram,
     pub decision_latency: LatencyHistogram,
+    /// Histogram of prediction divergence between active and shadow models
+    pub model_divergence: LatencyHistogram,
     // Channel depth gauges (approximate, since crossbeam doesn't expose len())
     pub feature_channel_depth: AtomicI64,
     pub risk_channel_depth: AtomicI64,
@@ -582,6 +603,7 @@ impl GlobalMetrics {
             feed_latency: LatencyHistogram::new(),
             broker_round_trip_latency: LatencyHistogram::new(),
             decision_latency: LatencyHistogram::new(),
+            model_divergence: LatencyHistogram::new(),
             feature_channel_depth: AtomicI64::new(0),
             risk_channel_depth: AtomicI64::new(0),
             decision_channel_depth: AtomicI64::new(0),
@@ -624,6 +646,7 @@ impl GlobalMetrics {
         self.feed_latency.reset();
         self.broker_round_trip_latency.reset();
         self.decision_latency.reset();
+        self.model_divergence.reset();
         self.feature_channel_depth.store(0, Ordering::Relaxed);
         self.risk_channel_depth.store(0, Ordering::Relaxed);
         self.decision_channel_depth.store(0, Ordering::Relaxed);
@@ -690,6 +713,7 @@ impl GlobalMetrics {
             feed_latency: self.feed_latency.snapshot(),
             broker_round_trip_latency: self.broker_round_trip_latency.snapshot(),
             decision_latency: self.decision_latency.snapshot(),
+            model_divergence: self.model_divergence.snapshot(),
             feature_channel_depth: self.feature_channel_depth.load(Ordering::Relaxed),
             risk_channel_depth: self.risk_channel_depth.load(Ordering::Relaxed),
             decision_channel_depth: self.decision_channel_depth.load(Ordering::Relaxed),
@@ -791,6 +815,8 @@ pub struct MetricsSnapshot {
     pub feed_latency: [u64; 6],
     pub broker_round_trip_latency: [u64; 6],
     pub decision_latency: [u64; 6],
+    // Model divergence histogram buckets
+    pub model_divergence: [u64; 6],
     // Channel depth gauges
     pub feature_channel_depth: i64,
     pub risk_channel_depth: i64,
