@@ -1,4 +1,4 @@
-use feature::{FeatureVector, FeatureIndex};
+use feature::{FeatureVector, FeatureIndex, FEATURE_SCHEMA_VERSION};
 use crate::prediction_engine::Prediction;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,7 @@ pub struct InferenceEngine {
     pub forecast_volume_weight: f64,
     pub volume_ratio_clamp: f64,
     pub volume_confirmation_threshold: f64,
+    pub feature_schema_version: u32,
 }
 
 impl InferenceEngine {
@@ -48,6 +49,7 @@ impl InferenceEngine {
             forecast_volume_weight,
             volume_ratio_clamp,
             volume_confirmation_threshold,
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
         }
     }
 
@@ -118,7 +120,48 @@ impl InferenceEngine {
             + vol_confirmation * self.forecast_volume_weight as f32)
             .clamp(-1.0, 1.0)
     }
+
+    /// Validate that a model's expected schema version matches this engine's version.
+    /// Returns Ok(()) if versions match, or an error with details on mismatch.
+    pub fn validate_model_schema(&self, model_id: &str, model_schema_version: u32) -> Result<(), SchemaValidationError> {
+        if model_schema_version != self.feature_schema_version {
+            let err = SchemaValidationError {
+                model_id: model_id.to_string(),
+                model_schema_version,
+                engine_schema_version: self.feature_schema_version,
+            };
+            tracing::error!(
+                model_id = %err.model_id,
+                model_version = %err.model_schema_version,
+                engine_version = %err.engine_schema_version,
+                "Model schema version mismatch - refusing to load model"
+            );
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
 }
+
+/// Error returned when model schema doesn't match the inference engine
+#[derive(Debug, Clone)]
+pub struct SchemaValidationError {
+    pub model_id: String,
+    pub model_schema_version: u32,
+    pub engine_schema_version: u32,
+}
+
+impl std::fmt::Display for SchemaValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Schema mismatch for model '{}': model version {} != engine version {}",
+            self.model_id, self.model_schema_version, self.engine_schema_version
+        )
+    }
+}
+
+impl std::error::Error for SchemaValidationError {}
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +246,29 @@ use unified_trading_core::symbol_registry::SymbolId;
         let fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
         let pred = engine.predict(&fv);
         assert!(pred.forecast >= -1.0 && pred.forecast <= 1.0);
+    }
+
+    #[test]
+    fn test_schema_validation_passes_for_matching_version() {
+        let engine = make_engine();
+        let result = engine.validate_model_schema("test_model", FEATURE_SCHEMA_VERSION);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_schema_validation_fails_for_mismatched_version() {
+        let engine = make_engine();
+        let result = engine.validate_model_schema("test_model", 999);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.model_id, "test_model");
+        assert_eq!(err.model_schema_version, 999);
+        assert_eq!(err.engine_schema_version, FEATURE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_feature_vector_has_schema_version() {
+        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        assert_eq!(fv.feature_schema_version, FEATURE_SCHEMA_VERSION);
     }
 }

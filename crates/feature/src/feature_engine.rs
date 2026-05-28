@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use unified_trading_core::symbol_registry::SymbolId;
 
+/// Current feature schema version. Increment this when the feature set changes
+/// to prevent training/serving skew between model and inference engine.
+pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FeatureIndex {
     MidPrice = 0,
@@ -49,6 +53,8 @@ pub struct FeatureVector {
     pub symbol_id: SymbolId,
     pub timestamp_ns: u64,
     pub values: [f32; FEATURE_COUNT],
+    /// Schema version for training/serving skew detection
+    pub feature_schema_version: u32,
 }
 
 impl FeatureVector {
@@ -57,6 +63,7 @@ impl FeatureVector {
             symbol_id,
             timestamp_ns,
             values: [0.0f32; FEATURE_COUNT],
+            feature_schema_version: FEATURE_SCHEMA_VERSION,
         }
     }
 

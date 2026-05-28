@@ -1,11 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use unified_trading_core::config::{BackpressurePolicy, EngineConfig};
-use unified_trading_core::metrics::{GlobalMetrics, MetricsBatch, ThreadLocalMetrics};
+use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::journal::{JournalWriter, JournalEntry};
 use unified_trading_core::channel_utils::{send_with_policy, PolicySendError};
@@ -82,7 +81,6 @@ pub struct AssetProcessor {
     pub feature_rx: Receiver<FeatureVector>,
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
-    pub local_metrics: Option<ThreadLocalMetrics>,
     pub prediction_staleness_ns: u64,
     pub default_order_quantity: f64,
     pub tick_processing_budget_us: u64,
@@ -133,11 +131,7 @@ impl AssetProcessor {
                     }
                 };
                 if gap {
-                    if let Some(ref mut lm) = self.local_metrics {
-                        lm.record_feed_gap();
-                    } else {
-                        self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
                 }
                 let features = self.feature_engine.compute(&normalized);
                 if send_with_policy(
@@ -147,11 +141,7 @@ impl AssetProcessor {
                     &self.feature_backpressure_policy,
                     &self.metrics,
                 ).is_ok() {
-                    if let Some(ref mut lm) = self.local_metrics {
-                        lm.record_feature_channel_depth(1);
-                    } else {
-                        self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
                 }
 
                 self.signal_ctx.update_price(normalized.mid_price);
@@ -165,11 +155,7 @@ impl AssetProcessor {
 
                 // If prediction is stale, fall back to a heuristic based on raw features
                 let prediction = if prediction.is_stale(self.prediction_staleness_ns) {
-                    if let Some(ref mut lm) = self.local_metrics {
-                        lm.record_model_fallback();
-                    } else {
-                        self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(symbol = %self.symbol, "Model prediction stale; using heuristic fallback");
                     Arc::new(Prediction::heuristic_from_features(&features, self.signal_ctx.symbol_id))
                 } else {
@@ -192,23 +178,13 @@ impl AssetProcessor {
                         &self.metrics,
                     ) {
                         Ok(()) => {
-                            if let Some(ref mut lm) = self.local_metrics {
-                                lm.record_intent_generated();
-                                lm.record_risk_channel_depth(1);
-                                lm.record_tick_to_intent_latency(tick_start.elapsed().as_nanos() as u64);
-                            } else {
-                                self.metrics.intents_generated.fetch_add(1, Ordering::Relaxed);
-                                self.metrics.risk_channel_depth.fetch_add(1, Ordering::Relaxed);
-                                let elapsed_ns = tick_start.elapsed().as_nanos() as u64;
-                                self.metrics.tick_to_intent_latency.record(elapsed_ns);
-                            }
+                            self.metrics.intents_generated.fetch_add(1, Ordering::Relaxed);
+                            self.metrics.risk_channel_depth.fetch_add(1, Ordering::Relaxed);
+                            let elapsed_ns = tick_start.elapsed().as_nanos() as u64;
+                            self.metrics.tick_to_intent_latency.record(elapsed_ns);
                         }
                         Err(PolicySendError::Dropped(_)) | Err(PolicySendError::Timeout(_)) => {
-                            if let Some(ref mut lm) = self.local_metrics {
-                                lm.record_dropped_intent();
-                            } else {
-                                self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
-                            }
+                            self.metrics.dropped_intents.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(PolicySendError::Disconnected(_)) => {
                             self.kill_switch.activate();
@@ -216,31 +192,18 @@ impl AssetProcessor {
                     }
                 }
 
-                // Record tick processed (only atomic on hot path)
                 self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);
+                self.metrics.features_computed.fetch_add(1, Ordering::Relaxed);
+                self.metrics.increment_per_symbol_tick(&self.symbol);
+                self.metrics.increment_per_symbol_feature(&self.symbol);
 
-                // Accumulate remaining metrics locally
-                if let Some(ref mut lm) = self.local_metrics {
-                    lm.accumulate(&self.symbol);
-                    // Record feed latency
-                    let proc_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    let latency = proc_ns.saturating_sub(tick.timestamp_ns);
-                    lm.record_feed_latency(latency);
-                } else {
-                    self.metrics.features_computed.fetch_add(1, Ordering::Relaxed);
-                    self.metrics.increment_per_symbol_tick(&self.symbol);
-                    self.metrics.increment_per_symbol_feature(&self.symbol);
-                    // Record feed latency (tick timestamp to processing time)
-                    let proc_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
-                    let latency = proc_ns.saturating_sub(tick.timestamp_ns);
-                    self.metrics.feed_latency.record(latency);
-                }
+                // Record feed latency (tick timestamp to processing time)
+                let proc_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let latency = proc_ns.saturating_sub(tick.timestamp_ns);
+                self.metrics.feed_latency.record(latency);
 
                 let elapsed_us = tick_start.elapsed().as_micros() as u64;
                 if elapsed_us > self.tick_processing_budget_us {
@@ -264,14 +227,6 @@ impl AssetProcessor {
         // Drain remaining ticks so the channel doesn't hold stale messages
         while let Ok(_tick) = md_rx.try_recv() {
             self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref mut lm) = self.local_metrics {
-                lm.accumulate(&self.symbol);
-            }
-        }
-
-        // Flush any remaining local metrics
-        if let Some(ref mut lm) = self.local_metrics {
-            lm.flush();
         }
     }
 
@@ -344,8 +299,6 @@ impl AssetProcessor {
     pub command_actor: Option<CommandActor>,
     pub lifecycle_tx: Option<crossbeam_channel::Sender<execution::OrderLifecycleEvent>>,
     pub execution_port: Option<Arc<dyn IExecutionPort>>,
-    pub metrics_batch_tx: Option<crossbeam_channel::Sender<MetricsBatch>>,
-    pub metrics_shutdown_tx: Option<crossbeam_channel::Sender<()>>,
     next_asset_core: usize,
 }
 
@@ -381,8 +334,6 @@ impl UnifiedEngine {
             command_actor: None,
             lifecycle_tx: None,
             execution_port: None,
-            metrics_batch_tx: None,
-            metrics_shutdown_tx: None,
             next_asset_core: 1,
         }
     }
@@ -417,17 +368,6 @@ impl UnifiedEngine {
         );
         self.journal_tx = Some(journal.tx.clone());
         self.journal = Some(journal);
-
-        // Spawn the metrics aggregator background thread
-        let (batch_tx, shutdown_tx, aggregator_handle) = self.metrics.spawn_aggregator(
-            threading_config.metrics_aggregator_core_id,
-            Duration::from_micros(threading_config.metrics_flush_interval_us),
-            threading_config.metrics_flush_tick_threshold,
-            threading_config.metrics_channel_capacity,
-        );
-        self.metrics_batch_tx = Some(batch_tx);
-        self.metrics_shutdown_tx = Some(shutdown_tx);
-        self.thread_handles.push(aggregator_handle);
 
         let heartbeat_monitor = ThreadHeartbeatMonitor::new(
             Arc::clone(&self.kill_switch),
@@ -985,7 +925,6 @@ impl UnifiedEngine {
             feature_rx: feature_rx.clone(),
             kill_switch: Arc::clone(&ks),
             metrics: Arc::clone(&metrics),
-            local_metrics: None, // Will be set below if batch_tx is available
             prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
             default_order_quantity: config.execution_defaults.default_order_quantity,
             tick_processing_budget_us: config.threading_config.tick_processing_budget_us,
@@ -1050,23 +989,12 @@ impl UnifiedEngine {
 
         // Start asset processor
         let sym = symbol.to_string();
-        let batch_tx = self.metrics_batch_tx.clone();
-        let metrics_flush_interval_us = config.threading_config.metrics_flush_interval_us;
-        let metrics_flush_tick_threshold = config.threading_config.metrics_flush_tick_threshold;
         let asset_handle = spawn_pinned(
             &format!("asset-{}", sym),
             core_id,
             ThreadPriority::High,
             move || {
                 let mut processor = processor;
-                // Initialize thread-local metrics if batch channel is available
-                if let Some(ref tx) = batch_tx {
-                    processor.local_metrics = Some(ThreadLocalMetrics::new(
-                        tx.clone(),
-                        Duration::from_micros(metrics_flush_interval_us),
-                        metrics_flush_tick_threshold,
-                    ));
-                }
                 processor.run_loop(&md_rx);
                 tracing::info!("Asset processor for {} stopped", sym);
             },
@@ -1502,12 +1430,7 @@ impl UnifiedEngine {
             watcher.stop();
         }
 
-        // 7. Shutdown metrics aggregator
-        if let Some(tx) = self.metrics_shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-
-        // 8. Join all worker threads with a timeout
+        // 7. Join all worker threads with a timeout
         let timeout = std::time::Duration::from_secs(5);
         for handle in self.thread_handles.drain(..) {
             match Self::join_with_timeout(handle, timeout) {

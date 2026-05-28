@@ -2,7 +2,6 @@ mod allocator;
 
 use std::sync::Arc;
 
-use model::ModelRegistry;
 use unified_trading_core::config::EngineConfig;
 use unified_trading_core::ws::{create_ws_router, WsState};
 use unified_trading_core::large_pages::{enable_large_pages, log_large_page_result};

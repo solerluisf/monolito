@@ -1,0 +1,336 @@
+warning: unused import: `Instant`
+ --> crates\core\src\heartbeat.rs:5:27
+  |
+5 | use std::time::{Duration, Instant};
+  |                           ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::thread`
+ --> crates\core\src\config_watcher.rs:3:5
+  |
+3 | use std::thread;
+  |     ^^^^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+ --> crates\core\src\config_watcher.rs:4:5
+  |
+4 | use std::time::Duration;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `error`
+ --> crates\core\src\config_watcher.rs:8:27
+  |
+8 | use tracing::{info, warn, error};
+  |                           ^^^^^
+
+warning: unused import: `futures_util::SinkExt`
+  --> crates\core\src\ws.rs:10:5
+   |
+10 | use futures_util::SinkExt;
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `flush_interval`
+   --> crates\core\src\metrics.rs:740:9
+    |
+740 |         flush_interval: Duration,
+    |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_flush_interval`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `flush_tick_threshold`
+   --> crates\core\src\metrics.rs:741:9
+    |
+741 |         flush_tick_threshold: u64,
+    |         ^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_flush_tick_threshold`
+
+warning: fields `retention_hours` and `max_size_mb` are never read
+  --> crates\core\src\journal.rs:37:5
+   |
+31 | pub struct JournalWriter {
+   |            ------------- fields in this struct
+...
+37 |     retention_hours: u32,
+   |     ^^^^^^^^^^^^^^^
+38 |     max_size_mb: u64,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `open_orders` and `flat_threshold` are never read
+  --> crates\core\src\portfolio_manager.rs:75:5
+   |
+73 | struct PortfolioState {
+   |        -------------- fields in this struct
+74 |     positions: HashMap<String, Position>,
+75 |     open_orders: HashMap<String, OpenOrder>,
+   |     ^^^^^^^^^^^
+...
+79 |     flat_threshold: f64,
+   |     ^^^^^^^^^^^^^^
+
+warning: `unified-trading-core` (lib) generated 9 warnings (run `cargo fix --lib -p unified-trading-core` to apply 6 suggestions)
+warning: field `symbol_id` is never read
+  --> crates\market-data\src\normalizer.rs:48:5
+   |
+47 | pub struct Normalizer {
+   |            ---------- field in this struct
+48 |     symbol_id: SymbolId,
+   |     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `alerts` is never read
+   --> crates\market-data\src\normalizer.rs:124:5
+    |
+119 | pub struct FeedMonitor {
+    |            ----------- field in this struct
+...
+124 |     alerts: Vec<FeedAlert>,
+    |     ^^^^^^
+
+warning: `market-data` (lib) generated 2 warnings
+warning: unused import: `bounded`
+ --> crates\risk\src\risk_coordinator.rs:1:25
+  |
+1 | use crossbeam_channel::{bounded, Receiver, Sender};
+  |                         ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `get_symbol` is never used
+   --> crates\risk\src\risk_checks.rs:225:8
+    |
+ 74 | impl RiskEngine {
+    | --------------- method in this implementation
+...
+225 |     fn get_symbol(&self, _symbol_id: SymbolId) -> Option<&str> {
+    |        ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `risk` (lib) generated 2 warnings (run `cargo fix --lib -p risk` to apply 1 suggestion)
+warning: unused import: `FEATURE_COUNT`
+ --> crates\feature\src\computers.rs:1:88
+  |
+1 | use crate::feature_engine::{FeatureVector, FeatureSnapshot, RegimeLabel, FeatureIndex, FEATURE_COUNT};
+  |                                                                                        ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `wm`
+  --> crates\feature\src\computers.rs:13:20
+   |
+13 |     pub fn compute(wm: &WindowManager, tick: &NormalizedTick) -> (f32, f32, f32) {
+   |                    ^^ help: if this is intentional, prefix it with an underscore: `_wm`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `feature` (lib) generated 2 warnings (run `cargo fix --lib -p feature` to apply 2 suggestions)
+warning: unused variable: `mid_price`
+  --> crates\model\src\inference.rs:62:13
+   |
+62 |         let mid_price = features.get(FeatureIndex::MidPrice);
+   |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mid_price`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `model` (lib) generated 1 warning (run `cargo fix --lib -p model` to apply 1 suggestion)
+warning: method `check_cooldown` is never used
+   --> crates\strategy\src\strategy_engine.rs:315:8
+    |
+138 | impl StrategyEngine {
+    | ------------------- method in this implementation
+...
+315 |     fn check_cooldown(&self, intent: &TradeIntent) -> bool {
+    |        ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `strategy` (lib) generated 1 warning
+warning: unused variable: `max_bytes`
+   --> crates\gateway\src\alpaca_feed.rs:190:13
+    |
+190 |         let max_bytes = config.replay_buffer_max_bytes.max(1024);
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_max_bytes`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `remaining_qty`
+   --> crates\gateway\src\alpaca_execution.rs:334:13
+    |
+334 |         let remaining_qty = total_qty.saturating_sub(filled_qty);
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_remaining_qty`
+
+warning: method `headers` is never used
+  --> crates\gateway\src\alpaca.rs:37:8
+   |
+16 | impl AlpacaAdapter {
+   | ------------------ method in this implementation
+...
+37 |     fn headers(&self) -> HashMap<String, String> {
+   |        ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `type` is never read
+   --> crates\gateway\src\alpaca_execution.rs:139:16
+    |
+133 | pub(crate) struct AlpacaOrderResponse {
+    |                   ------------------- field in this struct
+...
+139 |     pub(crate) r#type: String,
+    |                ^^^^^^
+    |
+    = note: `AlpacaOrderResponse` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `AlpacaCancelResponse` is never constructed
+   --> crates\gateway\src\alpaca_execution.rs:146:19
+    |
+146 | pub(crate) struct AlpacaCancelResponse {
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `headers` is never used
+   --> crates\gateway\src\alpaca_execution.rs:187:8
+    |
+166 | impl AlpacaExecutionPort {
+    | ------------------------ method in this implementation
+...
+187 |     fn headers(&self) -> HashMap<String, String> {
+    |        ^^^^^^^
+
+warning: structure field `S` should have a snake case name
+  --> crates\gateway\src\alpaca_feed.rs:57:9
+   |
+57 |     pub S: String,
+   |         ^ help: convert the identifier to snake case (notice the capitalization): `s`
+   |
+   = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: structure field `S` should have a snake case name
+  --> crates\gateway\src\alpaca_feed.rs:71:9
+   |
+71 |     pub S: String,
+   |         ^ help: convert the identifier to snake case (notice the capitalization): `s`
+
+warning: structure field `S` should have a snake case name
+  --> crates\gateway\src\alpaca_feed.rs:86:9
+   |
+86 |     pub S: String,
+   |         ^ help: convert the identifier to snake case (notice the capitalization): `s`
+
+warning: `gateway` (lib) generated 9 warnings (run `cargo fix --lib -p gateway` to apply 2 suggestions)
+warning: use of deprecated method `order_tracker::OrderTracker::update_fill`: Use full_fill_order or partial_fill_order instead
+   --> crates\execution\src\execution_manager.rs:234:21
+    |
+234 |             tracker.update_fill(order_id, filled_qty);
+    |                     ^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `order_tracker::OrderTracker::update_status`: Use transition_order with explicit events instead
+   --> crates\execution\src\execution_manager.rs:285:21
+    |
+285 |             tracker.update_status(order_id, OrderStatus::Cancelled);
+    |                     ^^^^^^^^^^^^^
+
+warning: unused variable: `global_rate`
+  --> crates\execution\src\execution_manager.rs:41:9
+   |
+41 |         global_rate: f64,
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_global_rate`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `per_symbol_rate`
+  --> crates\execution\src\execution_manager.rs:42:9
+   |
+42 |         per_symbol_rate: f64,
+   |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_per_symbol_rate`
+
+warning: `execution` (lib) generated 4 warnings (run `cargo fix --lib -p execution` to apply 2 suggestions)
+warning: unused imports: `OrderTracker` and `RateLimiter`
+  --> crates\engine\src\api.rs:28:17
+   |
+28 | use execution::{OrderTracker, RateLimiter};
+   |                 ^^^^^^^^^^^^  ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `gateway::CircuitBreaker`
+  --> crates\engine\src\api.rs:29:5
+   |
+29 | use gateway::CircuitBreaker;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `next_request_id`
+  --> crates\engine\src\engine.rs:17:71
+   |
+17 | use unified_trading_core::symbol_registry::{SymbolRegistry, SymbolId, next_request_id};
+   |                                                                       ^^^^^^^^^^^^^^^
+
+warning: unused imports: `OpenOrderInfo` and `PositionInfo`
+  --> crates\engine\src\engine.rs:26:126
+   |
+26 | ...MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide};
+   |                                                       ^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+warning: unused variable: `pm_clone`
+   --> crates\engine\src\engine.rs:486:13
+    |
+486 |         let pm_clone = Arc::clone(&self.portfolio_manager);
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pm_clone`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reactor_handle`
+   --> crates\engine\src\engine.rs:589:30
+    |
+589 |             let (reactor_tx, reactor_handle) = spawn_reactor(
+    |                              ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_reactor_handle`
+
+warning: unused variable: `timestamp_ns`
+   --> crates\engine\src\engine.rs:677:51
+    |
+677 |                     JournalEntry::Order { symbol, timestamp_ns, data } => {
+    |                                                   ^^^^^^^^^^^^ help: try ignoring the field: `timestamp_ns: _`
+
+warning: unused variable: `symbol`
+   --> crates\engine\src\engine.rs:687:42
+    |
+687 |                     JournalEntry::Fill { symbol, timestamp_ns, data } => {
+    |                                          ^^^^^^ help: try ignoring the field: `symbol: _`
+
+warning: unused variable: `timestamp_ns`
+   --> crates\engine\src\engine.rs:687:50
+    |
+687 |                     JournalEntry::Fill { symbol, timestamp_ns, data } => {
+    |                                                  ^^^^^^^^^^^^ help: try ignoring the field: `timestamp_ns: _`
+
+warning: unused variable: `config`
+   --> crates\engine\src\engine.rs:616:9
+    |
+616 |         config: &EngineConfig,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_config`
+
+warning: field `tx` is never read
+  --> crates\engine\src\tick_reactor.rs:23:5
+   |
+22 | struct SymbolHandler {
+   |        ------------- field in this struct
+23 |     tx: Sender<RawTick>,
+   |     ^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `unified-trading-engine` (lib) generated 11 warnings (run `cargo fix --lib -p unified-trading-engine` to apply 10 suggestions)
+   Compiling unified-trading-engine v0.1.0 (C:\Users\Magnesium\Documents\Trading\Event driven System\Visual Studio COde\Project\unified-trading-engine\crates\engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.89s
+     Running tests\tick_budget_watchdog_test.rs (target\debug\deps\tick_budget_watchdog_test-081ea7c862c9e95a.exe)
+
+running 1 test
+DEBUG: Kill switch activated after 20.728ms
+test test_watchdog_triggers_and_batch_ticks_are_skipped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
