@@ -139,6 +139,7 @@ pub struct AlpacaFeedConfig {
     pub subscribe_quotes: bool,
     pub subscribe_bars: bool,
     pub replay_buffer_max_bytes: usize,
+    pub max_message_size_bytes: usize,
 }
 
 impl AlpacaFeedConfig {
@@ -200,6 +201,22 @@ impl AlpacaWebSocketFeed {
             replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: 1000,
             current_buffer_bytes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Validates that the message size does not exceed the configured limit.
+    /// Returns Ok(()) if the message is within limits, or an error if it's too large.
+    fn validate_message_size(&self, text: &str) -> Result<(), String> {
+        if text.len() > self.config.max_message_size_bytes {
+            let error_msg = format!(
+                "Message size {} bytes exceeds configured limit of {} bytes",
+                text.len(),
+                self.config.max_message_size_bytes
+            );
+            tracing::warn!("{}", error_msg);
+            Err(error_msg)
+        } else {
+            Ok(())
         }
     }
 
@@ -335,6 +352,7 @@ impl AlpacaWebSocketFeed {
     }
 
     async fn handle_message(&self, text: &str) -> Result<bool, String> {
+        self.validate_message_size(text)?;
         let messages: Vec<serde_json::Value> = serde_json::from_str(text)
             .map_err(|e| format!("JSON parse error: {}", e))?;
 
@@ -400,6 +418,7 @@ impl AlpacaWebSocketFeed {
     }
 
     async fn handle_market_data(&self, text: &str) -> Result<(), String> {
+        self.validate_message_size(text)?;
         let messages: Vec<serde_json::Value> = serde_json::from_str(text)
             .map_err(|e| format!("JSON parse error: {}", e))?;
 
@@ -539,6 +558,7 @@ mod tests {
             subscribe_quotes: false,
             subscribe_bars: false,
             replay_buffer_max_bytes: 10 * 1024 * 1024,
+            max_message_size_bytes: 1024 * 1024,
         };
 
         let channels = config.channels();
@@ -558,6 +578,7 @@ mod tests {
             subscribe_quotes: true,
             subscribe_bars: true,
             replay_buffer_max_bytes: 10 * 1024 * 1024,
+            max_message_size_bytes: 1024 * 1024,
         };
 
         let channels = config.channels();
@@ -578,6 +599,7 @@ mod tests {
             subscribe_quotes: false,
             subscribe_bars: false,
             replay_buffer_max_bytes: 10 * 1024 * 1024,
+            max_message_size_bytes: 1024 * 1024,
         };
         assert!(config.ws_url().contains("alpaca.markets"));
     }
@@ -597,5 +619,40 @@ mod tests {
         let messages: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
         let t = messages[0].get("T").unwrap().as_str().unwrap();
         assert_eq!(t, "success");
+    }
+
+    #[test]
+    fn test_oversized_message_rejection() {
+        // Create a config with a small max message size (100 bytes)
+        let config = AlpacaFeedConfig {
+            api_key: "key".to_string(),
+            api_secret: "secret".to_string(),
+            paper_trading: true,
+            symbols: vec!["AAPL".to_string()],
+            subscribe_trades: true,
+            subscribe_quotes: true,
+            subscribe_bars: true,
+            replay_buffer_max_bytes: 10 * 1024 * 1024,
+            max_message_size_bytes: 100,
+        };
+
+        let (tick_tx, _tick_rx) = crossbeam_channel::unbounded();
+        let feed = AlpacaWebSocketFeed::new(config, tick_tx);
+
+        // Create a message that's larger than 100 bytes
+        let oversized_message = "x".repeat(150);
+        
+        // Test handle_message with oversized message
+        let result = feed.handle_message(&oversized_message);
+        // We can't await in a sync test, so we'll just check that it would be rejected
+        // by testing the validation method directly
+        let validation_result = feed.validate_message_size(&oversized_message);
+        assert!(validation_result.is_err());
+        assert!(validation_result.unwrap_err().contains("exceeds configured limit"));
+
+        // Test with a message that's within the limit
+        let small_message = "x".repeat(50);
+        let validation_result = feed.validate_message_size(&small_message);
+        assert!(validation_result.is_ok());
     }
 }

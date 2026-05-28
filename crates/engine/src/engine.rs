@@ -415,6 +415,7 @@ impl UnifiedEngine {
             subscribe_quotes: true,
             subscribe_bars: false,
             replay_buffer_max_bytes: 10 * 1024 * 1024,
+            max_message_size_bytes: 1024 * 1024,
         };
 
         let feed = AlpacaWebSocketFeed::new(feed_config, feed_tx);
