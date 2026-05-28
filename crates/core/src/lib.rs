@@ -18,7 +18,7 @@ pub mod crash_detector;
 
 pub use kill_switch::KillSwitch;
 pub use metrics::{GlobalMetrics, MetricsSnapshot};
-pub use config::{EngineConfig, CheckSeverity, default_check_severities};
+pub use config::{EngineConfig, CheckSeverity, default_check_severities, ConfigValidationError, ConfigViolation};
 pub use journal::JournalWriter;
 pub use journal::JournalEntry;
 pub use journal::JournalCommand;

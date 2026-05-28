@@ -1,19 +1,19 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, event::EventKind};
 use parking_lot::RwLock;
 use tracing::{info, warn, error};
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, ConfigValidationError};
 
 pub struct ConfigWatcher {
     watcher: Option<RecommendedWatcher>,
     config: Arc<RwLock<EngineConfig>>,
     running: Arc<AtomicBool>,
-    reload_count: Arc<std::sync::atomic::AtomicU64>,
+    reload_count: Arc<AtomicU64>,
+    /// Number of reload attempts that were rejected by validation.
+    rejected_count: Arc<AtomicU64>,
 }
 
 impl ConfigWatcher {
@@ -22,7 +22,8 @@ impl ConfigWatcher {
             watcher: None,
             config,
             running: Arc::new(AtomicBool::new(true)),
-            reload_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reload_count: Arc::new(AtomicU64::new(0)),
+            rejected_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -31,6 +32,7 @@ impl ConfigWatcher {
         let config = Arc::clone(&self.config);
         let running = Arc::clone(&self.running);
         let reload_count = Arc::clone(&self.reload_count);
+        let rejected_count = Arc::clone(&self.rejected_count);
 
         let path_buf = std::path::PathBuf::from(path);
         if !path_buf.exists() {
@@ -53,7 +55,13 @@ impl ConfigWatcher {
                                 info!("Config reloaded successfully");
                             }
                             Err(e) => {
-                                warn!("Failed to reload config: {}", e);
+                                // Distinguish validation errors from parse/I/O errors
+                                if e.contains("validation failed") {
+                                    rejected_count.fetch_add(1, Ordering::Relaxed);
+                                    error!("Rejected invalid config — keeping previous config: {}", e);
+                                } else {
+                                    warn!("Failed to reload config: {}", e);
+                                }
                             }
                         }
                     }
@@ -66,19 +74,28 @@ impl ConfigWatcher {
             .watch(&path_buf, RecursiveMode::Recursive)
             .map_err(|e| e.to_string())?;
 
-        info!(path = %path, "Config watcher started");
+        info!(path = %path, "Config watcher started (with sandbox validation)");
         self.watcher = Some(watcher);
         Ok(())
     }
 
+    /// Parse the TOML file, **validate** in a sandbox (no lock held yet),
+    /// and only then swap the live config.  If validation fails the old
+    /// config is left untouched and an error is returned.
     fn reload_config(config: &Arc<RwLock<EngineConfig>>, paths: &[std::path::PathBuf]) -> Result<(), String> {
         for path in paths {
             if path.extension().map_or(false, |ext| ext == "toml") {
+                // 1. Read + parse
                 let content = std::fs::read_to_string(path)
                     .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
                 let new_config: EngineConfig = toml::from_str(&content)
                     .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
 
+                // 2. Sandbox validate (no write lock held — purely read-only check)
+                new_config.validate()
+                    .map_err(|e: ConfigValidationError| format!("validation failed: {}", e))?;
+
+                // 3. Validation passed — acquire write lock and swap
                 let mut current = config.write();
                 *current = new_config;
                 return Ok(());
@@ -91,6 +108,12 @@ impl ConfigWatcher {
         self.reload_count.load(Ordering::Relaxed)
     }
 
+    /// Number of reload attempts that were rejected because the parsed
+    /// config failed `validate()`.
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected_count.load(Ordering::Relaxed)
+    }
+
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         self.watcher = None;
@@ -101,6 +124,7 @@ impl ConfigWatcher {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn test_config_watcher_reload() {
@@ -138,5 +162,86 @@ mod tests {
         let mut watcher = ConfigWatcher::new(config);
         let result = watcher.start("/nonexistent/path");
         assert!(result.is_ok());
+    }
+
+    /// Acceptance test: write an invalid config (negative leverage) to disk,
+    /// verify that reload is rejected and the previous valid config is retained.
+    #[test]
+    fn test_config_watcher_rejects_invalid_config() {
+        // Start with a known-valid config
+        let original = EngineConfig::default();
+        let config = Arc::new(RwLock::new(original.clone()));
+
+        let tmp_dir = std::env::temp_dir().join(format!("config_validate_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).ok();
+        let config_path = tmp_dir.join("invalid.toml");
+
+        // Write valid initial config
+        let valid_toml = toml::to_string(&original).unwrap();
+        std::fs::write(&config_path, &valid_toml).unwrap();
+
+        // Start watcher
+        let mut watcher = ConfigWatcher::new(Arc::clone(&config));
+        watcher.start(config_path.to_str().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Write invalid config: negative leverage
+        let mut invalid = EngineConfig::default();
+        invalid.risk_config.max_leverage = -3.0; // invalid
+        invalid.max_assets = 99;                  // also inconsistent with asset_configs
+        let invalid_toml = toml::to_string(&invalid).unwrap();
+        std::fs::write(&config_path, &invalid_toml).unwrap();
+
+        // Give the watcher time to pick up the change
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The original config must still be in place — no swap happened
+        let current = config.read();
+        assert_eq!(
+            current.risk_config.max_leverage, original.risk_config.max_leverage,
+            "leverage should remain at original value after rejected reload"
+        );
+        assert_eq!(
+            current.max_assets, original.max_assets,
+            "max_assets should remain at original value after rejected reload"
+        );
+
+        // Reload count should NOT have incremented for this attempt
+        // (or at minimum, rejected_count should reflect the rejection)
+        assert!(
+            watcher.rejected_count() >= 1 || watcher.reload_count() == 0,
+            "expected rejection to be counted or no successful reload"
+        );
+
+        watcher.stop();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// Direct unit test of `reload_config` with an invalid TOML — no
+    /// filesystem watcher needed.
+    #[test]
+    fn test_reload_config_rejects_negative_leverage_directly() {
+        let original = EngineConfig::default();
+        let config = Arc::new(RwLock::new(original.clone()));
+
+        let tmp_dir = std::env::temp_dir().join(format!("direct_validate_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).ok();
+        let path = tmp_dir.join("bad.toml");
+
+        let mut bad = EngineConfig::default();
+        bad.risk_config.max_leverage = -1.0;
+        std::fs::write(&path, toml::to_string(&bad).unwrap()).unwrap();
+
+        let result = ConfigWatcher::reload_config(&config, &[path.clone()]);
+        assert!(result.is_err(), "reload should fail on negative leverage");
+        assert!(
+            result.unwrap_err().contains("validation failed"),
+            "error should mention validation failure"
+        );
+
+        // Verify original is untouched
+        assert_eq!(config.read().risk_config.max_leverage, original.risk_config.max_leverage);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

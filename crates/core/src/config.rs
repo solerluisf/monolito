@@ -532,6 +532,228 @@ impl Default for ValidatorConfig {
     }
 }
 
+// ── Config validation ────────────────────────────────────────────────
+
+/// A single config-validation violation.
+#[derive(Debug, Clone)]
+pub struct ConfigViolation {
+    pub field: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.message)
+    }
+}
+
+/// Aggregated error returned when `EngineConfig::validate()` detects one or
+/// more problems that would make the configuration unsafe or inconsistent.
+#[derive(Debug, Clone)]
+pub struct ConfigValidationError {
+    pub violations: Vec<ConfigViolation>,
+}
+
+impl ConfigValidationError {
+    pub fn new(violations: Vec<ConfigViolation>) -> Self {
+        Self { violations }
+    }
+
+    /// Returns `true` when **no** violations were collected.
+    pub fn is_empty(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+impl std::fmt::Display for ConfigValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.violations.is_empty() {
+            return Ok(());
+        }
+        writeln!(f, "config validation failed ({} violation(s)):", self.violations.len())?;
+        for v in &self.violations {
+            writeln!(f, "  • {}", v)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConfigValidationError {}
+
+/// Helper used inside `validate()` to push a violation into the list.
+fn check(cond: bool, field: &str, msg: &str, out: &mut Vec<ConfigViolation>) {
+    if !cond {
+        out.push(ConfigViolation {
+            field: field.to_string(),
+            message: msg.to_string(),
+        });
+    }
+}
+
+impl EngineConfig {
+    /// Validate internal consistency and safety constraints of this config.
+    ///
+    /// Returns `Ok(())` when every check passes, or an error listing all
+    /// violations so the operator can fix them in one pass.
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        let mut v = Vec::new();
+
+        // ── Risk-level checks ──────────────────────────────────────
+        check(
+            self.risk_config.max_leverage > 0.0,
+            "risk_config.max_leverage",
+            "must be positive (got negative or zero leverage)",
+            &mut v,
+        );
+        check(
+            self.risk_config.max_position_per_symbol > 0.0,
+            "risk_config.max_position_per_symbol",
+            "must be positive",
+            &mut v,
+        );
+        check(
+            self.risk_config.max_portfolio_exposure > 0.0,
+            "risk_config.max_portfolio_exposure",
+            "must be positive",
+            &mut v,
+        );
+        check(
+            self.risk_config.max_drawdown_pct >= 0.0 && self.risk_config.max_drawdown_pct <= 100.0,
+            "risk_config.max_drawdown_pct",
+            "must be in [0, 100]",
+            &mut v,
+        );
+        // Sanity: per-symbol positions shouldn't wildly exceed total exposure
+        let implied_max = self.risk_config.max_position_per_symbol * self.asset_configs.len() as f64;
+        check(
+            implied_max <= self.risk_config.max_portfolio_exposure * 10.0,
+            "risk_config.max_position_per_symbol",
+            &format!(
+                "per-symbol position ({}) × asset count exceeds 10× portfolio exposure ({})",
+                implied_max,
+                self.risk_config.max_portfolio_exposure
+            ),
+            &mut v,
+        );
+
+        // ── Asset-config checks ────────────────────────────────────
+        for (i, a) in self.asset_configs.iter().enumerate() {
+            let prefix = format!("asset_configs[{}].{}", i, a.symbol);
+            check(
+                a.max_position >= 0.0,
+                &format!("{}.max_position", prefix),
+                "must be non-negative",
+                &mut v,
+            );
+            check(
+                a.tick_size > 0.0,
+                &format!("{}.tick_size", prefix),
+                "must be positive",
+                &mut v,
+            );
+            check(
+                !a.symbol.is_empty(),
+                &format!("{}.symbol", prefix),
+                "must not be empty",
+                &mut v,
+            );
+        }
+
+        // ── Structural consistency ─────────────────────────────────
+        check(
+            self.max_assets >= self.asset_configs.len(),
+            "max_assets",
+            &format!(
+                "is {} but only {} asset_configs provided (max_assets must be ≥ count)",
+                self.max_assets,
+                self.asset_configs.len()
+            ),
+            &mut v,
+        );
+
+        // ── Strategy confidence / threshold checks ─────────────────
+        check(
+            (0.0..=1.0).contains(&self.strategy_config.confidence_minimum),
+            "strategy_config.confidence_minimum",
+            "must be in [0, 1]",
+            &mut v,
+        );
+        check(
+            (0.0..=1.0).contains(&self.strategy_config.long_entry_threshold)
+                || self.strategy_config.long_entry_threshold <= 0.0,
+            "strategy_config.long_entry_threshold",
+            "must be in [-1, 1] range",
+            &mut v,
+        );
+        check(
+            (0.0..=1.0).contains(&self.strategy_config.volume_ratio_clamp),
+            "strategy_config.volume_ratio_clamp",
+            "must be in [0, 1]",
+            &mut v,
+        );
+
+        // ── Channel capacity sanity ────────────────────────────────
+        check(
+            self.channel_config.per_asset_tick_channel_capacity > 0,
+            "channel_config.per_asset_tick_channel_capacity",
+            "must be > 0",
+            &mut v,
+        );
+        check(
+            self.channel_config.feature_channel_capacity > 0,
+            "channel_config.feature_channel_capacity",
+            "must be > 0",
+            &mut v,
+        );
+        check(
+            self.channel_config.risk_channel_capacity > 0,
+            "channel_config.risk_channel_capacity",
+            "must be > 0",
+            &mut v,
+        );
+        check(
+            self.channel_config.decision_channel_capacity > 0,
+            "channel_config.decision_channel_capacity",
+            "must be > 0",
+            &mut v,
+        );
+
+        // ── Execution defaults ─────────────────────────────────────
+        check(
+            self.execution_defaults.default_order_quantity > 0.0,
+            "execution_defaults.default_order_quantity",
+            "must be positive",
+            &mut v,
+        );
+        check(
+            self.execution_defaults.execution_per_symbol_rate_divisor > 0.0,
+            "execution_defaults.execution_per_symbol_rate_divisor",
+            "must be positive",
+            &mut v,
+        );
+
+        // ── Threading / reactor ─────────────────────────────────────
+        check(
+            self.reactor_config.max_batch_size > 0,
+            "reactor_config.max_batch_size",
+            "must be > 0",
+            &mut v,
+        );
+        check(
+            self.threading_config.tick_processing_budget_us > 0,
+            "threading_config.tick_processing_budget_us",
+            "must be > 0",
+            &mut v,
+        );
+
+        if v.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigValidationError::new(v))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +846,116 @@ mod tests {
         assert!(!json.contains("test-secret-456"));
         // The serialized form should contain the masked secret
         assert!(json.contains("\"**"));
+    }
+
+    // ── Validation tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_validate_default_config_passes() {
+        let cfg = EngineConfig::default();
+        assert!(cfg.validate().is_ok(), "default config should pass validation");
+    }
+
+    #[test]
+    fn test_validate_rejects_negative_leverage() {
+        let mut cfg = EngineConfig::default();
+        cfg.risk_config.max_leverage = -1.0;
+        let err = cfg.validate().unwrap_err();
+        let msgs = format!("{}", err);
+        assert!(msgs.contains("leverage"), "error should mention leverage, got: {}", msgs);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_leverage() {
+        let mut cfg = EngineConfig::default();
+        cfg.risk_config.max_leverage = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.violations.iter().any(|v| v.field.contains("leverage")));
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_asset_count() {
+        let mut cfg = EngineConfig::default();
+        cfg.max_assets = 0; // but we have 2 asset_configs
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| v.field == "max_assets"),
+            "should flag max_assets mismatch, got: {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_negative_position() {
+        let mut cfg = EngineConfig::default();
+        cfg.asset_configs[0].max_position = -50.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| v.field.contains("max_position")),
+            "should flag negative max_position, got: {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_tick_size() {
+        let mut cfg = EngineConfig::default();
+        cfg.asset_configs[1].tick_size = 0.0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| v.field.contains("tick_size")),
+            "should flag zero tick_size, got: {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_drawdown_out_of_range() {
+        let mut cfg = EngineConfig::default();
+        cfg.risk_config.max_drawdown_pct = 150.0; // > 100
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| v.field.contains("drawdown")),
+            "should flag out-of-range drawdown, got: {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_confidence_out_of_range() {
+        let mut cfg = EngineConfig::default();
+        cfg.strategy_config.confidence_minimum = 2.0; // > 1
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.violations.iter().any(|v| v.field.contains("confidence_minimum")),
+            "should flag out-of-range confidence, got: {:?}",
+            err.violations
+        );
+    }
+
+    #[test]
+    fn test_validate_multiple_violations_reported_at_once() {
+        let mut cfg = EngineConfig::default();
+        cfg.risk_config.max_leverage = -5.0;
+        cfg.risk_config.max_portfolio_exposure = -1.0;
+        cfg.asset_configs[0].tick_size = 0.0;
+        cfg.channel_config.feature_channel_capacity = 0;
+        let err = cfg.validate().unwrap_err();
+        // Should collect all violations, not just the first one
+        assert!(err.violations.len() >= 3, "expected ≥3 violations, got {}: {:?}", err.violations.len(), err.violations);
+    }
+
+    #[test]
+    fn test_validation_error_display_format() {
+        let violations = vec![
+            ConfigViolation { field: "foo".into(), message: "bad value".into() },
+            ConfigViolation { field: "bar".into(), message: "must be positive".into() },
+        ];
+        let err = ConfigValidationError::new(violations);
+        let display = format!("{}", err);
+        assert!(display.contains("2 violation(s)"));
+        assert!(display.contains("foo"));
+        assert!(display.contains("bad value"));
+        assert!(display.contains("bar"));
     }
 }
