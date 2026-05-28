@@ -135,6 +135,19 @@ pub struct StrategyConfig {
     pub max_short_units: f64,
     pub urgency_aggressive_threshold: f64,
     pub urgency_normal_threshold: f64,
+    pub allow_short: bool,
+    pub action_score_rsi_weight: f64,
+    pub action_score_macd_weight: f64,
+    pub action_score_volatility_weight: f64,
+    pub atr_penalty_threshold: f64,
+    pub atr_penalty_value: f64,
+    pub rsi_overbought: f64,
+    pub rsi_oversold: f64,
+    pub rsi_neutral: f64,
+    pub confidence_rsi_weight: f64,
+    pub confidence_macd_weight: f64,
+    pub confidence_regime_weight: f64,
+    pub volume_ratio_clamp: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +357,19 @@ impl Default for StrategyConfig {
             max_short_units: 100.0,
             urgency_aggressive_threshold: 0.85,
             urgency_normal_threshold: 0.5,
+            allow_short: true,
+            action_score_rsi_weight: 0.4,
+            action_score_macd_weight: 0.4,
+            action_score_volatility_weight: 0.2,
+            atr_penalty_threshold: 2.0,
+            atr_penalty_value: -0.2,
+            rsi_overbought: 70.0,
+            rsi_oversold: 30.0,
+            rsi_neutral: 50.0,
+            confidence_rsi_weight: 0.3,
+            confidence_macd_weight: 0.4,
+            confidence_regime_weight: 0.3,
+            volume_ratio_clamp: 0.3,
         }
     }
 }

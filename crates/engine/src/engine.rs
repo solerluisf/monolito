@@ -852,34 +852,7 @@ impl UnifiedEngine {
         let metrics = Arc::clone(&self.metrics);
         let pm = Arc::clone(&self.portfolio_manager);
 
-        let strategy = StrategyEngine::new(
-            symbol_id,
-            config.strategy_config.long_entry_threshold,
-            config.strategy_config.short_entry_threshold,
-            config.strategy_config.confidence_minimum,
-            config.strategy_config.hysteresis_deadband,
-            config.strategy_config.entry_cooldown_ms,
-            config.strategy_config.exit_cooldown_ms,
-            config.strategy_config.prediction_staleness_ns,
-            config.risk_config.allow_short,
-            config.strategy_config.trade_intent_ttl_ns,
-            config.strategy_config.max_long_units,
-            config.strategy_config.max_short_units,
-            config.strategy_config.urgency_aggressive_threshold,
-            config.strategy_config.urgency_normal_threshold,
-            config.model_config.action_score_rsi_weight,
-            config.model_config.action_score_macd_weight,
-            config.model_config.action_score_volatility_weight,
-            config.model_config.atr_penalty_threshold,
-            config.model_config.atr_penalty_value,
-            config.model_config.rsi_overbought,
-            config.model_config.rsi_oversold,
-            config.model_config.rsi_neutral,
-            config.model_config.confidence_rsi_weight,
-            config.model_config.confidence_macd_weight,
-            config.model_config.confidence_regime_weight,
-            config.feature_config.volume_ratio_clamp,
-        );
+        let strategy = StrategyEngine::new(symbol_id, &config.strategy_config);
 
         let strategy_arc = Arc::new(ArcSwap::new(Arc::new(Box::new(strategy) as Box<dyn strategy::Strategy>)));
 
@@ -1092,26 +1065,33 @@ impl UnifiedEngine {
                     };
 
                     let sid = self.symbol_registry.lock().lookup(&symbol).unwrap_or(SymbolId::from_raw(0));
-                    let new_strategy: Box<dyn strategy::Strategy> = Box::new(
-                        StrategyEngine::new(
-                            sid, long_entry, short_entry, confidence, deadband,
-                            entry_cooldown, exit_cooldown, staleness, allow_short,
-                            trade_intent_ttl_ns, max_long_units, max_short_units,
-                            urgency_aggressive_threshold, urgency_normal_threshold,
-                            model_cfg.action_score_rsi_weight,
-                            model_cfg.action_score_macd_weight,
-                            model_cfg.action_score_volatility_weight,
-                            model_cfg.atr_penalty_threshold,
-                            model_cfg.atr_penalty_value,
-                            model_cfg.rsi_overbought,
-                            model_cfg.rsi_oversold,
-                            model_cfg.rsi_neutral,
-                            model_cfg.confidence_rsi_weight,
-                            model_cfg.confidence_macd_weight,
-                            model_cfg.confidence_regime_weight,
-                            feature_cfg.volume_ratio_clamp,
-                        )
-                    );
+                    let mut strat_cfg = unified_trading_core::config::StrategyConfig::default();
+                    strat_cfg.long_entry_threshold = long_entry;
+                    strat_cfg.short_entry_threshold = short_entry;
+                    strat_cfg.confidence_minimum = confidence;
+                    strat_cfg.hysteresis_deadband = deadband;
+                    strat_cfg.entry_cooldown_ms = entry_cooldown;
+                    strat_cfg.exit_cooldown_ms = exit_cooldown;
+                    strat_cfg.prediction_staleness_ns = staleness;
+                    strat_cfg.allow_short = allow_short;
+                    strat_cfg.trade_intent_ttl_ns = trade_intent_ttl_ns;
+                    strat_cfg.max_long_units = max_long_units;
+                    strat_cfg.max_short_units = max_short_units;
+                    strat_cfg.urgency_aggressive_threshold = urgency_aggressive_threshold;
+                    strat_cfg.urgency_normal_threshold = urgency_normal_threshold;
+                    strat_cfg.action_score_rsi_weight = model_cfg.action_score_rsi_weight;
+                    strat_cfg.action_score_macd_weight = model_cfg.action_score_macd_weight;
+                    strat_cfg.action_score_volatility_weight = model_cfg.action_score_volatility_weight;
+                    strat_cfg.atr_penalty_threshold = model_cfg.atr_penalty_threshold;
+                    strat_cfg.atr_penalty_value = model_cfg.atr_penalty_value;
+                    strat_cfg.rsi_overbought = model_cfg.rsi_overbought;
+                    strat_cfg.rsi_oversold = model_cfg.rsi_oversold;
+                    strat_cfg.rsi_neutral = model_cfg.rsi_neutral;
+                    strat_cfg.confidence_rsi_weight = model_cfg.confidence_rsi_weight;
+                    strat_cfg.confidence_macd_weight = model_cfg.confidence_macd_weight;
+                    strat_cfg.confidence_regime_weight = model_cfg.confidence_regime_weight;
+                    strat_cfg.volume_ratio_clamp = feature_cfg.volume_ratio_clamp;
+                    let new_strategy: Box<dyn strategy::Strategy> = Box::new(StrategyEngine::new(sid, &strat_cfg));
                     strategy_ref.store(Arc::new(new_strategy));
                     tracing::info!(symbol = %symbol, from = %old_name, to = %strategy_type, "Strategy swapped");
                     ControlResponse::Ok

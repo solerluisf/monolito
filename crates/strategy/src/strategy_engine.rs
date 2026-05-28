@@ -137,66 +137,39 @@ fn atomic_to_f64(val: &AtomicU64) -> f64 {
 }
 
 impl StrategyEngine {
-    pub fn new(
-        symbol_id: SymbolId,
-        long_entry_threshold: f64,
-        short_entry_threshold: f64,
-        confidence_minimum: f64,
-        hysteresis_deadband: f64,
-        entry_cooldown_ms: u64,
-        exit_cooldown_ms: u64,
-        prediction_staleness_ns: u64,
-        allow_short: bool,
-        trade_intent_ttl_ns: u64,
-        max_long_units: f64,
-        max_short_units: f64,
-        urgency_aggressive_threshold: f64,
-        urgency_normal_threshold: f64,
-        action_score_rsi_weight: f64,
-        action_score_macd_weight: f64,
-        action_score_volatility_weight: f64,
-        atr_penalty_threshold: f64,
-        atr_penalty_value: f64,
-        rsi_overbought: f64,
-        rsi_oversold: f64,
-        rsi_neutral: f64,
-        confidence_rsi_weight: f64,
-        confidence_macd_weight: f64,
-        confidence_regime_weight: f64,
-        volume_ratio_clamp: f64,
-    ) -> Self {
+    pub fn new(symbol_id: SymbolId, config: &unified_trading_core::config::StrategyConfig) -> Self {
         Self {
-            symbol_id: symbol_id,
-            long_entry_threshold,
-            short_entry_threshold,
-            exit_threshold: 0.1,
-            confidence_minimum,
-            hysteresis_deadband,
-            entry_cooldown_ms,
-            exit_cooldown_ms,
-            prediction_staleness_ns,
-            trade_intent_ttl_ns,
+            symbol_id,
+            long_entry_threshold: config.long_entry_threshold,
+            short_entry_threshold: config.short_entry_threshold,
+            exit_threshold: config.exit_threshold,
+            confidence_minimum: config.confidence_minimum,
+            hysteresis_deadband: config.hysteresis_deadband,
+            entry_cooldown_ms: config.entry_cooldown_ms,
+            exit_cooldown_ms: config.exit_cooldown_ms,
+            prediction_staleness_ns: config.prediction_staleness_ns,
+            trade_intent_ttl_ns: config.trade_intent_ttl_ns,
             hysteresis_state: AtomicI32::new(0),
             last_entry_ns: AtomicU64::new(0),
             last_exit_ns: AtomicU64::new(0),
             net_position: f64_to_atomic(0.0),
-            max_long_units,
-            max_short_units,
-            allow_short,
-            urgency_aggressive_threshold,
-            urgency_normal_threshold,
-            action_score_rsi_weight,
-            action_score_macd_weight,
-            action_score_volatility_weight,
-            atr_penalty_threshold,
-            atr_penalty_value,
-            rsi_overbought,
-            rsi_oversold,
-            rsi_neutral,
-            confidence_rsi_weight,
-            confidence_macd_weight,
-            confidence_regime_weight,
-            volume_ratio_clamp,
+            max_long_units: config.max_long_units,
+            max_short_units: config.max_short_units,
+            allow_short: config.allow_short,
+            urgency_aggressive_threshold: config.urgency_aggressive_threshold,
+            urgency_normal_threshold: config.urgency_normal_threshold,
+            action_score_rsi_weight: config.action_score_rsi_weight,
+            action_score_macd_weight: config.action_score_macd_weight,
+            action_score_volatility_weight: config.action_score_volatility_weight,
+            atr_penalty_threshold: config.atr_penalty_threshold,
+            atr_penalty_value: config.atr_penalty_value,
+            rsi_overbought: config.rsi_overbought,
+            rsi_oversold: config.rsi_oversold,
+            rsi_neutral: config.rsi_neutral,
+            confidence_rsi_weight: config.confidence_rsi_weight,
+            confidence_macd_weight: config.confidence_macd_weight,
+            confidence_regime_weight: config.confidence_regime_weight,
+            volume_ratio_clamp: config.volume_ratio_clamp,
         }
     }
 
@@ -376,8 +349,7 @@ impl Strategy for StrategyEngine {
     }
 
     fn clone_box(&self) -> Box<dyn Strategy> {
-        Box::new(Self {
-            symbol_id: self.symbol_id,
+        let config = unified_trading_core::config::StrategyConfig {
             long_entry_threshold: self.long_entry_threshold,
             short_entry_threshold: self.short_entry_threshold,
             exit_threshold: self.exit_threshold,
@@ -387,15 +359,11 @@ impl Strategy for StrategyEngine {
             exit_cooldown_ms: self.exit_cooldown_ms,
             prediction_staleness_ns: self.prediction_staleness_ns,
             trade_intent_ttl_ns: self.trade_intent_ttl_ns,
-            hysteresis_state: AtomicI32::new(self.hysteresis_state.load(Ordering::Relaxed)),
-            last_entry_ns: AtomicU64::new(self.last_entry_ns.load(Ordering::Relaxed)),
-            last_exit_ns: AtomicU64::new(self.last_exit_ns.load(Ordering::Relaxed)),
-            net_position: AtomicU64::new(self.net_position.load(Ordering::Relaxed)),
             max_long_units: self.max_long_units,
             max_short_units: self.max_short_units,
-            allow_short: self.allow_short,
             urgency_aggressive_threshold: self.urgency_aggressive_threshold,
             urgency_normal_threshold: self.urgency_normal_threshold,
+            allow_short: self.allow_short,
             action_score_rsi_weight: self.action_score_rsi_weight,
             action_score_macd_weight: self.action_score_macd_weight,
             action_score_volatility_weight: self.action_score_volatility_weight,
@@ -408,7 +376,13 @@ impl Strategy for StrategyEngine {
             confidence_macd_weight: self.confidence_macd_weight,
             confidence_regime_weight: self.confidence_regime_weight,
             volume_ratio_clamp: self.volume_ratio_clamp,
-        })
+        };
+        let mut engine = Self::new(self.symbol_id, &config);
+        engine.hysteresis_state = AtomicI32::new(self.hysteresis_state.load(Ordering::Relaxed));
+        engine.last_entry_ns = AtomicU64::new(self.last_entry_ns.load(Ordering::Relaxed));
+        engine.last_exit_ns = AtomicU64::new(self.last_exit_ns.load(Ordering::Relaxed));
+        engine.net_position = AtomicU64::new(self.net_position.load(Ordering::Relaxed));
+        Box::new(engine)
     }
 }
 
@@ -419,12 +393,35 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_engine() -> StrategyEngine {
-        StrategyEngine::new(
-            SymbolId::from_raw(0), 0.6, -0.6, 0.5, 0.15, 5000, 2000, 150_000_000, true,
-            30_000_000_000, 100.0, 100.0, 0.85, 0.5,
-            0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
-            0.3, 0.4, 0.3, 0.3,
-        )
+        let config = unified_trading_core::config::StrategyConfig {
+            long_entry_threshold: 0.6,
+            short_entry_threshold: -0.6,
+            exit_threshold: 0.1,
+            confidence_minimum: 0.5,
+            hysteresis_deadband: 0.15,
+            entry_cooldown_ms: 5000,
+            exit_cooldown_ms: 2000,
+            prediction_staleness_ns: 150_000_000,
+            trade_intent_ttl_ns: 30_000_000_000,
+            max_long_units: 100.0,
+            max_short_units: 100.0,
+            urgency_aggressive_threshold: 0.85,
+            urgency_normal_threshold: 0.5,
+            allow_short: true,
+            action_score_rsi_weight: 0.4,
+            action_score_macd_weight: 0.4,
+            action_score_volatility_weight: 0.2,
+            atr_penalty_threshold: 2.0,
+            atr_penalty_value: -0.2,
+            rsi_overbought: 70.0,
+            rsi_oversold: 30.0,
+            rsi_neutral: 50.0,
+            confidence_rsi_weight: 0.3,
+            confidence_macd_weight: 0.4,
+            confidence_regime_weight: 0.3,
+            volume_ratio_clamp: 0.3,
+        };
+        StrategyEngine::new(SymbolId::from_raw(0), &config)
     }
 
     fn make_pred(score: f64, confidence: f64) -> Prediction {

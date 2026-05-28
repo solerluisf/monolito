@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crossbeam_channel::bounded;
 
-use unified_trading_core::config::BackpressurePolicy;
+use unified_trading_core::config::{BackpressurePolicy, StrategyConfig};
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::portfolio_manager::PortfolioManager;
@@ -108,12 +108,7 @@ fn test_full_pipeline_tick_to_intent() {
     let symbol_id = SymbolId::from_raw(0);
     let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
-    let strategy_engine = StrategyEngine::new(
-        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
-        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
-        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
-        0.3, 0.4, 0.3, 0.3,
-    );
+    let strategy_engine = StrategyEngine::new(symbol_id, &StrategyConfig::default());
 
     let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
@@ -194,12 +189,7 @@ fn test_pipeline_with_burst_ticks() {
     let symbol_id = SymbolId::from_raw(1);
     let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("MSFT", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
-    let strategy_engine = StrategyEngine::new(
-        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
-        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
-        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
-        0.3, 0.4, 0.3, 0.3,
-    );
+    let strategy_engine = StrategyEngine::new(symbol_id, &StrategyConfig::default());
 
     let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
@@ -280,12 +270,7 @@ fn test_kill_switch_stops_pipeline() {
     let symbol_id = SymbolId::from_raw(0);
     let normalizer = Normalizer::new(symbol_id);
     let feature_engine = FeatureEngine::new("AAPL", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5);
-    let strategy_engine = StrategyEngine::new(
-        symbol_id, 0.6, -0.6, 0.5, 0.15, 0, 0, 150_000_000, true,
-        30_000_000_000, 100.0, 100.0, 0.85, 0.5,
-        0.4, 0.4, 0.2, 2.0, -0.2, 70.0, 30.0, 50.0,
-        0.3, 0.4, 0.3, 0.3,
-    );
+    let strategy_engine = StrategyEngine::new(symbol_id, &StrategyConfig::default());
 
     let pred_engine = PredictionEngine::new(feature_rx, symbol_id);
     let inference_engine = InferenceEngine::new(
