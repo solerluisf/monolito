@@ -214,11 +214,22 @@ pub struct ThreadingConfig {
     pub execution_core_id: usize,
     pub heartbeat_core_id: usize,
     pub command_core_id: usize,
+    pub metrics_aggregator_core_id: usize,
     pub heartbeat_timeout_ns: u64,
     pub heartbeat_check_interval_ms: u64,
     #[serde(default = "default_tick_processing_budget_us")]
     pub tick_processing_budget_us: u64,
+    #[serde(default = "default_metrics_flush_interval_us")]
+    pub metrics_flush_interval_us: u64,
+    #[serde(default = "default_metrics_flush_tick_threshold")]
+    pub metrics_flush_tick_threshold: u64,
+    #[serde(default = "default_metrics_channel_capacity")]
+    pub metrics_channel_capacity: usize,
 }
+
+fn default_metrics_flush_interval_us() -> u64 { 10_000 } // 10ms
+fn default_metrics_flush_tick_threshold() -> u64 { 1_000 } // 1000 ticks
+fn default_metrics_channel_capacity() -> usize { 1_000 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionDefaults {
@@ -442,9 +453,13 @@ impl Default for ThreadingConfig {
             execution_core_id: 0,
             heartbeat_core_id: 0,
             command_core_id: 0,
+            metrics_aggregator_core_id: 0,
             heartbeat_timeout_ns: 2_000_000_000, // 2 seconds
             heartbeat_check_interval_ms: 500,
             tick_processing_budget_us: default_tick_processing_budget_us(),
+            metrics_flush_interval_us: default_metrics_flush_interval_us(),
+            metrics_flush_tick_threshold: default_metrics_flush_tick_threshold(),
+            metrics_channel_capacity: default_metrics_channel_capacity(),
         }
     }
 }

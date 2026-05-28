@@ -116,6 +116,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         risk_backpressure_policy: BackpressurePolicy::DropNewest,
         kill_switch: Arc::clone(&kill_switch),
         metrics: Arc::clone(&metrics),
+        local_metrics: None,
         prediction_staleness_ns: 1_000_000_000,
         default_order_quantity: 1.0,
         tick_processing_budget_us: 500,
