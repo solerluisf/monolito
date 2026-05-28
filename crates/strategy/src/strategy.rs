@@ -3,6 +3,22 @@ use unified_trading_core::symbol_registry::SymbolId;
 
 use crate::{SignalSide, SizeHint, TradeIntent, IntentType, Urgency};
 
+/// Marker trait indicating that a type is safe to store behind
+/// [`ArcSwap`](arc_swap::ArcSwap) and hot-swap at runtime.
+///
+/// Implementors guarantee:
+/// - No interior mutability via `Mutex`, `RwLock`, `RefCell`, or `Cell`.
+/// - All observable state is either immutable after construction or uses
+///   lock-free atomic primitives (`AtomicBool`, `AtomicI32`, `AtomicU64`, …).
+///
+/// This is a **sealed** super-trait of [`Strategy`] — you cannot implement
+/// `Strategy` without also satisfying this contract (via a blanket impl).
+pub trait HotSwappableStrategy: Send + Sync + 'static {}
+
+// Blanket impl: every Strategy is assumed HotSwappable unless audited otherwise.
+// The compile-time lint in immutability_lint.rs provides the real enforcement.
+impl<T: ?Sized + Strategy> HotSwappableStrategy for T {}
+
 pub struct SignalContext {
     pub symbol_id: SymbolId,
     pub net_position: f64,
@@ -35,7 +51,38 @@ impl SignalContext {
     }
 }
 
-pub trait Strategy: Send + Sync + 'static {
+/// # Hot-Swap Immutability Contract (Mandatory)
+///
+/// Every type that implements `Strategy` **may** be stored behind
+/// [`ArcSwap`](arc_swap::ArcSwap) and hot-swapped at runtime without
+/// stopping reader threads. This means:
+///
+/// 1. After construction, the struct must be **safe for concurrent reads**
+///    from any number of threads via `&self`.
+/// 2. The `evaluate()` method must not mutate observable state in a way
+///    that could be torn across fields during an atomic pointer swap.
+///
+/// ## Forbidden interior mutability
+/// - ❌ `Mutex<T>`, `RwLock<T>`, `RefCell<T>`, `Cell<T>` — these allow
+///   in-place mutation that readers on other threads could observe
+///   partially updated, leading to inconsistent trading decisions.
+/// - ❌ `OnceLock<T>`, `LazyLock<T>` — lazy initialisation is technically
+///   safe but introduces non-determinism during hot-swap; avoid.
+///
+/// ## Allowed patterns
+/// - ✅ `Atomic*` types (`AtomicI32`, `AtomicU64`, …) — each field is
+///   individually atomic and lock-free. Acceptable for counters, flags,
+///   hysteresis state, etc. (used by `StrategyEngine`).
+/// - ✅ Pure configuration fields (`f64`, `String`, `bool`, …).
+/// - ✅ Pre-computed lookup tables owned by the struct.
+///
+/// ## Enforcement
+/// The compile-time lint in `crates/engine/tests/immutability_lint.rs`
+/// will fail to compile if a `Strategy` implementation contains forbidden
+/// types. All new `Strategy` implementations must pass this lint.
+///
+/// See also: [`HotSwappableStrategy`] marker trait for explicit opt-in.
+pub trait Strategy: Send + Sync + HotSwappableStrategy + 'static {
     fn name(&self) -> &str;
 
     fn evaluate(

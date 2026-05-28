@@ -10,7 +10,28 @@ use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use crate::model_registry::ModelRegistry;
 
-#[derive(Debug, Clone)]
+/// Model output produced by `PredictionEngine` and consumed by `Strategy`.
+///
+/// # Immutability Contract (Mandatory)
+///
+/// This struct is stored behind [`ArcSwap`](arc_swap::ArcSwap) in
+/// `AssetProcessor.latest_pred` and hot-swapped on every inference tick.
+/// **All fields must be plain data — no interior mutability.**
+///
+/// ## Forbidden types inside `Prediction`
+/// - `Mutex<T>`, `RwLock<T>`, `RefCell<T>`, `Cell<T>` — these allow
+///   in-place mutation that other threads could observe mid-update, causing
+///   torn reads across fields during a hot-swap.
+/// - Any heap-allocated mutable shared state (`Arc<Mutex<…>>`, etc.).
+///
+/// ## Allowed types
+/// - `Copy` primitives (`f32`, `i32`, `u64`, …)
+/// - Value-types that own their data (`String`, `Vec<T>` when T is immutable)
+/// - `SymbolId`, other newtype wrappers around primitives
+///
+/// The compile-time lint in `crates/engine/tests/immutability_lint.rs`
+/// will **fail to compile** if any forbidden type is added. Do not bypass it.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prediction {
     pub symbol_id: SymbolId,
     pub forecast: f32,

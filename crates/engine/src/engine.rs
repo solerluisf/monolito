@@ -65,6 +65,35 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 use std::time::Instant;
 
+// ══════════════════════════════════════════════════════════════════
+//  ARC-SWAP HOT-SWAP INVARIANT (ISSUE-035)
+// ══════════════════════════════════════════════════════════════════
+//
+//  `ArcSwap` atomically swaps a pointer — readers always see either
+//  the old value or the new value, never a partial mix. BUT this
+//  guarantee ONLY holds if the pointed-to struct is fully constructed
+//  before being stored AND does not contain interior mutability that
+//  could be observed mid-update by concurrent readers.
+//
+//  Consequence of violation:
+//    If a struct behind ArcSwap has a Mutex field F1 and a plain field
+//    F2, a writer could lock F1, update it, then store the Arc. A reader
+//    loading the Arc concurrently sees the new F1 but old F2 → torn read
+//    across fields → inconsistent trading signal / wrong risk decision.
+//
+//  Enforced by:
+//    • `Strategy` trait requires `HotSwappableStrategy` super-trait
+//      (see crates/strategy/src/strategy.rs for full contract).
+//    • `Prediction` is a POD struct with explicit immutability docs
+//      (see crates/model/src/prediction_engine.rs).
+//    • Compile-time lint in tests/immutability_lint.rs catches any
+//      forbidden type (Mutex/RwLock/RefCell/Cell) at CI time.
+//
+//  DO NOT add interior-mutable fields to structs stored in these types:
+//    - `StrategySwapRef`  (below)
+//    - `PredictionRef`    (below)
+// ══════════════════════════════════════════════════════════════════
+
 /// Phases of a staged config rollout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RolloutPhase {
@@ -85,7 +114,21 @@ pub struct StagedRolloutState {
     pub monitoring_duration_secs: u64,
 }
 
+/// Shared reference to a hot-swappable strategy.
+///
+/// # Invariant
+/// The `Box<dyn Strategy>` inside **must** satisfy the
+/// [`HotSwappableStrategy`](strategy::HotSwappableStrategy) contract:
+/// no `Mutex`, `RwLock`, `RefCell`, or `Cell` fields.
+/// See the ARC-SWAP HOT-SWAP INVARIANT block above this module.
 pub type StrategySwapRef = Arc<ArcSwap<Box<dyn strategy::Strategy>>>;
+
+/// Shared reference to a hot-swappable prediction.
+///
+/// # Invariant
+/// `Prediction` is a plain data struct — all fields are `Copy`
+/// primitives. No interior mutability allowed.
+/// See the ARC-SWAP HOT-SWAP INVARIANT block above this module.
 type PredictionRef = Arc<ArcSwap<Prediction>>;
 
 pub struct AssetProcessor {
