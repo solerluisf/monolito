@@ -35,6 +35,7 @@ fn test_arc_swap_prediction_concurrent() {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64,
+                    trace_id: 1,
                 };
                 pred.store(Arc::new(new_pred));
                 wc.fetch_add(1, Ordering::Relaxed);
@@ -96,6 +97,7 @@ fn test_arc_swap_strategy_hot_swap() {
                     0.8,
                     prediction.action_score as f64,
                     30_000_000_000,
+                    prediction.trace_id,
                 ))
             } else {
                 None
@@ -136,6 +138,7 @@ fn test_arc_swap_strategy_hot_swap() {
                 regime_label: 0,
                 regime_strength: 0.5,
                 computed_ns: 0,
+                trace_id: 1,
             };
             let s = strat.load_full();
             let _ = s.evaluate(&pred, &ctx);

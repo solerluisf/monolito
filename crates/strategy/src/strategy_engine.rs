@@ -63,6 +63,7 @@ impl TradeIntent {
         confidence: f64,
         action_score: f64,
         ttl_ns: u64,
+        trace_id: u64,
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -80,7 +81,7 @@ impl TradeIntent {
             action_score,
             timestamp_ns: now,
             expires_ns: now + ttl_ns,
-            trace_id: 0,
+            trace_id,
         }
     }
 
@@ -214,7 +215,7 @@ impl StrategyEngine {
             return None;
         }
 
-        if let Some(intent) = self.apply_hysteresis(score) {
+        if let Some(intent) = self.apply_hysteresis(score, prediction.trace_id) {
             if self.check_position_gate(&intent) {
                 return Some(intent);
             }
@@ -238,7 +239,7 @@ impl StrategyEngine {
         }
     }
 
-    fn apply_hysteresis(&self, score: f64) -> Option<TradeIntent> {
+    fn apply_hysteresis(&self, score: f64, trace_id: u64) -> Option<TradeIntent> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -257,6 +258,7 @@ impl StrategyEngine {
                         0.5,
                         score,
                         self.trade_intent_ttl_ns,
+                        trace_id,
                     ))
                 } else if score < self.short_entry_threshold && self.allow_short {
                     self.hysteresis_state.store(-1, Ordering::Relaxed);
@@ -269,6 +271,7 @@ impl StrategyEngine {
                         0.5,
                         score,
                         self.trade_intent_ttl_ns,
+                        trace_id,
                     ))
                 } else {
                     None
@@ -286,6 +289,7 @@ impl StrategyEngine {
                         0.5,
                         score,
                         self.trade_intent_ttl_ns,
+                        trace_id,
                     ))
                 } else {
                     None
@@ -303,6 +307,7 @@ impl StrategyEngine {
                         0.5,
                         score,
                         self.trade_intent_ttl_ns,
+                        trace_id,
                     ))
                 } else {
                     None
@@ -435,6 +440,24 @@ mod tests {
             regime_label: 0,
             regime_strength: 0.5,
             computed_ns: now,
+            trace_id: 0,
+        }
+    }
+
+    fn make_pred_with_trace(score: f64, confidence: f64, trace_id: u64) -> Prediction {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Prediction {
+            symbol_id: SymbolId::from_raw(0),
+            forecast: score as f32,
+            confidence: confidence as f32,
+            action_score: score as f32,
+            regime_label: 0,
+            regime_strength: 0.5,
+            computed_ns: now,
+            trace_id,
         }
     }
 
@@ -494,5 +517,42 @@ mod tests {
         let pred = make_pred(0.8, 0.9);
         let intent = engine.evaluate(&pred);
         assert!(intent.is_none());
+    }
+
+    #[test]
+    fn test_strategy_trace_id_propagation() {
+        let engine = make_engine();
+        let trace_id = 12345u64;
+        let pred = make_pred_with_trace(0.8, 0.9, trace_id);
+        let intent = engine.evaluate(&pred);
+        assert!(intent.is_some());
+        let intent = intent.unwrap();
+        assert_eq!(intent.trace_id, trace_id);
+    }
+
+    #[test]
+    fn test_strategy_trace_id_propagation_short() {
+        let engine = make_engine();
+        let trace_id = 67890u64;
+        let pred = make_pred_with_trace(-0.8, 0.9, trace_id);
+        let intent = engine.evaluate(&pred);
+        assert!(intent.is_some());
+        let intent = intent.unwrap();
+        assert_eq!(intent.trace_id, trace_id);
+    }
+
+    #[test]
+    fn test_strategy_trace_id_propagation_exit() {
+        let engine = make_engine();
+        // First enter a long position
+        let pred_enter = make_pred_with_trace(0.8, 0.9, 111);
+        engine.evaluate(&pred_enter);
+        
+        // Then trigger an exit
+        let pred_exit = make_pred_with_trace(0.3, 0.9, 222);
+        let intent = engine.evaluate(&pred_exit);
+        assert!(intent.is_some());
+        let intent = intent.unwrap();
+        assert_eq!(intent.trace_id, 222);
     }
 }

@@ -15,6 +15,8 @@ pub struct Prediction {
     pub regime_label: i32,
     pub regime_strength: f32,
     pub computed_ns: u64,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 impl Prediction {
@@ -35,6 +37,7 @@ impl Prediction {
             regime_label: 0,
             regime_strength: 0.0,
             computed_ns: 0,
+            trace_id: 0,
         }
     }
 
@@ -58,6 +61,7 @@ impl Prediction {
             regime_label,
             regime_strength,
             computed_ns: now,
+            trace_id: features.trace_id,
         }
     }
 
@@ -81,6 +85,7 @@ impl Prediction {
             regime_label: features.get(FeatureIndex::Regime) as i32,
             regime_strength: features.get(FeatureIndex::RegimeStrength),
             computed_ns: now,
+            trace_id: features.trace_id,
         }
     }
 }
@@ -167,6 +172,7 @@ mod tests {
             regime_label: 0,
             regime_strength: 0.5,
             computed_ns: 0,
+            trace_id: 1,
         };
         assert!(pred.is_stale(1000));
     }
@@ -185,6 +191,7 @@ mod tests {
             regime_label: 0,
             regime_strength: 0.5,
             computed_ns: now,
+            trace_id: 2,
         };
         assert!(!pred.is_stale(1_000_000_000));
     }
@@ -206,7 +213,7 @@ mod tests {
         let symbol_id = SymbolId::from_raw(0);
         let engine = PredictionEngine::new(rx, symbol_id);
 
-        let mut fv = FeatureVector::new(symbol_id, 1000);
+        let mut fv = FeatureVector::new(symbol_id, 1000, 42);
         fv.set(FeatureIndex::MidPrice, 150.0);
         tx.send(fv).unwrap();
 
@@ -223,6 +230,7 @@ mod tests {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64,
+                trace_id: features.trace_id,
             }
         }, 0);
 
@@ -232,5 +240,6 @@ mod tests {
 
         let pred = engine.get_prediction();
         assert!((pred.forecast - 150.0).abs() < 0.01);
+        assert_eq!(pred.trace_id, 42);
     }
 }

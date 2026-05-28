@@ -107,6 +107,7 @@ impl AlpacaTrade {
             last_price: self.p,
             last_size: self.s,
             exchange: self.x.clone(),
+            trace_id: 0, // Will be assigned by TickReactor
         })
     }
 }
@@ -123,6 +124,7 @@ impl AlpacaQuote {
             last_price: (self.bp + self.ap) / 2.0,
             last_size: self.bs.min(self.as_size),
             exchange: self.bx.clone(),
+            trace_id: 0, // Will be assigned by TickReactor
         })
     }
 }
@@ -434,6 +436,7 @@ impl AlpacaWebSocketFeed {
                                         last_price: bar.c,
                                         last_size: bar.v,
                                         exchange: "BAR".to_string(),
+                                        trace_id: 0, // Will be assigned by TickReactor
                                     };
                                     self.buffer_tick(tick.clone());
                                     let _ = self.tick_tx.try_send(tick);

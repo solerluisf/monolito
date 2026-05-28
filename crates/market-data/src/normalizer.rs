@@ -12,6 +12,9 @@ pub struct RawTick {
     pub last_price: f64,
     pub last_size: u64,
     pub exchange: String,
+    /// Unique trace ID for causal tracing across the pipeline.
+    /// Generated at tick ingestion and propagated through all subsequent stages.
+    pub trace_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +29,8 @@ pub struct NormalizedTick {
     pub bid_size: u64,
     pub ask_size: u64,
     pub volume: u64,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +96,7 @@ impl Normalizer {
             bid_size: raw.bid_size,
             ask_size: raw.ask_size,
             volume: raw.last_size,
+            trace_id: raw.trace_id,
         }, gap))
     }
 
@@ -186,11 +192,13 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 1,
         };
         let (normalized, _gap) = norm.process(raw).unwrap();
         assert_eq!(normalized.symbol_id, symbol_id);
         assert!((normalized.mid_price - 150.025).abs() < 0.001);
         assert!((normalized.spread - 0.05).abs() < 0.001);
+        assert_eq!(normalized.trace_id, 1);
     }
 
     #[test]
@@ -207,6 +215,7 @@ mod tests {
             last_price: 400.02,
             last_size: 10,
             exchange: "IEX".to_string(),
+            trace_id: 2,
         };
         let (normalized, _gap) = norm.process(raw).unwrap();
         assert!((normalized.spread_bps - 1.0).abs() < 0.01);
@@ -226,6 +235,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 3,
         }).unwrap();
         assert!(norm.check_sequence(2).is_none());
         assert!(norm.check_sequence(5).is_some());
@@ -245,6 +255,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 4,
         }).unwrap();
         assert!(!norm.check_staleness(1_100_000_000, 200_000_000));
         assert!(norm.check_staleness(1_300_000_000, 200_000_000));
@@ -285,6 +296,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 5,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -303,6 +315,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 6,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -321,6 +334,7 @@ mod tests {
             last_price: 0.0,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 7,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -339,6 +353,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 8,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -357,6 +372,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 9,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -375,6 +391,7 @@ mod tests {
             last_price: 150.02,
             last_size: 50,
             exchange: "IEX".to_string(),
+            trace_id: 10,
         };
         let result = norm.process(raw);
         assert!(result.is_some());

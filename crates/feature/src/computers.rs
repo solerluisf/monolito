@@ -146,7 +146,7 @@ impl FeatureEngine {
             tick.spread,
         );
 
-        let mut fv = FeatureVector::new(tick.symbol_id, tick.timestamp_ns);
+        let mut fv = FeatureVector::new(tick.symbol_id, tick.timestamp_ns, tick.trace_id);
 
         let (mid, spread_bps, spread_abs) = PriceComputer::compute(&self.window_manager, tick);
         // Clamp spread_bps to a sane max (500 bps = 5%) to avoid poisoning from corrupt data
@@ -239,6 +239,7 @@ mod tests {
             bid_size: 100,
             ask_size: 200,
             volume: 50,
+            trace_id: 1,
         }
     }
 

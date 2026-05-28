@@ -33,6 +33,7 @@ impl StrategyEngineExt for StrategyEngine {
                 confidence as f64,
                 action_score as f64,
                 self.trade_intent_ttl_ns,
+                features.trace_id,
             ))
         } else if action_score < self.short_entry_threshold as f32 {
             Some(TradeIntent::new(
@@ -43,6 +44,7 @@ impl StrategyEngineExt for StrategyEngine {
                 confidence as f64,
                 action_score as f64,
                 self.trade_intent_ttl_ns,
+                features.trace_id,
             ))
         } else {
             None

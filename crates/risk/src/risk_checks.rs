@@ -17,6 +17,8 @@ pub struct RiskCheckRequest {
     pub timestamp_ns: u64,
     pub current_volatility: f64,
     pub current_spread_bps: f64,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,8 @@ pub struct RiskDecision {
     pub check_index: usize,
     pub timestamp_ns: u64,
     pub request: RiskCheckRequest,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 impl RiskDecision {
@@ -43,6 +47,7 @@ impl RiskDecision {
                 .unwrap_or_default()
                 .as_nanos() as u64,
             request: request.clone(),
+            trace_id: request.trace_id,
         }
     }
 
@@ -58,6 +63,7 @@ impl RiskDecision {
                 .unwrap_or_default()
                 .as_nanos() as u64,
             request: request.clone(),
+            trace_id: request.trace_id,
         }
     }
 }
@@ -304,6 +310,26 @@ mod tests {
             timestamp_ns: now,
             current_volatility: 0.01,
             current_spread_bps: 10.0,
+            trace_id: 1,
+        }
+    }
+
+    fn make_request_with_trace(symbol_id: SymbolId, quantity: f64, price: f64, trace_id: u64) -> RiskCheckRequest {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        RiskCheckRequest {
+            request_id: next_request_id(),
+            symbol_id,
+            intent_id: next_intent_id(),
+            side: 1,
+            quantity,
+            price,
+            timestamp_ns: now,
+            current_volatility: 0.01,
+            current_spread_bps: 10.0,
+            trace_id,
         }
     }
 
@@ -472,5 +498,29 @@ mod tests {
         let decision = engine.check(&request, false);
         assert!(decision.approved);
         assert!(decision.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_risk_decision_trace_id_propagation_approved() {
+        let config = RiskConfig::default();
+        let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+        let symbol_id = SymbolId::from_raw(0);
+        let trace_id = 99999u64;
+        let request = make_request_with_trace(symbol_id, 10.0, 150.0, trace_id);
+        let decision = engine.check(&request, false);
+        assert!(decision.approved);
+        assert_eq!(decision.trace_id, trace_id);
+    }
+
+    #[test]
+    fn test_risk_decision_trace_id_propagation_rejected() {
+        let config = RiskConfig::default();
+        let mut engine = RiskEngine::new(config, Arc::new(PortfolioManager::new(100_000.0, 0.001)));
+        let symbol_id = SymbolId::from_raw(0);
+        let trace_id = 88888u64;
+        let request = make_request_with_trace(symbol_id, 10.0, 150.0, trace_id);
+        let decision = engine.check(&request, true); // kill switch active
+        assert!(!decision.approved);
+        assert_eq!(decision.trace_id, trace_id);
     }
 }

@@ -275,6 +275,7 @@ impl AssetProcessor {
             timestamp_ns: now,
             current_volatility,
             current_spread_bps,
+            trace_id: signal.trace_id,
         }
     }
 }

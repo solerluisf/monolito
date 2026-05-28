@@ -29,6 +29,7 @@ fn make_raw_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> RawTick
         last_price: mid,
         last_size: 50,
         exchange: "IEX".to_string(),
+        trace_id: ts,
     }
 }
 
@@ -78,6 +79,7 @@ fn run_processor(
                     timestamp_ns: now,
                     current_volatility: 0.01,
                     current_spread_bps: 10.0,
+                    trace_id: signal.trace_id,
                 };
                 match risk_tx.try_send(request) {
                     Ok(()) => {

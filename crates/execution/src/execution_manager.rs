@@ -155,6 +155,7 @@ impl ExecutionManager {
             stop_price: None,
             time_in_force: TimeInForce::Day,
             correlation_id: decision.request_id.to_string(),
+            trace_id: decision.trace_id,
         };
 
         // Persist to journal BEFORE submitting to broker for critical commands
@@ -196,7 +197,8 @@ impl ExecutionManager {
                     OrderLifecycleEventType::Submitted,
                     now,
                 )
-                .with_status("submitted".to_string());
+                .with_status("submitted".to_string())
+                .with_trace_id(decision.trace_id);
 
                 self.metrics.lifecycle_channel_depth.fetch_add(1, Ordering::Relaxed);
                 let _ = self.lifecycle_tx.send(lifecycle_event);
@@ -223,7 +225,7 @@ impl ExecutionManager {
         }
     }
 
-    pub fn on_fill(&mut self, order_id: &str, symbol: &str, filled_qty: f64, fill_price: f64) {
+    pub fn on_fill(&mut self, order_id: &str, symbol: &str, filled_qty: f64, fill_price: f64, trace_id: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -246,14 +248,15 @@ impl ExecutionManager {
             now,
         )
         .with_fill(filled_qty, fill_price)
-        .with_status("filled".to_string());
+        .with_status("filled".to_string())
+        .with_trace_id(trace_id);
 
         let _ = self.lifecycle_tx.send(lifecycle_event);
 
-        tracing::info!(order_id = %order_id, symbol = %symbol, qty = filled_qty, price = fill_price, "Order filled");
+        tracing::info!(order_id = %order_id, symbol = %symbol, qty = filled_qty, price = fill_price, trace_id = trace_id, "Order filled");
     }
 
-    pub fn on_reject(&mut self, order_id: &str, symbol: &str, reason: &str) {
+    pub fn on_reject(&mut self, order_id: &str, symbol: &str, reason: &str, trace_id: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -269,12 +272,13 @@ impl ExecutionManager {
             OrderLifecycleEventType::Rejected,
             now,
         )
-        .with_status(format!("rejected: {}", reason));
+        .with_status(format!("rejected: {}", reason))
+        .with_trace_id(trace_id);
 
         let _ = self.lifecycle_tx.send(lifecycle_event);
     }
 
-    pub fn on_cancel(&mut self, order_id: &str, symbol: &str) {
+    pub fn on_cancel(&mut self, order_id: &str, symbol: &str, trace_id: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -293,7 +297,8 @@ impl ExecutionManager {
             OrderLifecycleEventType::Cancelled,
             now,
         )
-        .with_status("cancelled".to_string());
+        .with_status("cancelled".to_string())
+        .with_trace_id(trace_id);
 
         let _ = self.lifecycle_tx.send(lifecycle_event);
     }
@@ -340,6 +345,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             timestamp_ns: now,
             current_volatility: 0.01,
             current_spread_bps: 10.0,
+            trace_id: 1,
         };
         RiskDecision {
             request_id: request.request_id,
@@ -349,6 +355,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             check_index: 14,
             timestamp_ns: now,
             request,
+            trace_id: 1,
         }
     }
 
@@ -458,7 +465,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             let mut tracker = manager.order_tracker.lock();
             tracker.create_order("AAPL", "buy", 10.0, None, "corr-1")
         };
-        manager.on_fill(&order_id, "AAPL", 10.0, 150.0);
+        manager.on_fill(&order_id, "AAPL", 10.0, 150.0, 42);
         assert_eq!(metrics.orders_filled.load(Ordering::Relaxed), 1);
 
         let pos = portfolio_manager.get_position("AAPL").unwrap();

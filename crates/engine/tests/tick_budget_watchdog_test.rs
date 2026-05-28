@@ -51,6 +51,7 @@ fn make_tick(symbol_id: SymbolId, ts: u64) -> RawTick {
         last_price: 100.05,
         last_size: 1,
         exchange: "TEST".to_string(),
+        trace_id: ts,
     }
 }
 
@@ -77,6 +78,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64,
+        trace_id: 1,
     });
     let latest_pred = Arc::new(ArcSwap::new(prediction));
 

@@ -51,6 +51,7 @@ mod tests {
             stop_price: None,
             time_in_force: TimeInForce::Day,
             correlation_id: "corr-1".to_string(),
+            trace_id: 1,
         };
         let result = adapter.submit_order(&cmd);
         assert!(result.is_ok());

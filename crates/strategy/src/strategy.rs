@@ -72,6 +72,7 @@ pub fn build_entry_intent(
     ttl_ns: u64,
     aggressive_threshold: f32,
     normal_threshold: f32,
+    trace_id: u64,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
         symbol_id,
@@ -81,6 +82,7 @@ pub fn build_entry_intent(
         confidence,
         action_score,
         ttl_ns,
+        trace_id,
     );
     intent.urgency = urgency_from_score(action_score as f32, aggressive_threshold, normal_threshold);
     intent
@@ -94,6 +96,7 @@ pub fn build_exit_intent(
     ttl_ns: u64,
     aggressive_threshold: f32,
     normal_threshold: f32,
+    trace_id: u64,
 ) -> TradeIntent {
     let mut intent = TradeIntent::new(
         symbol_id,
@@ -103,6 +106,7 @@ pub fn build_exit_intent(
         confidence,
         action_score,
         ttl_ns,
+        trace_id,
     );
     intent.urgency = urgency_from_score(action_score as f32, aggressive_threshold, normal_threshold);
     intent
@@ -122,19 +126,21 @@ mod tests {
     #[test]
     fn test_build_entry_intent() {
         let sid = SymbolId::from_raw(0);
-        let intent = build_entry_intent(sid, SignalSide::Long, 0.75, 0.67, 100, 30_000_000_000, 0.85, 0.5);
+        let intent = build_entry_intent(sid, SignalSide::Long, 0.75, 0.67, 100, 30_000_000_000, 0.85, 0.5, 1);
         assert_eq!(intent.symbol_id.as_u16(), 0);
         assert!(matches!(intent.side, SignalSide::Long));
         assert!(matches!(intent.size_hint, SizeHint::Units(100)));
         assert!(matches!(intent.intent_type, IntentType::Entry));
+        assert_eq!(intent.trace_id, 1);
     }
 
     #[test]
     fn test_build_exit_intent() {
         let sid = SymbolId::from_raw(0);
-        let intent = build_exit_intent(sid, SignalSide::Flatten, 0.90, 0.90, 30_000_000_000, 0.85, 0.5);
+        let intent = build_exit_intent(sid, SignalSide::Flatten, 0.90, 0.90, 30_000_000_000, 0.85, 0.5, 2);
         assert_eq!(intent.symbol_id.as_u16(), 0);
         assert!(matches!(intent.side, SignalSide::Flatten));
         assert!(matches!(intent.intent_type, IntentType::Exit));
+        assert_eq!(intent.trace_id, 2);
     }
 }

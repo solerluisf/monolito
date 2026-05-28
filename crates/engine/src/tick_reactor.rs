@@ -7,7 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
-use unified_trading_core::symbol_registry::{SymbolId, SymbolRegistry, SymbolIdArray};
+use unified_trading_core::symbol_registry::{SymbolId, SymbolRegistry, SymbolIdArray, next_trace_id};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 use market_data::RawTick;
@@ -163,9 +163,12 @@ impl TickReactor {
         for tick in batch.drain(..) {
             self.total_ticks.fetch_add(1, Ordering::Relaxed);
             let symbol_id = tick.symbol_id;
+            let trace_id = next_trace_id();
 
             if let Some(tx) = self.handler_array.get(symbol_id) {
-                match tx.try_send(tick) {
+                let mut tick_with_trace = tick;
+                tick_with_trace.trace_id = trace_id;
+                match tx.try_send(tick_with_trace) {
                     Ok(()) => {
                         if let Some(handler) = self.handlers.get_mut(&symbol_id) {
                             handler.tick_count += 1;
@@ -180,6 +183,7 @@ impl TickReactor {
                             if handler.dropped_count % self.backpressure_log_interval == 0 {
                                 tracing::warn!(
                                     symbol_id = %symbol_id,
+                                    trace_id = trace_id,
                                     dropped = handler.dropped_count,
                                     "Back-pressure: tick channel full"
                                 );
@@ -187,11 +191,11 @@ impl TickReactor {
                         }
                     }
                     Err(TrySendError::Disconnected(_)) => {
-                        tracing::warn!(symbol_id = %symbol_id, "Handler disconnected");
+                        tracing::warn!(symbol_id = %symbol_id, trace_id = trace_id, "Handler disconnected");
                     }
                 }
             } else {
-                tracing::debug!(symbol_id = %symbol_id, "Received tick for unregistered symbol_id");
+                tracing::debug!(symbol_id = %symbol_id, trace_id = trace_id, "Received tick for unregistered symbol_id");
             }
         }
     }
@@ -280,6 +284,7 @@ mod tests {
             last_price: 150.0,
             last_size: 100,
             exchange: "V".to_string(),
+            trace_id: 0,
         };
 
         tick_tx.send(tick.clone()).unwrap();
@@ -288,6 +293,7 @@ mod tests {
 
         let received = handler_rx.try_recv().unwrap();
         assert_eq!(received.symbol_id, symbol_id);
+        assert!(received.trace_id > 0);
     }
 
     #[test]
@@ -314,6 +320,7 @@ mod tests {
             last_price: 150.0,
             last_size: 100,
             exchange: "V".to_string(),
+            trace_id: 0,
         };
 
         tick_tx.send(tick).unwrap();
@@ -341,6 +348,7 @@ mod tests {
             last_price: 150.0,
             last_size: 100,
             exchange: "V".to_string(),
+            trace_id: 0,
         };
 
         tick_tx.send(tick.clone()).unwrap();

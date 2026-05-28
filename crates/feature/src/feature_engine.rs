@@ -55,15 +55,18 @@ pub struct FeatureVector {
     pub values: [f32; FEATURE_COUNT],
     /// Schema version for training/serving skew detection
     pub feature_schema_version: u32,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 impl FeatureVector {
-    pub fn new(symbol_id: SymbolId, timestamp_ns: u64) -> Self {
+    pub fn new(symbol_id: SymbolId, timestamp_ns: u64, trace_id: u64) -> Self {
         Self {
             symbol_id,
             timestamp_ns,
             values: [0.0f32; FEATURE_COUNT],
             feature_schema_version: FEATURE_SCHEMA_VERSION,
+            trace_id,
         }
     }
 
@@ -396,12 +399,13 @@ mod tests {
     #[test]
     fn test_feature_vector() {
         let symbol_id = SymbolId::from_raw(0);
-        let mut fv = FeatureVector::new(symbol_id, 1000);
+        let mut fv = FeatureVector::new(symbol_id, 1000, 1);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 65.0);
         assert_eq!(fv.len(), FEATURE_COUNT);
         assert_eq!(fv.get(FeatureIndex::MidPrice), 150.0);
         assert_eq!(fv.get(FeatureIndex::Confidence), 0.0);
+        assert_eq!(fv.trace_id, 1);
     }
 
     #[test]
@@ -458,7 +462,7 @@ mod tests {
     #[test]
     fn test_feature_vector_to_array() {
         let symbol_id = SymbolId::from_raw(0);
-        let mut fv = FeatureVector::new(symbol_id, 1000);
+        let mut fv = FeatureVector::new(symbol_id, 1000, 2);
         fv.set(FeatureIndex::MidPrice, 1.0);
         fv.set(FeatureIndex::Rsi14, 2.0);
         let arr: [f32; 5] = fv.to_array();

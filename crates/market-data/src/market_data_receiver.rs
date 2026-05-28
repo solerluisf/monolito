@@ -83,6 +83,7 @@ mod tests {
                 last_price: 150.02,
                 last_size: 50,
                 exchange: "IEX".to_string(),
+                trace_id: i as u64,
             })
             .unwrap();
         }
@@ -108,6 +109,7 @@ mod tests {
                 last_price: 150.02,
                 last_size: 50,
                 exchange: "IEX".to_string(),
+                trace_id: i as u64,
             })
             .unwrap();
         }

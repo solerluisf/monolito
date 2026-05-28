@@ -13,6 +13,8 @@ pub struct OrderCommand {
     pub stop_price: Option<f64>,
     pub time_in_force: TimeInForce,
     pub correlation_id: String,
+    /// Trace ID propagated from RawTick for causal tracing.
+    pub trace_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +490,7 @@ mod tests {
             stop_price: None,
             time_in_force: TimeInForce::Day,
             correlation_id: "corr-1".to_string(),
+            trace_id: 42,
         };
         let result = port.submit_order(&cmd);
         assert!(result.is_ok());

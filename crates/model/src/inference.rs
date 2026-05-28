@@ -79,6 +79,7 @@ impl InferenceEngine {
             regime_label: regime as i32,
             regime_strength,
             computed_ns: now,
+            trace_id: features.trace_id,
         }
     }
 
@@ -181,7 +182,7 @@ use unified_trading_core::symbol_registry::SymbolId;
     }
 
     fn make_features() -> FeatureVector {
-        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000, 1);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 55.0);
         fv.set(FeatureIndex::MacdHistogram, 0.3);
@@ -209,7 +210,7 @@ use unified_trading_core::symbol_registry::SymbolId;
     #[test]
     fn test_inference_engine_bullish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000, 2);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 25.0);
         fv.set(FeatureIndex::MacdHistogram, 0.5);
@@ -226,7 +227,7 @@ use unified_trading_core::symbol_registry::SymbolId;
     #[test]
     fn test_inference_engine_bearish_signal() {
         let engine = make_engine();
-        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        let mut fv = FeatureVector::new(SymbolId::from_raw(0), 1000, 3);
         fv.set(FeatureIndex::MidPrice, 150.0);
         fv.set(FeatureIndex::Rsi14, 75.0);
         fv.set(FeatureIndex::MacdHistogram, -0.5);
@@ -243,7 +244,7 @@ use unified_trading_core::symbol_registry::SymbolId;
     #[test]
     fn test_inference_engine_missing_features() {
         let engine = make_engine();
-        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000, 4);
         let pred = engine.predict(&fv);
         assert!(pred.forecast >= -1.0 && pred.forecast <= 1.0);
     }
@@ -268,7 +269,7 @@ use unified_trading_core::symbol_registry::SymbolId;
 
     #[test]
     fn test_feature_vector_has_schema_version() {
-        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000);
+        let fv = FeatureVector::new(SymbolId::from_raw(0), 1000, 5);
         assert_eq!(fv.feature_schema_version, FEATURE_SCHEMA_VERSION);
     }
 }

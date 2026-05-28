@@ -141,6 +141,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             timestamp_ns: now,
             current_volatility: 0.01,
             current_spread_bps: 10.0,
+            trace_id: 1,
         }
     }
 

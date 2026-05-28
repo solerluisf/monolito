@@ -367,6 +367,7 @@ mod tests {
             stop_price: None,
             time_in_force: TimeInForce::Day,
             correlation_id: "corr-1".to_string(),
+            trace_id: 1,
         };
         // This test will fail at runtime without valid credentials, but it verifies the struct builds
         // and the request path is correct. In CI, we rely on mock execution port tests.
