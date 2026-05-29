@@ -8,6 +8,12 @@ use futures_util::{SinkExt, StreamExt};
 use market_data::RawTick;
 use unified_trading_core::symbol_registry::SymbolId;
 
+#[derive(Debug, Clone)]
+pub enum FeedCommand {
+    Subscribe { symbol: String },
+    Unsubscribe { symbol: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FeedError {
     Connect(String),
@@ -210,15 +216,21 @@ pub struct AlpacaWebSocketFeed {
     pub replay_buffer: parking_lot::Mutex<std::collections::VecDeque<RawTick>>,
     pub max_replay_ticks: usize,
     current_buffer_bytes: std::sync::atomic::AtomicUsize,
+    /// Sender for subscription commands (used by the engine to add/remove symbols dynamically).
+    pub subscription_cmd_tx: crossbeam_channel::Sender<FeedCommand>,
+    /// Tracks the current set of subscribed symbols for reconnect resubscription.
+    pub active_symbols: Arc<parking_lot::RwLock<Vec<String>>>,
 }
 
 impl AlpacaWebSocketFeed {
     pub fn new(
         config: AlpacaFeedConfig,
         tick_tx: crossbeam_channel::Sender<RawTick>,
-    ) -> Self {
+    ) -> (Self, crossbeam_channel::Receiver<FeedCommand>) {
+        let (sub_tx, sub_rx) = crossbeam_channel::bounded(64);
         let max_bytes = config.replay_buffer_max_bytes.max(1024);
-        Self {
+        let active_symbols = Arc::new(parking_lot::RwLock::new(config.symbols.clone()));
+        (Self {
             config,
             tick_tx,
             running: Arc::new(AtomicBool::new(false)),
@@ -228,7 +240,9 @@ impl AlpacaWebSocketFeed {
             replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: 1000,
             current_buffer_bytes: std::sync::atomic::AtomicUsize::new(0),
-        }
+            subscription_cmd_tx: sub_tx,
+            active_symbols,
+        }, sub_rx)
     }
 
     fn validate_message_size(&self, text: &str) -> Result<(), FeedError> {
@@ -245,10 +259,10 @@ impl AlpacaWebSocketFeed {
         }
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&self, sub_rx: crossbeam_channel::Receiver<FeedCommand>) {
         let mut attempts = 0;
         while self.running.load(Ordering::Relaxed) && attempts < self.max_reconnect_attempts as u64 {
-            match self.connect_and_stream().await {
+            match self.connect_and_stream(&sub_rx).await {
                 Ok(()) => {
                     tracing::info!("Alpaca WebSocket disconnected, reconnecting...");
                     attempts += 1;
@@ -271,7 +285,39 @@ impl AlpacaWebSocketFeed {
         }
     }
 
-    async fn connect_and_stream(&self) -> Result<(), FeedError> {
+    fn current_channels(&self) -> Vec<String> {
+        let symbols = self.active_symbols.read();
+        let mut channels = Vec::new();
+        if self.config.subscribe_trades {
+            for s in symbols.iter() {
+                channels.push(format!("T.{}", s));
+            }
+        }
+        if self.config.subscribe_quotes {
+            for s in symbols.iter() {
+                channels.push(format!("Q.{}", s));
+            }
+        }
+        if self.config.subscribe_bars {
+            for s in symbols.iter() {
+                channels.push(format!("B.{}", s));
+            }
+        }
+        channels
+    }
+
+    fn build_subscribe_message(&self) -> serde_json::Result<String> {
+        let symbols = self.active_symbols.read();
+        let subscribe = AlpacaSubscribe {
+            action: "subscribe".to_string(),
+            trades: symbols.iter().map(|s| format!("T.{}", s)).collect(),
+            quotes: symbols.iter().map(|s| format!("Q.{}", s)).collect(),
+            bars: symbols.iter().map(|s| format!("B.{}", s)).collect(),
+        };
+        serde_json::to_string(&vec![&subscribe])
+    }
+
+    async fn connect_and_stream(&self, sub_rx: &crossbeam_channel::Receiver<FeedCommand>) -> Result<(), FeedError> {
         let ws_url = self.config.ws_url();
 
         tracing::info!("Connecting to Alpaca WebSocket: {}", ws_url);
@@ -328,18 +374,12 @@ impl AlpacaWebSocketFeed {
             }
         }
 
-        let channels = self.config.channels();
+        let channels = self.current_channels();
         if channels.is_empty() {
             return Err(FeedError::Subscription("No channels to subscribe to".to_string()));
         }
 
-        let subscribe = AlpacaSubscribe {
-            action: "subscribe".to_string(),
-            trades: self.config.symbols.iter().map(|s| format!("T.{}", s)).collect(),
-            quotes: self.config.symbols.iter().map(|s| format!("Q.{}", s)).collect(),
-            bars: self.config.symbols.iter().map(|s| format!("B.{}", s)).collect(),
-        };
-        let sub_msg = serde_json::to_string(&vec![&subscribe]).map_err(|e| FeedError::Parse(e.to_string()))?;
+        let sub_msg = self.build_subscribe_message().map_err(|e| FeedError::Parse(e.to_string()))?;
         write
             .send(Message::Text(sub_msg.into()))
             .await
@@ -348,27 +388,78 @@ impl AlpacaWebSocketFeed {
 
         self.replay_ticks();
 
+        let mut sub_interval = tokio::time::interval(std::time::Duration::from_millis(250));
         while self.running.load(Ordering::Relaxed) {
-            match read.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    if let Err(e) = self.handle_market_data(&text).await {
-                        tracing::warn!("Market data error: {}", e);
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Err(e) = self.handle_market_data(&text).await {
+                                tracing::warn!("Market data error: {}", e);
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            tracing::info!("Alpaca WebSocket closed");
+                            return Ok(());
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
+                        Some(Err(e)) => {
+                            return Err(FeedError::Connect(format!("WebSocket read error: {}", e)));
+                        }
+                        None => {
+                            return Ok(());
+                        }
+                        _ => {}
                     }
                 }
-                Some(Ok(Message::Close(_))) => {
-                    tracing::info!("Alpaca WebSocket closed");
-                    return Ok(());
+                _ = sub_interval.tick() => {
+                    while let Ok(cmd) = sub_rx.try_recv() {
+                        match cmd {
+                            FeedCommand::Subscribe { symbol } => {
+                                {
+                                    let mut symbols = self.active_symbols.write();
+                                    if !symbols.contains(&symbol) {
+                                        symbols.push(symbol.clone());
+                                    }
+                                }
+                                // Send subscribe message over the open WebSocket
+                                let subscribe = AlpacaSubscribe {
+                                    action: "subscribe".to_string(),
+                                    trades: vec![format!("T.{}", symbol)],
+                                    quotes: vec![format!("Q.{}", symbol)],
+                                    bars: vec![format!("B.{}", symbol)],
+                                };
+                                let msg = serde_json::to_string(&vec![&subscribe])
+                                    .map_err(|e| FeedError::Parse(e.to_string()))?;
+                                tracing::info!(symbol = %symbol, "Sending dynamic subscribe to Alpaca feed");
+                                if let Err(e) = write.send(Message::Text(msg.into())).await {
+                                    tracing::warn!(symbol = %symbol, error = %e, "Failed to send subscribe message");
+                                }
+                            }
+                            FeedCommand::Unsubscribe { symbol } => {
+                                {
+                                    let mut symbols = self.active_symbols.write();
+                                    symbols.retain(|s| s != &symbol);
+                                }
+                                // Send unsubscribe message over the open WebSocket
+                                let unsub = AlpacaSubscribe {
+                                    action: "unsubscribe".to_string(),
+                                    trades: vec![format!("T.{}", symbol)],
+                                    quotes: vec![format!("Q.{}", symbol)],
+                                    bars: vec![format!("B.{}", symbol)],
+                                };
+                                let msg = serde_json::to_string(&vec![&unsub])
+                                    .map_err(|e| FeedError::Parse(e.to_string()))?;
+                                tracing::info!(symbol = %symbol, "Sending dynamic unsubscribe to Alpaca feed");
+                                if let Err(e) = write.send(Message::Text(msg.into())).await {
+                                    tracing::warn!(symbol = %symbol, error = %e, "Failed to send unsubscribe message");
+                                }
+                            }
+                        }
+                    }
                 }
-                Some(Ok(Message::Ping(data))) => {
-                    let _ = write.send(Message::Pong(data)).await;
-                }
-                Some(Err(e)) => {
-                    return Err(FeedError::Connect(format!("WebSocket read error: {}", e)));
-                }
-                None => {
-                    return Ok(());
-                }
-                _ => {}
             }
         }
 
@@ -495,7 +586,7 @@ impl AlpacaWebSocketFeed {
         Ok(())
     }
 
-    pub fn start(&self) -> tokio::task::JoinHandle<()> {
+    pub fn start(&self, sub_rx: crossbeam_channel::Receiver<FeedCommand>) -> tokio::task::JoinHandle<()> {
         let feed = Self {
             config: self.config.clone(),
             tick_tx: self.tick_tx.clone(),
@@ -506,10 +597,12 @@ impl AlpacaWebSocketFeed {
             replay_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             max_replay_ticks: self.max_replay_ticks,
             current_buffer_bytes: std::sync::atomic::AtomicUsize::new(0),
+            subscription_cmd_tx: self.subscription_cmd_tx.clone(),
+            active_symbols: Arc::clone(&self.active_symbols),
         };
 
         tokio::spawn(async move {
-            feed.run().await;
+            feed.run(sub_rx).await;
         })
     }
 
@@ -661,15 +754,12 @@ mod tests {
         };
 
         let (tick_tx, _tick_rx) = crossbeam_channel::unbounded();
-        let feed = AlpacaWebSocketFeed::new(config, tick_tx);
+        let (feed, _sub_rx) = AlpacaWebSocketFeed::new(config, tick_tx);
 
         // Create a message that's larger than 100 bytes
         let oversized_message = "x".repeat(150);
         
-        // Test handle_message with oversized message
-        let result = feed.handle_message(&oversized_message);
-        // We can't await in a sync test, so we'll just check that it would be rejected
-        // by testing the validation method directly
+        // Test validation method directly
         let validation_result = feed.validate_message_size(&oversized_message);
         assert!(validation_result.is_err());
         match validation_result.unwrap_err() {

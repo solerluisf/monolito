@@ -16,6 +16,6 @@ pub use alpaca_execution::{
 pub use alpaca::AlpacaAdapter;
 pub use circuit_breaker::CircuitBreaker;
 pub use alpaca_feed::{
-    AlpacaFeedConfig, AlpacaWebSocketFeed, FeedError,
+    AlpacaFeedConfig, AlpacaWebSocketFeed, FeedError, FeedCommand,
     AlpacaTrade, AlpacaQuote, AlpacaBar,
 };

@@ -540,6 +540,8 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/control/circuit-breaker/config", post(set_circuit_breaker_config_handler).put(set_circuit_breaker_config_handler))
         .route("/control/strategy-swap", post(strategy_swap_handler))
         .route("/control/strategy/:symbol/parameters", post(set_strategy_params_handler).put(set_strategy_params_handler))
+        .route("/control/asset/:symbol/subscribe", post(subscribe_asset_handler))
+        .route("/control/asset/:symbol/unsubscribe", post(unsubscribe_asset_handler))
         .route("/control/asset/:symbol/pause", post(pause_asset_handler))
         .route("/control/asset/:symbol/resume", post(resume_asset_handler))
         .route("/control/asset/:symbol/config", get(get_asset_config_handler).put(set_asset_config_handler))
@@ -944,6 +946,20 @@ async fn set_circuit_breaker_config_handler(
 }
 
 // Asset control handlers
+async fn subscribe_asset_handler(
+    State(state): State<ApiState>,
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+) -> StatusCode {
+    send_command(&state, ControlCommand::SubscribeFeed { symbol })
+}
+
+async fn unsubscribe_asset_handler(
+    State(state): State<ApiState>,
+    axum::extract::Path(symbol): axum::extract::Path<String>,
+) -> StatusCode {
+    send_command(&state, ControlCommand::UnsubscribeFeed { symbol })
+}
+
 async fn pause_asset_handler(
     State(state): State<ApiState>,
     axum::extract::Path(symbol): axum::extract::Path<String>,

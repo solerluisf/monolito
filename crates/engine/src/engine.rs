@@ -24,7 +24,7 @@ use model::{Prediction, PredictionEngine, InferenceEngine};
 use strategy::{StrategyEngine, TradeIntent, SizeHint};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent, OrderTracker, RateLimiter};
-use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide};
+use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide, FeedCommand};
 
 use crate::tick_reactor::{spawn_reactor, ReactorCommand};
 
@@ -376,6 +376,7 @@ impl AssetProcessor {
     pub command_actor: Option<CommandActor>,
     pub lifecycle_tx: Option<crossbeam_channel::Sender<execution::OrderLifecycleEvent>>,
     pub execution_port: Option<Arc<dyn IExecutionPort>>,
+    pub feed_subscription_tx: Option<crossbeam_channel::Sender<FeedCommand>>,
     next_asset_core: usize,
     /// When `Some(..)`, a config rollout is in progress (canary → global).
     pub staged_rollout: Option<StagedRolloutState>,
@@ -413,6 +414,7 @@ impl UnifiedEngine {
             command_actor: None,
             lifecycle_tx: None,
             execution_port: None,
+            feed_subscription_tx: None,
             next_asset_core: 1,
             staged_rollout: None,
         }
@@ -497,7 +499,8 @@ impl UnifiedEngine {
             max_message_size_bytes: 1024 * 1024,
         };
 
-        let feed = AlpacaWebSocketFeed::new(feed_config, feed_tx);
+        let (feed, sub_rx) = AlpacaWebSocketFeed::new(feed_config, feed_tx);
+        self.feed_subscription_tx = Some(feed.subscription_cmd_tx.clone());
 
         let ks = Arc::clone(&self.kill_switch);
         let hb_monitor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread("alpaca-feed"));
@@ -513,7 +516,7 @@ impl UnifiedEngine {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async {
-                    let handle = feed.start();
+                    let handle = feed.start(sub_rx);
                     while !ks.is_active() {
                         if let Some(ref hb) = hb_monitor {
                             hb.pulse();
@@ -1525,6 +1528,12 @@ impl UnifiedEngine {
 
                 let _ = reactor_tx.send(ReactorCommand::Subscribe { symbol: symbol.clone(), tx: pipeline.md_tx.clone() });
                 self.asset_pipelines.insert(symbol.clone(), pipeline);
+
+                // Notify the WebSocket feed to subscribe to this symbol
+                if let Some(ref feed_tx) = self.feed_subscription_tx {
+                    let _ = feed_tx.send(FeedCommand::Subscribe { symbol: symbol.clone() });
+                }
+
                 tracing::info!(symbol = %symbol, "Asset pipeline subscribed dynamically");
                 ControlResponse::Ok
             }
@@ -1547,6 +1556,12 @@ impl UnifiedEngine {
                     }
                     // Remove from strategy registry
                     self.strategy_registry.lock().remove(&symbol);
+
+                    // Notify the WebSocket feed to unsubscribe from this symbol
+                    if let Some(ref feed_tx) = self.feed_subscription_tx {
+                        let _ = feed_tx.send(FeedCommand::Unsubscribe { symbol: symbol.clone() });
+                    }
+
                     tracing::info!(symbol = %symbol, "Asset pipeline unsubscribed");
                     ControlResponse::Ok
                 } else {
