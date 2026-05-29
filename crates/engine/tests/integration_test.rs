@@ -717,3 +717,108 @@ fn test_e2e_rejected_risk_decisions_do_not_become_orders() {
 
     fix.shutdown();
 }
+
+#[test]
+fn test_circuit_breaker_trips_after_mock_failures() {
+    use gateway::{CircuitBreaker, MockExecutionPort, OrderSide, OrderType, TimeInForce};
+
+    // Create a circuit breaker with threshold of 3 failures
+    let cb = Arc::new(CircuitBreaker::new(3, 30_000));
+
+    // Create a mock execution port that always fails
+    let mock = Arc::new(MockExecutionPort::builder()
+        .explicit_failure(true)
+        .failure_message("Simulated network error".to_string())
+        .build());
+
+    // Verify initial state
+    assert!(cb.can_execute(), "Circuit breaker should allow execution initially");
+    assert_eq!(cb.state_name(), "closed");
+
+    // Submit orders that will fail - each failure should be recorded
+    let cmd = OrderCommand {
+        order_id: "cb-test".to_string(),
+        symbol: "AAPL".to_string(),
+        side: OrderSide::Buy,
+        quantity: 10.0,
+        order_type: OrderType::Market,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: TimeInForce::Day,
+        correlation_id: "corr-1".to_string(),
+        trace_id: 42,
+    };
+
+    // First failure
+    let _ = mock.submit_order(&cmd);
+    cb.record_failure();
+    assert!(cb.can_execute(), "Circuit breaker should still allow execution after 1 failure");
+    assert_eq!(cb.failure_count(), 1);
+
+    // Second failure
+    let _ = mock.submit_order(&cmd);
+    cb.record_failure();
+    assert!(cb.can_execute(), "Circuit breaker should still allow execution after 2 failures");
+    assert_eq!(cb.failure_count(), 2);
+
+    // Third failure - should trip the circuit breaker
+    let _ = mock.submit_order(&cmd);
+    cb.record_failure();
+    assert!(!cb.can_execute(), "Circuit breaker should open after 3 failures");
+    assert!(cb.is_open.load(Ordering::Relaxed));
+    assert_eq!(cb.state_name(), "open");
+
+    // Verify mock tracked failures correctly
+    assert_eq!(mock.submit_count(), 3);
+    assert_eq!(mock.failure_count(), 3);
+
+    tracing::info!(
+        state = cb.state_name(),
+        is_open = cb.is_open.load(Ordering::Relaxed),
+        "Circuit breaker successfully tripped after 3 mock failures"
+    );
+}
+
+#[test]
+fn test_circuit_breaker_resets_after_success() {
+    use gateway::CircuitBreaker;
+
+    let cb = Arc::new(CircuitBreaker::new(3, 10)); // 10ms cooldown for testing
+
+    // Trip the circuit breaker
+    cb.record_failure();
+    cb.record_failure();
+    cb.record_failure();
+    assert!(!cb.can_execute(), "Circuit breaker should be open");
+    assert_eq!(cb.state_name(), "open");
+
+    // Wait for cooldown to elapse
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Probe should succeed and reset the breaker
+    assert!(cb.can_execute(), "Circuit breaker should transition to half-open after cooldown");
+    assert_eq!(cb.state_name(), "half_open");
+
+    cb.record_success();
+    assert_eq!(cb.state_name(), "closed", "Circuit breaker should close after successful probe");
+    assert!(!cb.is_open.load(Ordering::Relaxed));
+}
+
+#[test]
+fn test_mock_partial_fill_behavior() {
+    use gateway::MockExecutionPort;
+
+    let mock = Arc::new(MockExecutionPort::builder()
+        .partial_fill_rate(1.0) // Always partial fill
+        .partial_fill_qty(25)
+        .build());
+
+    let query = gateway::StatusQuery {
+        execution_id: "partial-test".to_string(),
+    };
+
+    let result = mock.get_order_status(&query).unwrap();
+    assert_eq!(result.status, "partially_filled");
+    assert_eq!(result.filled_qty, 25);
+    assert_eq!(result.remaining_qty, 75);
+}

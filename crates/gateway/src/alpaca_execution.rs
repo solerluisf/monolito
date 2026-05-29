@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -116,6 +119,90 @@ pub trait IExecutionPort: Send + Sync {
     fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String>;
     fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String>;
     fn query_positions(&self) -> Result<Vec<PositionInfo>, String>;
+}
+
+/// Configuration for MockExecutionPort behavior.
+#[derive(Debug, Clone)]
+pub struct MockConfig {
+    /// Probability (0.0 to 1.0) that an order submission will fail.
+    pub failure_rate: f64,
+    /// Simulated network latency in milliseconds.
+    pub latency_ms: u64,
+    /// Probability (0.0 to 1.0) that a fill will be partial instead of full.
+    pub partial_fill_rate: f64,
+    /// Fixed quantity for partial fills.
+    pub partial_fill_qty: u32,
+    /// If true, always fail regardless of failure_rate.
+    pub explicit_failure: bool,
+    /// Error message returned on failure.
+    pub failure_message: String,
+}
+
+impl Default for MockConfig {
+    fn default() -> Self {
+        Self {
+            failure_rate: 0.0,
+            latency_ms: 0,
+            partial_fill_rate: 0.0,
+            partial_fill_qty: 0,
+            explicit_failure: false,
+            failure_message: "Mock execution failed".to_string(),
+        }
+    }
+}
+
+/// Builder for constructing MockExecutionPort with custom configuration.
+#[derive(Debug)]
+pub struct MockExecutionPortBuilder {
+    config: MockConfig,
+}
+
+impl MockExecutionPortBuilder {
+    pub fn new() -> Self {
+        Self {
+            config: MockConfig::default(),
+        }
+    }
+
+    pub fn failure_rate(mut self, rate: f64) -> Self {
+        self.config.failure_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn latency_ms(mut self, ms: u64) -> Self {
+        self.config.latency_ms = ms;
+        self
+    }
+
+    pub fn partial_fill_rate(mut self, rate: f64) -> Self {
+        self.config.partial_fill_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn partial_fill_qty(mut self, qty: u32) -> Self {
+        self.config.partial_fill_qty = qty;
+        self
+    }
+
+    pub fn explicit_failure(mut self, enabled: bool) -> Self {
+        self.config.explicit_failure = enabled;
+        self
+    }
+
+    pub fn failure_message(mut self, msg: impl Into<String>) -> Self {
+        self.config.failure_message = msg.into();
+        self
+    }
+
+    pub fn build(self) -> MockExecutionPort {
+        MockExecutionPort::with_config(self.config)
+    }
+}
+
+impl Default for MockExecutionPortBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -430,19 +517,91 @@ impl IExecutionPort for AlpacaExecutionPort {
 pub struct MockExecutionPort {
     pub open_orders: Vec<OpenOrderInfo>,
     pub positions: Vec<PositionInfo>,
+    config: parking_lot::Mutex<MockConfig>,
+    submit_count: AtomicU64,
+    failure_count: AtomicU64,
+}
+
+impl MockExecutionPort {
+    pub fn builder() -> MockExecutionPortBuilder {
+        MockExecutionPortBuilder::new()
+    }
+
+    pub fn with_config(config: MockConfig) -> Self {
+        Self {
+            open_orders: Vec::new(),
+            positions: Vec::new(),
+            config: parking_lot::Mutex::new(config),
+            submit_count: AtomicU64::new(0),
+            failure_count: AtomicU64::new(0),
+        }
+    }
+
+    pub fn config(&self) -> MockConfig {
+        self.config.lock().clone()
+    }
+
+    pub fn update_config(&self, config: MockConfig) {
+        *self.config.lock() = config;
+    }
+
+    pub fn submit_count(&self) -> u64 {
+        self.submit_count.load(Ordering::Relaxed)
+    }
+
+    pub fn failure_count(&self) -> u64 {
+        self.failure_count.load(Ordering::Relaxed)
+    }
+
+    fn should_fail(&self) -> bool {
+        let config = self.config.lock();
+        if config.explicit_failure {
+            return true;
+        }
+        if config.failure_rate > 0.0 {
+            let mut rng = rand::thread_rng();
+            return rng.gen::<f64>() < config.failure_rate;
+        }
+        false
+    }
+
+    fn apply_latency(&self) {
+        let latency_ms = {
+            let config = self.config.lock();
+            config.latency_ms
+        };
+        if latency_ms > 0 {
+            std::thread::sleep(Duration::from_millis(latency_ms));
+        }
+    }
+
+    fn should_partial_fill(&self) -> bool {
+        let config = self.config.lock();
+        if config.partial_fill_rate > 0.0 {
+            let mut rng = rand::thread_rng();
+            return rng.gen::<f64>() < config.partial_fill_rate;
+        }
+        false
+    }
 }
 
 impl Default for MockExecutionPort {
     fn default() -> Self {
-        Self {
-            open_orders: Vec::new(),
-            positions: Vec::new(),
-        }
+        Self::with_config(MockConfig::default())
     }
 }
 
 impl IExecutionPort for MockExecutionPort {
     fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
+        self.submit_count.fetch_add(1, Ordering::Relaxed);
+        self.apply_latency();
+
+        if self.should_fail() {
+            self.failure_count.fetch_add(1, Ordering::Relaxed);
+            let config = self.config.lock();
+            return Err(config.failure_message.clone());
+        }
+
         Ok(format!("mock-{}", cmd.order_id))
     }
 
@@ -455,13 +614,21 @@ impl IExecutionPort for MockExecutionPort {
     }
 
     fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String> {
+        let total_qty = 100u32;
+        let filled_qty = if self.should_partial_fill() {
+            let config = self.config.lock();
+            config.partial_fill_qty.max(1).min(total_qty)
+        } else {
+            total_qty
+        };
+
         Ok(OrderStatusResponse::new(
             query.execution_id.clone(),
-            "filled".to_string(),
+            if filled_qty == total_qty { "filled" } else { "partially_filled" }.to_string(),
             "AAPL".to_string(),
             OrderSide::Buy,
-            100,
-        ).with_fill(100, 150.0))
+            total_qty,
+        ).with_fill(filled_qty, 150.0))
     }
 
     fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
@@ -550,5 +717,138 @@ mod tests {
         let positions = port.query_positions().unwrap();
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol, "AAPL");
+    }
+
+    #[test]
+    fn test_mock_explicit_failure() {
+        let port = MockExecutionPort::builder()
+            .explicit_failure(true)
+            .failure_message("Test rejection".to_string())
+            .build();
+
+        let cmd = OrderCommand {
+            order_id: "fail-1".to_string(),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            quantity: 10.0,
+            order_type: OrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::Day,
+            correlation_id: "corr-1".to_string(),
+            trace_id: 42,
+        };
+
+        let result = port.submit_order(&cmd);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Test rejection");
+        assert_eq!(port.submit_count(), 1);
+        assert_eq!(port.failure_count(), 1);
+    }
+
+    #[test]
+    fn test_mock_failure_rate() {
+        let port = MockExecutionPort::builder()
+            .failure_rate(1.0) // 100% failure
+            .build();
+
+        let cmd = OrderCommand {
+            order_id: "rate-fail".to_string(),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            quantity: 10.0,
+            order_type: OrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::Day,
+            correlation_id: "corr-1".to_string(),
+            trace_id: 42,
+        };
+
+        // With 100% failure rate, all submissions should fail
+        for i in 0..10 {
+            let result = port.submit_order(&cmd);
+            assert!(result.is_err(), "Submission {} should fail with 100% failure rate", i);
+        }
+        assert_eq!(port.submit_count(), 10);
+        assert_eq!(port.failure_count(), 10);
+    }
+
+    #[test]
+    fn test_mock_latency() {
+        let port = MockExecutionPort::builder()
+            .latency_ms(50)
+            .build();
+
+        let cmd = OrderCommand {
+            order_id: "latency-test".to_string(),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            quantity: 10.0,
+            order_type: OrderType::Market,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::Day,
+            correlation_id: "corr-1".to_string(),
+            trace_id: 42,
+        };
+
+        let start = std::time::Instant::now();
+        let _ = port.submit_order(&cmd);
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(45), "Should have latency of at least 45ms");
+    }
+
+    #[test]
+    fn test_mock_partial_fill() {
+        let port = MockExecutionPort::builder()
+            .partial_fill_rate(1.0) // 100% partial fills
+            .partial_fill_qty(50)
+            .build();
+
+        let query = StatusQuery {
+            execution_id: "partial-fill-test".to_string(),
+        };
+
+        let result = port.get_order_status(&query).unwrap();
+        assert_eq!(result.status, "partially_filled");
+        assert_eq!(result.filled_qty, 50);
+        assert_eq!(result.remaining_qty, 50);
+    }
+
+    #[test]
+    fn test_mock_config_update() {
+        let port = MockExecutionPort::default();
+        assert_eq!(port.config().failure_rate, 0.0);
+
+        port.update_config(MockConfig {
+            failure_rate: 0.5,
+            latency_ms: 100,
+            ..Default::default()
+        });
+
+        assert_eq!(port.config().failure_rate, 0.5);
+        assert_eq!(port.config().latency_ms, 100);
+    }
+
+    #[test]
+    fn test_mock_builder_fluent() {
+        let port = MockExecutionPort::builder()
+            .failure_rate(0.25)
+            .latency_ms(10)
+            .partial_fill_rate(0.3)
+            .partial_fill_qty(25)
+            .explicit_failure(false)
+            .failure_message("Builder test".to_string())
+            .build();
+
+        let config = port.config();
+        assert_eq!(config.failure_rate, 0.25);
+        assert_eq!(config.latency_ms, 10);
+        assert_eq!(config.partial_fill_rate, 0.3);
+        assert_eq!(config.partial_fill_qty, 25);
+        assert!(!config.explicit_failure);
+        assert_eq!(config.failure_message, "Builder test");
     }
 }

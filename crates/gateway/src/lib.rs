@@ -10,7 +10,7 @@ pub use broker_adapter::{
 pub use alpaca_execution::{
     IExecutionPort, OrderCommand, OrderSide, OrderType, TimeInForce,
     CancelCommand, ReplaceCommand, StatusQuery, OrderStatusResponse,
-    AlpacaExecutionPort, MockExecutionPort,
+    AlpacaExecutionPort, MockExecutionPort, MockConfig, MockExecutionPortBuilder,
     OpenOrderInfo, PositionInfo,
 };
 pub use alpaca::AlpacaAdapter;
