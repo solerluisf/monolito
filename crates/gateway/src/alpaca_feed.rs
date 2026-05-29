@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 
-use market_data::RawTick;
+use market_data::{RawTick, TickType};
 use unified_trading_core::symbol_registry::SymbolId;
 
 #[derive(Debug, Clone)]
@@ -132,6 +132,8 @@ impl AlpacaTrade {
         let ts = self.ts.unwrap_or(0);
         Some(RawTick {
             symbol_id: SymbolId::from_raw(0),
+            symbol: self.S.clone(),
+            tick_type: TickType::Trade,
             timestamp_ns: ts,
             bid: self.p,
             ask: self.p,
@@ -140,7 +142,7 @@ impl AlpacaTrade {
             last_price: self.p,
             last_size: self.s,
             exchange: self.x.clone(),
-            trace_id: 0, // Will be assigned by TickReactor
+            trace_id: 0,
         })
     }
 }
@@ -149,6 +151,8 @@ impl AlpacaQuote {
     pub fn to_raw_tick(&self) -> Option<RawTick> {
         Some(RawTick {
             symbol_id: SymbolId::from_raw(0),
+            symbol: self.S.clone(),
+            tick_type: TickType::Quote,
             timestamp_ns: self.tr.unwrap_or(0),
             bid: self.bp,
             ask: self.ap,
@@ -157,7 +161,7 @@ impl AlpacaQuote {
             last_price: (self.bp + self.ap) / 2.0,
             last_size: self.bs.min(self.as_size),
             exchange: self.bx.clone(),
-            trace_id: 0, // Will be assigned by TickReactor
+            trace_id: 0,
         })
     }
 }
@@ -518,6 +522,17 @@ impl AlpacaWebSocketFeed {
         self.current_buffer_bytes.store(current_bytes + tick_bytes, Ordering::Relaxed);
     }
 
+    fn try_send_tick(&self, tick: RawTick) {
+        if self.tick_tx.try_send(tick.clone()).is_err() {
+            tracing::warn!(
+                symbol = %tick.symbol,
+                tick_type = ?tick.tick_type,
+                channel_capacity = %self.tick_tx.capacity().unwrap_or(0),
+                "Feed tick dropped: channel full or disconnected"
+            );
+        }
+    }
+
     fn replay_ticks(&self) {
         let ticks: Vec<RawTick> = {
             let mut buf = self.replay_buffer.lock();
@@ -527,7 +542,7 @@ impl AlpacaWebSocketFeed {
         if !ticks.is_empty() {
             tracing::info!("Replaying {} buffered ticks post-reconnect", ticks.len());
             for tick in ticks {
-                let _ = self.tick_tx.try_send(tick);
+                self.try_send_tick(tick);
             }
         }
     }
@@ -546,7 +561,7 @@ impl AlpacaWebSocketFeed {
                                 if let Ok(trade) = serde_json::from_value::<AlpacaTrade>(item.clone()) {
                                     if let Some(tick) = trade.to_raw_tick() {
                                         self.buffer_tick(tick.clone());
-                                        let _ = self.tick_tx.try_send(tick);
+                                        self.try_send_tick(tick);
                                     }
                                 }
                             }
@@ -554,7 +569,7 @@ impl AlpacaWebSocketFeed {
                                 if let Ok(quote) = serde_json::from_value::<AlpacaQuote>(item.clone()) {
                                     if let Some(tick) = quote.to_raw_tick() {
                                         self.buffer_tick(tick.clone());
-                                        let _ = self.tick_tx.try_send(tick);
+                                        self.try_send_tick(tick);
                                     }
                                 }
                             }
@@ -562,6 +577,8 @@ impl AlpacaWebSocketFeed {
                                 if let Ok(bar) = serde_json::from_value::<AlpacaBar>(item.clone()) {
                                     let tick = RawTick {
                                         symbol_id: SymbolId::from_raw(0),
+                                        symbol: bar.S.clone(),
+                                        tick_type: TickType::Bar,
                                         timestamp_ns: 0,
                                         bid: bar.o,
                                         ask: bar.c,
@@ -570,10 +587,10 @@ impl AlpacaWebSocketFeed {
                                         last_price: bar.c,
                                         last_size: bar.v,
                                         exchange: "BAR".to_string(),
-                                        trace_id: 0, // Will be assigned by TickReactor
+                                        trace_id: 0,
                                     };
                                     self.buffer_tick(tick.clone());
-                                    let _ = self.tick_tx.try_send(tick);
+                                    self.try_send_tick(tick);
                                 }
                             }
                             _ => {}

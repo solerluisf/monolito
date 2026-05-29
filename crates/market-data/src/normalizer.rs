@@ -1,9 +1,18 @@
 use serde::{Deserialize, Serialize};
 use unified_trading_core::symbol_registry::SymbolId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TickType {
+    Quote,
+    Trade,
+    Bar,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawTick {
     pub symbol_id: SymbolId,
+    pub symbol: String,
+    pub tick_type: TickType,
     pub timestamp_ns: u64,
     pub bid: f64,
     pub ask: f64,
@@ -53,6 +62,7 @@ pub struct Normalizer {
     symbol_id: SymbolId,
     last_sequence: u64,
     last_timestamp_ns: u64,
+    last_spread: Option<f64>,
 }
 
 impl Normalizer {
@@ -61,14 +71,17 @@ impl Normalizer {
             symbol_id,
             last_sequence: 0,
             last_timestamp_ns: 0,
+            last_spread: None,
         }
     }
 
-    /// Returns `None` if the tick contains invalid prices (NaN, Inf, non-positive, or bid > ask).
+    /// Returns `None` if the tick contains invalid prices (NaN, Inf, non-positive, or crossed book).
     pub fn process(&mut self, raw: RawTick) -> Option<(NormalizedTick, bool)> {
         if !Self::validate_tick(&raw) {
             tracing::warn!(
+                symbol = %raw.symbol,
                 symbol_id = %raw.symbol_id,
+                tick_type = ?raw.tick_type,
                 bid = %raw.bid,
                 ask = %raw.ask,
                 last_price = %raw.last_price,
@@ -77,9 +90,30 @@ impl Normalizer {
             return None;
         }
 
-        let mid_price = (raw.bid + raw.ask) / 2.0;
-        let spread = raw.ask - raw.bid;
-        let spread_bps = (spread / mid_price) * 10_000.0;
+        let (mid_price, spread, spread_bps) = match raw.tick_type {
+            TickType::Quote => {
+                let mid = (raw.bid + raw.ask) / 2.0;
+                let sp = raw.ask - raw.bid;
+                let sp_bps = if mid > 0.0 { (sp / mid) * 10_000.0 } else { 0.0 };
+                (mid, sp, sp_bps)
+            }
+            TickType::Trade => {
+                let mid = raw.last_price;
+                let sp = self.last_spread.unwrap_or(0.0);
+                let sp_bps = if mid > 0.0 { (sp / mid) * 10_000.0 } else { 0.0 };
+                (mid, sp, sp_bps)
+            }
+            TickType::Bar => {
+                let mid = raw.last_price;
+                let sp = 0.0;
+                let sp_bps = 0.0;
+                (mid, sp, sp_bps)
+            }
+        };
+
+        if raw.tick_type == TickType::Quote && spread > 0.0 {
+            self.last_spread = Some(spread);
+        }
 
         self.last_sequence += 1;
         let gap = self.last_timestamp_ns > 0 && raw.timestamp_ns > self.last_timestamp_ns + 1_000_000_000;
@@ -106,7 +140,10 @@ impl Normalizer {
                 return false;
             }
         }
-        raw.bid <= raw.ask
+        match raw.tick_type {
+            TickType::Quote => raw.bid <= raw.ask,
+            TickType::Trade | TickType::Bar => true,
+        }
     }
 
     pub fn check_sequence(&self, expected: u64) -> Option<u64> {
@@ -184,6 +221,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -207,6 +246,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 2000,
             bid: 400.0,
             ask: 400.04,
@@ -227,6 +268,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         norm.process(RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -247,6 +290,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         norm.process(RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Trade,
             timestamp_ns: 1_000_000_000,
             bid: 150.0,
             ask: 150.05,
@@ -288,6 +333,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: f64::NAN,
             ask: 150.05,
@@ -307,6 +354,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: f64::INFINITY,
@@ -326,6 +375,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,
@@ -345,6 +396,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: -1.0,
             ask: 150.05,
@@ -364,6 +417,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 160.0,
             ask: 150.05,
@@ -383,6 +438,8 @@ mod tests {
         let mut norm = Normalizer::new(symbol_id);
         let raw = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 1000,
             bid: 150.0,
             ask: 150.05,

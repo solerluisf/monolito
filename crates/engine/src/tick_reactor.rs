@@ -10,7 +10,7 @@ use unified_trading_core::symbol_registry::{SymbolId, SymbolRegistry, SymbolIdAr
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 use unified_trading_core::clock::wall_time_ns;
 
-use market_data::RawTick;
+use market_data::{RawTick, TickType};
 
 #[derive(Debug, Clone)]
 pub enum ReactorCommand {
@@ -159,8 +159,14 @@ impl TickReactor {
 
         for tick in batch.drain(..) {
             self.total_ticks.fetch_add(1, Ordering::Relaxed);
-            let symbol_id = tick.symbol_id;
             let trace_id = next_trace_id();
+            let symbol = tick.symbol.clone();
+
+            let symbol_id = if tick.symbol_id.as_u16() == 0 {
+                self.registry.lookup(&symbol).unwrap_or(tick.symbol_id)
+            } else {
+                tick.symbol_id
+            };
 
             if let Some(tx) = self.handler_array.get(symbol_id) {
                 let mut tick_with_trace = tick;
@@ -179,6 +185,7 @@ impl TickReactor {
                             handler.dropped_count += 1;
                             if handler.dropped_count % self.backpressure_log_interval == 0 {
                                 tracing::warn!(
+                                    symbol = %symbol,
                                     symbol_id = %symbol_id,
                                     trace_id = trace_id,
                                     dropped = handler.dropped_count,
@@ -188,11 +195,11 @@ impl TickReactor {
                         }
                     }
                     Err(TrySendError::Disconnected(_)) => {
-                        tracing::warn!(symbol_id = %symbol_id, trace_id = trace_id, "Handler disconnected");
+                        tracing::warn!(symbol = %symbol, symbol_id = %symbol_id, trace_id = trace_id, "Handler disconnected");
                     }
                 }
             } else {
-                tracing::debug!(symbol_id = %symbol_id, trace_id = trace_id, "Received tick for unregistered symbol_id");
+                tracing::debug!(symbol = %symbol, symbol_id = %symbol_id, trace_id = trace_id, "Received tick for unregistered symbol");
             }
         }
     }
@@ -273,6 +280,8 @@ mod tests {
         let symbol_id = reactor.registry.lookup("AAPL").unwrap();
         let tick = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,
@@ -309,6 +318,8 @@ mod tests {
         let symbol_id = SymbolId::from_raw(0);
         let tick = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,
@@ -337,6 +348,8 @@ mod tests {
         let symbol_id = reactor.registry.lookup("AAPL").unwrap();
         let tick = RawTick {
             symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
             timestamp_ns: 0,
             bid: 150.0,
             ask: 150.01,

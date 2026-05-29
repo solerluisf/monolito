@@ -7,7 +7,7 @@ use crossbeam_channel::bounded;
 
 use unified_trading_engine::engine::{AssetProcessor, StrategySwapRef};
 use feature::{FeatureEngine, FeatureVector};
-use market_data::{Normalizer, RawTick};
+use market_data::{Normalizer, RawTick, TickType};
 use model::Prediction;
 use risk::RiskCheckRequest;
 use strategy::{SignalContext, Strategy, TradeIntent};
@@ -43,6 +43,8 @@ impl Strategy for SlowNoopStrategy {
 fn make_tick(symbol_id: SymbolId, ts: u64) -> RawTick {
     RawTick {
         symbol_id,
+        symbol: "TEST".to_string(),
+        tick_type: TickType::Quote,
         timestamp_ns: ts,
         bid: 100.0,
         ask: 100.1,

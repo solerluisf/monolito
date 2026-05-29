@@ -11,7 +11,7 @@ use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::symbol_registry::{next_request_id, SymbolId};
-use market_data::{Normalizer, RawTick};
+use market_data::{Normalizer, RawTick, TickType};
 use feature::FeatureEngine;
 use model::{InferenceEngine, PredictionEngine};
 use strategy::{StrategyEngine, StrategyEngineExt};
@@ -19,9 +19,11 @@ use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent};
 use gateway::MockExecutionPort;
 
-fn make_raw_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> RawTick {
+fn make_raw_tick(symbol_id: SymbolId, symbol: &str, ts: u64, mid: f64, spread: f64) -> RawTick {
     RawTick {
         symbol_id,
+        symbol: symbol.to_string(),
+        tick_type: TickType::Quote,
         timestamp_ns: ts,
         bid: mid - spread / 2.0,
         ask: mid + spread / 2.0,
@@ -157,7 +159,7 @@ fn test_pipeline_with_500k_ticks() {
 
     const TOTAL_TICKS: usize = 500_000;
     for i in 0..TOTAL_TICKS {
-        let tick = make_raw_tick(symbol_id, i as u64 * 100_000, 400.0 + (i as f64 * 0.0001), 0.04);
+        let tick = make_raw_tick(symbol_id, "TEST", i as u64 * 100_000, 400.0 + (i as f64 * 0.0001), 0.04);
         // Use send (blocking with timeout) to ensure all ticks are enqueued
         if md_tx.send(tick).is_err() {
             break;
@@ -183,7 +185,7 @@ fn test_channel_burst_without_loss() {
 
     const COUNT: usize = 100_000;
     for i in 0..COUNT {
-        let tick = make_raw_tick(SymbolId::from_raw(1), i as u64, 150.0, 0.05);
+        let tick = make_raw_tick(SymbolId::from_raw(1), "TEST", i as u64, 150.0, 0.05);
         tx.send(tick).expect("send should succeed with large buffer");
     }
     drop(tx);

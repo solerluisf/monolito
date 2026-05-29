@@ -292,12 +292,12 @@ impl AssetProcessor {
                         elapsed_us = elapsed_us,
                         budget_us = self.tick_processing_budget_us,
                         skipped_ticks = skipped,
-                        "Tick processing budget exceeded; skipping remaining ticks in batch and yielding"
+                        "Tick processing budget exceeded; skipping remaining ticks in batch"
                     );
                     if let Some(cb) = on_budget_exceeded {
                         cb(elapsed_us, self.tick_processing_budget_us, skipped);
                     }
-                    std::thread::yield_now();
+                    std::hint::spin_loop();
                     break;
                 }
             }

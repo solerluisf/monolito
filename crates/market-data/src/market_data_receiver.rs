@@ -1,7 +1,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::thread;
 
-use crate::normalizer::RawTick;
+use crate::normalizer::{RawTick, TickType};
 
 pub struct MarketDataReceiver {
     tx: Sender<RawTick>,
@@ -75,6 +75,8 @@ mod tests {
         for i in 0..10 {
             tx.send(RawTick {
                 symbol_id: SymbolId::from_raw(0),
+                symbol: "TEST".to_string(),
+                tick_type: TickType::Quote,
                 timestamp_ns: i,
                 bid: 150.0,
                 ask: 150.05,
@@ -101,6 +103,8 @@ mod tests {
         for i in 0..20 {
             tx.send(RawTick {
                 symbol_id: SymbolId::from_raw(0),
+                symbol: "TEST".to_string(),
+                tick_type: TickType::Quote,
                 timestamp_ns: i,
                 bid: 150.0,
                 ask: 150.05,

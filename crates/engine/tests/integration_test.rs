@@ -9,7 +9,7 @@ use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::symbol_registry::{next_request_id, SymbolId};
-use market_data::{Normalizer, RawTick};
+use market_data::{Normalizer, RawTick, TickType};
 use feature::FeatureEngine;
 use model::{InferenceEngine, PredictionEngine};
 use strategy::{StrategyEngine, StrategyEngineExt};
@@ -61,9 +61,11 @@ impl IExecutionPort for SpyExecutionPort {
     }
 }
 
-fn make_raw_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> RawTick {
+fn make_raw_tick(symbol_id: SymbolId, symbol: &str, ts: u64, mid: f64, spread: f64) -> RawTick {
     RawTick {
         symbol_id,
+        symbol: symbol.to_string(),
+        tick_type: TickType::Quote,
         timestamp_ns: ts,
         bid: mid - spread / 2.0,
         ask: mid + spread / 2.0,
@@ -202,7 +204,7 @@ fn test_full_pipeline_tick_to_intent() {
     ).expect("spawn_pinned failed");
 
     for i in 0..50 {
-        let tick = make_raw_tick(symbol_id, i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
+        let tick = make_raw_tick(symbol_id, "TEST", i * 1_000_000, 150.0 + (i as f64 * 0.1), 0.05);
         md_tx.send(tick).unwrap();
     }
 
@@ -283,7 +285,7 @@ fn test_pipeline_with_burst_ticks() {
     ).expect("spawn_pinned failed");
 
     for i in 0..500 {
-        let tick = make_raw_tick(symbol_id, i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
+        let tick = make_raw_tick(symbol_id, "TEST", i * 100_000, 400.0 + (i as f64 * 0.01), 0.04);
         md_tx.send(tick).unwrap();
     }
 
@@ -364,7 +366,7 @@ fn test_kill_switch_stops_pipeline() {
     ).expect("spawn_pinned failed");
 
     for i in 0..100 {
-        let tick = make_raw_tick(symbol_id, i * 1_000_000, 150.0, 0.05);
+        let tick = make_raw_tick(symbol_id, "TEST", i * 1_000_000, 150.0, 0.05);
         md_tx.send(tick).unwrap();
     }
 
@@ -503,20 +505,20 @@ impl PipelineFixture {
 
 /// Generate a strong uptrend sequence of ticks — prices climb steadily with
 /// moderate spread. This should drive RSI up and MACD positive → long signal.
-fn generate_uptrend_ticks(symbol_id: SymbolId, count: usize, start_price: f64, step: f64) -> Vec<RawTick> {
+fn generate_uptrend_ticks(symbol_id: SymbolId, symbol: &str, count: usize, start_price: f64, step: f64) -> Vec<RawTick> {
     (0..count).map(|i| {
         let ts = (i as u64) * 1_000_000; // 1 ms apart
         let price = start_price + (i as f64) * step;
-        make_raw_tick(symbol_id, ts, price, 0.04)
+        make_raw_tick(symbol_id, symbol, ts, price, 0.04)
     }).collect()
 }
 
 /// Generate a strong downtrend sequence — prices fall steadily.
-fn generate_downtrend_ticks(symbol_id: SymbolId, count: usize, start_price: f64, step: f64) -> Vec<RawTick> {
+fn generate_downtrend_ticks(symbol_id: SymbolId, symbol: &str, count: usize, start_price: f64, step: f64) -> Vec<RawTick> {
     (0..count).map(|i| {
         let ts = (i as u64) * 1_000_000;
         let price = start_price - (i as f64) * step;
-        make_raw_tick(symbol_id, ts, price.max(1.0), 0.04)
+        make_raw_tick(symbol_id, symbol, ts, price.max(1.0), 0.04)
     }).collect()
 }
 
@@ -525,7 +527,7 @@ fn test_e2e_long_entry_signal_path() {
     let fix = PipelineFixture::with_aggressive_strategy();
 
     // Inject a strong uptrend — should eventually produce Long entry signals
-    let ticks = generate_uptrend_ticks(SymbolId::from_raw(42), 500, 100.0, 0.5);
+    let ticks = generate_uptrend_ticks(SymbolId::from_raw(42), "TEST", 500, 100.0, 0.5);
     for tick in &ticks {
         fix.md_tx.send(tick.clone()).unwrap();
     }
@@ -615,11 +617,11 @@ fn test_e2e_exit_signal_path_with_downtrend() {
     let fix = PipelineFixture::with_aggressive_strategy();
 
     // First send an uptrend to establish position / warm up indicators
-    let up_ticks = generate_uptrend_ticks(SymbolId::from_raw(42), 150, 100.0, 0.3);
+    let up_ticks = generate_uptrend_ticks(SymbolId::from_raw(42), "TEST", 150, 100.0, 0.3);
     for t in &up_ticks { fix.md_tx.send(t.clone()).unwrap(); }
 
     // Then reverse into a downtrend — should generate Short / CloseLong signals
-    let down_ticks = generate_downtrend_ticks(SymbolId::from_raw(42), 150, 145.5, 0.5);
+    let down_ticks = generate_downtrend_ticks(SymbolId::from_raw(42), "TEST", 150, 145.5, 0.5);
     for t in &down_ticks { fix.md_tx.send(t.clone()).unwrap(); }
 
     std::thread::sleep(Duration::from_millis(1000));
@@ -666,6 +668,7 @@ fn test_e2e_trace_id_propagation_across_pipeline() {
     for i in 0..200u64 {
         let tick = make_raw_tick(
             SymbolId::from_raw(42),
+            "TEST",
             base_ts + i * 1_000_000,
             100.0 + (i as f64) * 0.4,
             0.04,
@@ -692,7 +695,7 @@ fn test_e2e_rejected_risk_decisions_do_not_become_orders() {
     let fix = PipelineFixture::with_aggressive_strategy();
 
     // Send enough ticks to generate some activity
-    let ticks = generate_uptrend_ticks(SymbolId::from_raw(42), 100, 100.0, 0.3);
+    let ticks = generate_uptrend_ticks(SymbolId::from_raw(42), "TEST", 100, 100.0, 0.3);
     for t in &ticks { fix.md_tx.send(t.clone()).unwrap(); }
 
     std::thread::sleep(Duration::from_millis(500));
