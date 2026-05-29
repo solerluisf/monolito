@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::EngineConfig;
+use crate::clock::wall_time_ns;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CrashState {
@@ -23,10 +23,7 @@ impl CrashDetector {
     }
 
     pub fn check_and_record_startup(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = wall_time_ns() / 1_000_000; // Convert ns to ms
 
         let prev_state = std::fs::read_to_string(&self.state_file)
             .ok()

@@ -4,20 +4,34 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::clock::{Clock, WallClock};
 use crate::kill_switch::KillSwitch;
 use crate::metrics::GlobalMetrics;
 use crate::threading::{spawn_pinned, ThreadPriority};
 
 pub struct HeartbeatHandle {
     timestamp_ns: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
 }
 
 impl HeartbeatHandle {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            timestamp_ns: Arc::new(AtomicU64::new(0)),
+            clock,
+        }
+    }
+
+    /// Create a handle that shares the given timestamp atomic
+    pub fn with_timestamp(timestamp_ns: Arc<AtomicU64>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            timestamp_ns,
+            clock,
+        }
+    }
+
     pub fn pulse(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = self.clock.now_ns();
         self.timestamp_ns.store(now, Ordering::Relaxed);
     }
 }
@@ -27,6 +41,7 @@ pub struct ThreadHeartbeatMonitor {
     handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     asset_watchdog_timeout_ns: u64,
+    clock: Arc<dyn Clock>,
 }
 
 impl ThreadHeartbeatMonitor {
@@ -37,6 +52,24 @@ impl ThreadHeartbeatMonitor {
         check_interval_ms: u64,
         core_id: usize,
     ) -> Self {
+        Self::with_clock(
+            kill_switch,
+            metrics,
+            timeout_ns,
+            check_interval_ms,
+            core_id,
+            Arc::new(WallClock::new()),
+        )
+    }
+
+    pub fn with_clock(
+        kill_switch: Arc<KillSwitch>,
+        metrics: Arc<GlobalMetrics>,
+        timeout_ns: u64,
+        check_interval_ms: u64,
+        core_id: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let heartbeats = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let running = Arc::new(AtomicBool::new(true));
 
@@ -44,6 +77,7 @@ impl ThreadHeartbeatMonitor {
         let ks = Arc::clone(&kill_switch);
         let m = Arc::clone(&metrics);
         let r = Arc::clone(&running);
+        let c = Arc::clone(&clock);
 
         let asset_watchdog_timeout_ns = timeout_ns.saturating_div(2).max(1);
 
@@ -60,6 +94,7 @@ impl ThreadHeartbeatMonitor {
                     asset_watchdog_timeout_ns,
                     check_interval_ms,
                     &r,
+                    &c,
                 );
             },
         );
@@ -69,6 +104,7 @@ impl ThreadHeartbeatMonitor {
             handle: Some(handle.expect("spawn_pinned failed")),
             running,
             asset_watchdog_timeout_ns,
+            clock,
         }
     }
 
@@ -80,6 +116,7 @@ impl ThreadHeartbeatMonitor {
         asset_watchdog_timeout_ns: u64,
         check_interval_ms: u64,
         running: &AtomicBool,
+        clock: &Arc<dyn Clock>,
     ) {
         let interval = Duration::from_millis(check_interval_ms);
         while running.load(Ordering::Relaxed) {
@@ -89,10 +126,7 @@ impl ThreadHeartbeatMonitor {
                 continue;
             }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            let now = clock.now_ns();
 
             let map = heartbeats.read();
             for (name, ts) in map.iter() {
@@ -135,7 +169,8 @@ impl ThreadHeartbeatMonitor {
         let ts = Arc::new(AtomicU64::new(0));
         let mut map = self.heartbeats.write();
         map.insert(name.to_string(), Arc::clone(&ts));
-        HeartbeatHandle { timestamp_ns: ts }
+        // Return handle that shares the same atomic
+        HeartbeatHandle::with_timestamp(ts, Arc::clone(&self.clock))
     }
 
     pub fn heartbeats(&self) -> Arc<parking_lot::RwLock<HashMap<String, Arc<AtomicU64>>>> {
@@ -157,14 +192,15 @@ impl ThreadHeartbeatMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
 
     #[test]
     fn test_heartbeat_handle_pulse() {
-        let ts = Arc::new(AtomicU64::new(0));
-        let handle = HeartbeatHandle { timestamp_ns: Arc::clone(&ts) };
-        assert_eq!(ts.load(Ordering::Relaxed), 0);
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_000_000_000));
+        let handle = HeartbeatHandle::new(Arc::clone(&clock));
+        assert_eq!(handle.timestamp_ns.load(Ordering::Relaxed), 0);
         handle.pulse();
-        assert!(ts.load(Ordering::Relaxed) > 0);
+        assert_eq!(handle.timestamp_ns.load(Ordering::Relaxed), 1_000_000_000);
     }
 
     #[test]
@@ -187,16 +223,17 @@ mod tests {
         let monitor = ThreadHeartbeatMonitor::new(
             Arc::clone(&ks),
             Arc::clone(&metrics),
-            50_000_000, // 50ms timeout
-            20,         // check every 20ms
+            100_000_000, // 100ms timeout
+            10,          // check every 10ms
             0,
         );
 
         let handle = monitor.register_thread("stale_thread");
         handle.pulse();
 
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(ks.is_active());
+        // Give monitor time to run multiple check cycles
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(ks.is_active(), "Kill switch should be active after heartbeat timeout");
         assert!(metrics.heartbeat_misses.load(Ordering::Relaxed) > 0);
 
         let mut monitor = monitor;

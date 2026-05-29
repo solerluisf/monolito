@@ -3,22 +3,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
+use crate::clock::{Clock, WallClock, wall_time_ns};
+
 pub struct KillSwitch {
     active: AtomicBool,
     activated_at_ns: AtomicU64,
     activation_count: AtomicU64,
     open_orders: Arc<Mutex<HashSet<String>>>,
     activation_latency_ns: AtomicU64,  // Time from activate() call to store completion
+    clock: Arc<dyn Clock>,
 }
 
 impl KillSwitch {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(WallClock::new()))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
             active: AtomicBool::new(false),
             activated_at_ns: AtomicU64::new(0),
             activation_count: AtomicU64::new(0),
             open_orders: Arc::new(Mutex::new(HashSet::new())),
             activation_latency_ns: AtomicU64::new(0),
+            clock,
         }
     }
 
@@ -33,10 +41,7 @@ impl KillSwitch {
         };
 
         if !self.active.load(Ordering::Relaxed) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            let now = self.clock.now_ns();
             self.activated_at_ns.store(now, Ordering::SeqCst);
             self.activation_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -114,6 +119,7 @@ impl Default for KillSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::TestClock;
 
     #[test]
     fn test_kill_switch_initial_state() {
@@ -168,6 +174,15 @@ mod tests {
         ks.track_open_order("order-2");
         let count = ks.activate();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_kill_switch_with_custom_clock() {
+        let clock = Arc::new(TestClock::new(1_000_000_000_000));
+        let ks = KillSwitch::with_clock(clock);
+        ks.activate();
+        assert!(ks.is_active());
+        assert_eq!(ks.activated_at_ns(), 1_000_000_000_000);
     }
 
     /// Benchmark-style test measuring KillSwitch activation latency under concurrent reads.

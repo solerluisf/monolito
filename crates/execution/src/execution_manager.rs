@@ -2,6 +2,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use unified_trading_core::clock::{Clock, WallClock};
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::journal::{JournalWriter, JournalEntry};
@@ -31,6 +32,7 @@ pub struct ExecutionManager {
     pub kill_switch: Arc<KillSwitch>,
     pub validator: RequestValidator,
     running: Arc<AtomicBool>,
+    clock: Arc<dyn Clock>,
 }
 
 impl ExecutionManager {
@@ -49,6 +51,40 @@ impl ExecutionManager {
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
     ) -> Self {
+        Self::with_clock(
+            decision_rx,
+            lifecycle_tx,
+            execution_port,
+            global_rate,
+            per_symbol_rate,
+            metrics,
+            kill_switch,
+            portfolio_manager,
+            order_tracker,
+            rate_limiter,
+            circuit_breaker,
+            idempotency_store,
+            validator,
+            Arc::new(WallClock::new()),
+        )
+    }
+
+    pub fn with_clock(
+        decision_rx: Receiver<RiskDecision>,
+        lifecycle_tx: Sender<OrderLifecycleEvent>,
+        execution_port: Arc<dyn IExecutionPort>,
+        _global_rate: f64,
+        _per_symbol_rate: f64,
+        metrics: Arc<GlobalMetrics>,
+        kill_switch: Arc<KillSwitch>,
+        portfolio_manager: Arc<PortfolioManager>,
+        order_tracker: Arc<parking_lot::Mutex<OrderTracker>>,
+        rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+        circuit_breaker: Arc<CircuitBreaker>,
+        idempotency_store: Arc<IdempotencyStore>,
+        validator: RequestValidator,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             decision_rx,
             lifecycle_tx,
@@ -63,6 +99,7 @@ impl ExecutionManager {
             kill_switch,
             validator,
             running: Arc::new(AtomicBool::new(true)),
+            clock,
         }
     }
 
@@ -103,10 +140,7 @@ impl ExecutionManager {
 
     #[tracing::instrument(skip_all, fields(request_id = %decision.request_id))]
     fn execute_decision(&mut self, decision: &RiskDecision) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = self.clock.now_ns();
 
         let symbol_id = decision.request.symbol_id;
         let symbol_key = symbol_id.as_u16().to_string();
@@ -173,17 +207,11 @@ impl ExecutionManager {
             }
         }
 
-        let broker_start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let broker_start = self.clock.now_monotonic_ns();
 
         match self.execution_port.submit_order(&cmd) {
             Ok(execution_id) => {
-                let broker_end = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                let broker_end = self.clock.now_monotonic_ns();
                 let rtt_ns = broker_end.saturating_sub(broker_start);
                 self.metrics.broker_round_trip_latency.record(rtt_ns);
                 self.metrics.broker_send_latency.record(rtt_ns);
@@ -226,10 +254,7 @@ impl ExecutionManager {
     }
 
     pub fn on_fill(&mut self, order_id: &str, symbol: &str, filled_qty: f64, fill_price: f64, trace_id: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = self.clock.now_ns();
 
         {
             let mut tracker = self.order_tracker.lock();
@@ -257,10 +282,7 @@ impl ExecutionManager {
     }
 
     pub fn on_reject(&mut self, order_id: &str, symbol: &str, reason: &str, trace_id: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = self.clock.now_ns();
 
         self.kill_switch.remove_open_order(order_id);
         self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
@@ -279,10 +301,7 @@ impl ExecutionManager {
     }
 
     pub fn on_cancel(&mut self, order_id: &str, symbol: &str, trace_id: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = self.clock.now_ns();
 
         {
             let mut tracker = self.order_tracker.lock();
@@ -319,22 +338,17 @@ impl ExecutionManager {
     }
 }
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use unified_trading_core::clock::wall_time_ns;
     use gateway::MockExecutionPort;
 
 use unified_trading_core::symbol_registry::SymbolId;
 
     fn make_approved_decision() -> RiskDecision {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         let request = risk::RiskCheckRequest {
             request_id: unified_trading_core::symbol_registry::next_request_id(),
             symbol_id: SymbolId::from_raw(0),

@@ -67,10 +67,7 @@ fn run_processor(
             let _ = feature_tx.try_send(features.clone());
 
             if let Some(signal) = strategy_engine.evaluate_from_features(&features) {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                let now = unified_trading_core::clock::wall_time_ns();
                 let request = RiskCheckRequest {
                     request_id: next_request_id(),
                     symbol_id: signal.symbol_id,

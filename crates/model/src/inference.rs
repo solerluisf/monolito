@@ -1,6 +1,6 @@
 use feature::{FeatureVector, FeatureIndex, FEATURE_SCHEMA_VERSION};
 use crate::prediction_engine::Prediction;
-use std::time::{SystemTime, UNIX_EPOCH};
+use unified_trading_core::clock::wall_time_ns;
 
 pub struct InferenceEngine {
     pub feature_vector_size: usize,
@@ -54,10 +54,7 @@ impl InferenceEngine {
     }
 
     pub fn predict(&self, features: &FeatureVector) -> Prediction {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         let mid_price = features.get(FeatureIndex::MidPrice);
         let rsi = features.get(FeatureIndex::Rsi14);

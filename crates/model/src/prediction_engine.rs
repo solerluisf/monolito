@@ -1,12 +1,13 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use feature::{FeatureVector, FeatureIndex};
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::symbol_registry::SymbolId;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
+use unified_trading_core::clock::wall_time_ns;
 
 use crate::model_registry::ModelRegistry;
 
@@ -46,10 +47,7 @@ pub struct Prediction {
 
 impl Prediction {
     pub fn is_stale(&self, staleness_ns: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         now.saturating_sub(self.computed_ns) > staleness_ns
     }
 
@@ -67,10 +65,7 @@ impl Prediction {
     }
 
     pub fn from_features(features: &FeatureVector, symbol_id: SymbolId) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         let forecast = features.get(FeatureIndex::MidPrice);
         let confidence = features.get(FeatureIndex::Confidence);
@@ -93,10 +88,7 @@ impl Prediction {
     /// Create a heuristic prediction from raw features when the model is stale or unavailable.
     /// Uses MACD histogram as a simple trend-following signal with fixed confidence.
     pub fn heuristic_from_features(features: &FeatureVector, symbol_id: SymbolId) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         let macd_hist = features.get(FeatureIndex::MacdHistogram);
         let action_score = macd_hist;
@@ -387,10 +379,7 @@ mod tests {
 
     #[test]
     fn test_prediction_not_stale() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
         let pred = Prediction {
             symbol_id: SymbolId::from_raw(0),
             forecast: 0.5,
@@ -493,10 +482,7 @@ mod tests {
                 action_score: 0.5,
                 regime_label: 0,
                 regime_strength: 0.5,
-                computed_ns: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64,
+                computed_ns: unified_trading_core::clock::wall_time_ns(),
                 trace_id: features.trace_id,
             }
         }, 0);

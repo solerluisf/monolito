@@ -74,10 +74,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         action_score: 0.0,
         regime_label: 0,
         regime_strength: 0.0,
-        computed_ns: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64,
+        computed_ns: unified_trading_core::clock::wall_time_ns(),
         trace_id: 1,
     });
     let latest_pred = Arc::new(ArcSwap::new(prediction));

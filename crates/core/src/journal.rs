@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
+use crate::clock::{Clock, WallClock};
 use crate::metrics::GlobalMetrics;
 use crate::threading::{spawn_pinned, ThreadPriority};
 
@@ -36,6 +37,7 @@ pub struct JournalWriter {
     journal_dir: PathBuf,
     retention_hours: u32,
     max_size_mb: u64,
+    clock: Arc<dyn Clock>,
 }
 
 impl JournalWriter {
@@ -46,6 +48,26 @@ impl JournalWriter {
         core_id: usize,
         retention_hours: u32,
         max_size_mb: u64,
+    ) -> Self {
+        Self::with_clock(
+            journal_dir,
+            flush_interval_ms,
+            metrics,
+            core_id,
+            retention_hours,
+            max_size_mb,
+            Arc::new(WallClock::new()),
+        )
+    }
+
+    pub fn with_clock(
+        journal_dir: &str,
+        flush_interval_ms: u64,
+        metrics: Arc<GlobalMetrics>,
+        core_id: usize,
+        retention_hours: u32,
+        max_size_mb: u64,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let (tx, rx) = bounded::<JournalCommand>(10_000);
         let write_count = Arc::new(AtomicU64::new(0));
@@ -62,6 +84,7 @@ impl JournalWriter {
         let journal_dir_clone = path.clone();
         let retention_hours_clone = retention_hours;
         let max_size_mb_clone = max_size_mb;
+        let clock_clone = Arc::clone(&clock);
 
         let handle = spawn_pinned(
             "journal",
@@ -77,6 +100,7 @@ impl JournalWriter {
                     retention_hours_clone,
                     max_size_mb_clone,
                     &journal_dir_clone,
+                    &clock_clone,
                 );
             },
         );
@@ -89,6 +113,7 @@ impl JournalWriter {
             journal_dir: path,
             retention_hours,
             max_size_mb,
+            clock,
         }
     }
 
@@ -140,6 +165,7 @@ impl JournalWriter {
         retention_hours: u32,
         max_size_mb: u64,
         journal_dir: &PathBuf,
+        clock: &Arc<dyn Clock>,
     ) {
         let file = OpenOptions::new()
             .create(true)
@@ -179,7 +205,7 @@ impl JournalWriter {
                 }
                 Ok(JournalCommand::Compaction) => {
                     let _ = writer.flush();
-                    Self::run_compaction(journal_dir, retention_hours, max_size_mb);
+                    Self::run_compaction(journal_dir, retention_hours, max_size_mb, clock);
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if last_flush.elapsed() >= flush_dur {
@@ -188,7 +214,7 @@ impl JournalWriter {
                     }
                     if last_compaction_check.elapsed() >= compaction_check_interval {
                         let _ = writer.flush();
-                        Self::run_compaction(journal_dir, retention_hours, max_size_mb);
+                        Self::run_compaction(journal_dir, retention_hours, max_size_mb, clock);
                         last_compaction_check = std::time::Instant::now();
                     }
                 }
@@ -200,11 +226,8 @@ impl JournalWriter {
         }
     }
 
-    fn run_compaction(journal_dir: &PathBuf, retention_hours: u32, max_size_mb: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u64;
+    fn run_compaction(journal_dir: &PathBuf, retention_hours: u32, max_size_mb: u64, clock: &Arc<dyn Clock>) {
+        let now = clock.now_ns() / 1_000_000_000; // Convert ns to seconds
         let retention_secs = retention_hours as u64 * 3600;
         let cutoff = now.saturating_sub(retention_secs);
         let max_bytes = max_size_mb as u64 * 1024 * 1024;

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use unified_trading_core::clock::wall_time_ns;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CooldownKey {
@@ -29,10 +29,7 @@ impl CooldownTracker {
         };
 
         if let Some(&last_time) = self.cooldowns.get(&key) {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+            let now = wall_time_ns() / 1_000_000; // Convert ns to ms
             let cooldown = if intent_type == "entry" || intent_type == "scale_in" {
                 self.entry_cooldown_ms
             } else {
@@ -49,10 +46,7 @@ impl CooldownTracker {
             symbol: symbol.to_string(),
             intent_type: intent_type.to_string(),
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = wall_time_ns() / 1_000_000; // Convert ns to ms
         self.cooldowns.insert(key, now);
     }
 

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use parking_lot::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use unified_trading_core::clock::wall_time_ns;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
@@ -62,10 +62,7 @@ impl CircuitBreaker {
         let threshold = self.failure_threshold_val();
 
         if inner.failures >= threshold || inner.state == State::HalfOpen {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            let now = wall_time_ns();
             inner.tripped_at_ns = now;
             inner.state = State::Open;
             self.is_open.store(true, Ordering::SeqCst);
@@ -77,10 +74,7 @@ impl CircuitBreaker {
 
     pub fn trip(&self) {
         let mut inner = self.inner.lock();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         inner.tripped_at_ns = now;
         inner.state = State::Open;
         inner.failures = self.failure_threshold_val();
@@ -94,10 +88,7 @@ impl CircuitBreaker {
         match inner.state {
             State::Closed => true,
             State::Open => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                let now = wall_time_ns();
                 let elapsed_ms = now.saturating_sub(inner.tripped_at_ns) / 1_000_000;
 
                 if elapsed_ms > self.cooldown_ms_val() {

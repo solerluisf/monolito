@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
@@ -9,6 +8,7 @@ use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::symbol_registry::{SymbolId, SymbolRegistry, SymbolIdArray, next_trace_id};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
+use unified_trading_core::clock::wall_time_ns;
 
 use market_data::RawTick;
 
@@ -155,10 +155,7 @@ impl TickReactor {
             return;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         for tick in batch.drain(..) {
             self.total_ticks.fetch_add(1, Ordering::Relaxed);

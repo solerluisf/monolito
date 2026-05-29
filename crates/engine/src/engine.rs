@@ -15,6 +15,7 @@ use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::config_watcher::ConfigWatcher;
 use unified_trading_core::idempotency::IdempotencyStore;
 use unified_trading_core::symbol_registry::{SymbolRegistry, SymbolId, next_request_id};
+use unified_trading_core::clock::wall_time_ns;
 use parking_lot::RwLock;
 
 use market_data::{Normalizer, RawTick};
@@ -262,10 +263,7 @@ impl AssetProcessor {
                 self.metrics.increment_per_symbol_feature(&self.symbol);
 
                 // Record feed latency (tick timestamp to processing time)
-                let proc_ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+                let proc_ns = wall_time_ns();
                 let latency = proc_ns.saturating_sub(tick.timestamp_ns);
                 self.metrics.feed_latency.record(latency);
 
@@ -305,10 +303,7 @@ impl AssetProcessor {
     }
 
     pub fn build_risk_request(&self, signal: &TradeIntent, prediction: &Prediction, current_spread_bps: f64, mid_price: f64) -> RiskCheckRequest {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         // Calculate implied volatility from prediction confidence (simplified)
         let current_volatility = (1.0 - prediction.confidence as f64).max(0.0);
@@ -698,10 +693,7 @@ impl UnifiedEngine {
                         };
                         let mut tracker = state.order_tracker.lock();
                         let order_id = tracker.create_order(&order.symbol, side_str, order.quantity, None, &order.order_id);
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos() as u64;
+                        let now = unified_trading_core::clock::wall_time_ns();
                         let _ = tracker.submit_order(&order_id, now);
                         if order.filled_qty > 0.0 {
                             let _ = tracker.partial_fill_order(&order_id, order.filled_qty, 0.0, now);

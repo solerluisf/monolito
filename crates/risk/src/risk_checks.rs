@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use unified_trading_core::config::{RiskConfig, CheckSeverity, default_check_severities};
 use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::symbol_registry::SymbolId;
+use unified_trading_core::clock::wall_time_ns;
 
 #[derive(Debug, Clone)]
 pub struct RiskCheckRequest {
@@ -42,10 +42,7 @@ impl RiskDecision {
             rejection_reason: None,
             warnings: Vec::new(),
             check_index: 14,
-            timestamp_ns: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            timestamp_ns: wall_time_ns(),
             request: request.clone(),
             trace_id: request.trace_id,
         }
@@ -58,10 +55,7 @@ impl RiskDecision {
             rejection_reason: Some(reason.to_string()),
             warnings: Vec::new(),
             check_index,
-            timestamp_ns: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            timestamp_ns: wall_time_ns(),
             request: request.clone(),
             trace_id: request.trace_id,
         }
@@ -184,10 +178,7 @@ impl RiskEngine {
     }
 
     fn check_staleness(&self, request: &RiskCheckRequest) -> Option<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         let age_ns = now.saturating_sub(request.timestamp_ns);
         if age_ns > self.config.risk_intent_staleness_ns {
             Some("Intent expired".to_string())
@@ -197,10 +188,7 @@ impl RiskEngine {
     }
 
     fn check_order_rate(&mut self, _request: &RiskCheckRequest) -> Option<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         if self.order_rate_last_refill > 0 {
             let elapsed_s = (now - self.order_rate_last_refill) as f64 / 1_000_000_000.0;
@@ -292,14 +280,10 @@ impl RiskEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use unified_trading_core::symbol_registry::{next_intent_id, next_request_id, SymbolId};
 
     fn make_request(symbol_id: SymbolId, quantity: f64, price: f64) -> RiskCheckRequest {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         RiskCheckRequest {
             request_id: next_request_id(),
             symbol_id,
@@ -315,10 +299,7 @@ mod tests {
     }
 
     fn make_request_with_trace(symbol_id: SymbolId, quantity: f64, price: f64, trace_id: u64) -> RiskCheckRequest {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         RiskCheckRequest {
             request_id: next_request_id(),
             symbol_id,

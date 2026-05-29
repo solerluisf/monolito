@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::order_state_machine::{OrderEvent, OrderState, OrderStateMachine};
 use unified_trading_core::symbol_registry::next_request_id;
+use unified_trading_core::clock::wall_time_ns;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -61,10 +61,7 @@ impl OrderTracker {
         correlation_id: &str,
     ) -> String {
         let order_id = next_request_id().to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         let order = Order {
             order_id: order_id.clone(),
@@ -160,10 +157,7 @@ impl OrderTracker {
 
     #[deprecated(note = "Use full_fill_order or partial_fill_order instead")]
     pub fn update_fill(&mut self, order_id: &str, filled_qty: f64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
 
         if let Some(order) = self.orders.get(order_id) {
             let fill_price = order.limit_price.unwrap_or(0.0);
@@ -239,7 +233,7 @@ mod tests {
     fn test_order_tracker_valid_transition_submit() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         let result = tracker.submit_order(&id, now);
         assert!(result.is_ok());
         assert_eq!(tracker.open_orders_count(), 1);
@@ -251,7 +245,7 @@ mod tests {
     fn test_order_tracker_valid_transition_partial_fill() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         tracker.submit_order(&id, now).unwrap();
         let result = tracker.partial_fill_order(&id, 5.0, 150.0, now + 1_000_000);
         assert!(result.is_ok());
@@ -264,7 +258,7 @@ mod tests {
     fn test_order_tracker_valid_transition_full_fill() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         tracker.submit_order(&id, now).unwrap();
         let result = tracker.full_fill_order(&id, 10.0, 150.0, now + 1_000_000);
         assert!(result.is_ok());
@@ -278,7 +272,7 @@ mod tests {
     fn test_order_tracker_invalid_transition_after_fill() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         tracker.submit_order(&id, now).unwrap();
         tracker.full_fill_order(&id, 10.0, 150.0, now + 1_000_000).unwrap();
         let result = tracker.submit_order(&id, now + 2_000_000);
@@ -289,7 +283,7 @@ mod tests {
     fn test_order_tracker_invalid_transition_after_cancel() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         tracker.submit_order(&id, now).unwrap();
         tracker.cancel_order(&id, now + 1_000_000).unwrap();
         let result = tracker.partial_fill_order(&id, 5.0, 150.0, now + 2_000_000);
@@ -310,7 +304,7 @@ mod tests {
     fn test_order_tracker_state_machine_metadata() {
         let mut tracker = OrderTracker::new();
         let id = tracker.create_order("AAPL", "buy", 10.0, None, "corr-1");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+        let now = wall_time_ns();
         tracker.submit_order(&id, now).unwrap();
         tracker.partial_fill_order(&id, 5.0, 100.0, now + 1_000_000).unwrap();
         tracker.partial_fill_order(&id, 5.0, 120.0, now + 2_000_000).unwrap();

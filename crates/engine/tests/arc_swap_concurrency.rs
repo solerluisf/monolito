@@ -31,10 +31,7 @@ fn test_arc_swap_prediction_concurrent() {
                     action_score: 0.0,
                     regime_label: i,
                     regime_strength: 0.5,
-                    computed_ns: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64,
+                    computed_ns: unified_trading_core::clock::wall_time_ns(),
                     trace_id: 1,
                 };
                 pred.store(Arc::new(new_pred));

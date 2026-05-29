@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use model::Prediction;
+use unified_trading_core::clock::{Clock, WallClock};
 use unified_trading_core::symbol_registry::SymbolId;
 use unified_trading_core::symbol_registry::next_intent_id;
 
@@ -65,10 +66,31 @@ impl TradeIntent {
         ttl_ns: u64,
         trace_id: u64,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        Self::with_clock(
+            symbol_id,
+            side,
+            size_hint,
+            intent_type,
+            confidence,
+            action_score,
+            ttl_ns,
+            trace_id,
+            Arc::new(wall_clock()),
+        )
+    }
+
+    pub fn with_clock(
+        symbol_id: SymbolId,
+        side: SignalSide,
+        size_hint: SizeHint,
+        intent_type: IntentType,
+        confidence: f64,
+        action_score: f64,
+        ttl_ns: u64,
+        trace_id: u64,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let now = clock.now_ns();
 
         Self {
             intent_id: next_intent_id(),
@@ -86,12 +108,18 @@ impl TradeIntent {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        Self::is_expired_with_clock(self, Arc::new(wall_clock()))
+    }
+
+    pub fn is_expired_with_clock(&self, clock: Arc<dyn Clock>) -> bool {
+        let now = clock.now_ns();
         now > self.expires_ns
     }
+}
+
+/// Returns a new WallClock instance for use in production code.
+fn wall_clock() -> WallClock {
+    WallClock::new()
 }
 
 pub struct StrategyEngine {
@@ -198,10 +226,7 @@ impl StrategyEngine {
     }
 
     fn check_cooldown_for_score(&self, score: f64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
 
         if score > self.long_entry_threshold {
             now.saturating_sub(self.last_entry_ns.load(Ordering::Relaxed)) > self.entry_cooldown_ms * 1_000_000
@@ -213,10 +238,7 @@ impl StrategyEngine {
     }
 
     fn apply_hysteresis(&self, score: f64, trace_id: u64) -> Option<TradeIntent> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
 
         match self.hysteresis_state.load(Ordering::Relaxed) {
             0 => {
@@ -291,10 +313,7 @@ impl StrategyEngine {
     }
 
     fn check_cooldown(&self, intent: &TradeIntent) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
 
         match intent.intent_type {
             IntentType::Entry | IntentType::ScaleIn => {
@@ -390,7 +409,8 @@ impl Strategy for StrategyEngine {
 mod tests {
     use super::*;
     use model::Prediction;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use unified_trading_core::clock::TestClock;
 
     fn make_engine() -> StrategyEngine {
         let config = unified_trading_core::config::StrategyConfig {
@@ -425,10 +445,7 @@ mod tests {
     }
 
     fn make_pred(score: f64, confidence: f64) -> Prediction {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
         Prediction {
             symbol_id: SymbolId::from_raw(0),
             forecast: score as f32,
@@ -442,10 +459,7 @@ mod tests {
     }
 
     fn make_pred_with_trace(score: f64, confidence: f64, trace_id: u64) -> Prediction {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
         Prediction {
             symbol_id: SymbolId::from_raw(0),
             forecast: score as f32,
@@ -456,6 +470,72 @@ mod tests {
             computed_ns: now,
             trace_id,
         }
+    }
+
+    #[test]
+    fn test_trade_intent_expiration_with_test_clock() {
+        // This is the acceptance test for ISSUE-032:
+        // A unit test advances TestClock by 1 hour and asserts that
+        // TradeIntent::is_expired() triggers correctly.
+        
+        let clock = Arc::new(TestClock::new(1_000_000_000_000)); // 1 second after epoch (1e12 ns)
+        
+        // Create a TradeIntent with 30 second TTL
+        let ttl_ns = 30_000_000_000u64; // 30 seconds in nanoseconds
+        let intent = TradeIntent::with_clock(
+            SymbolId::from_raw(0),
+            SignalSide::Long,
+            SizeHint::Units(1),
+            IntentType::Entry,
+            0.8,
+            0.8,
+            ttl_ns,
+            0,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        
+        // At creation time, intent should not be expired
+        assert!(!intent.is_expired_with_clock(Arc::clone(&clock) as Arc<dyn Clock>), 
+            "Intent should not be expired at creation time");
+        
+        // Advance clock by 1 second (well within TTL)
+        clock.advance(1_000_000_000);
+        assert!(!intent.is_expired_with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+            "Intent should not be expired after 1 second");
+        
+        // Advance clock by 1 hour (well past TTL)
+        let one_hour_ns = 3_600_000_000_000u64; // 1 hour in nanoseconds
+        clock.advance(one_hour_ns);
+        assert!(intent.is_expired_with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+            "Intent should be expired after advancing clock by 1 hour");
+    }
+
+    #[test]
+    fn test_trade_intent_expiration_edge_case() {
+        // Test the exact boundary of expiration
+        let clock = Arc::new(TestClock::new(1_000_000_000_000));
+        
+        // Create intent with exactly 1 second TTL
+        let ttl_ns = 1_000_000_000u64; // 1 second
+        let intent = TradeIntent::with_clock(
+            SymbolId::from_raw(0),
+            SignalSide::Long,
+            SizeHint::Units(1),
+            IntentType::Entry,
+            0.8,
+            0.8,
+            ttl_ns,
+            0,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        
+        // At exactly TTL time, should not be expired (expires_ns > now)
+        assert!(!intent.is_expired_with_clock(Arc::clone(&clock) as Arc<dyn Clock>));
+        
+        // Advance by 1 nanosecond past TTL (TTL is 1e9 ns, so need TTL + 1)
+        clock.advance(ttl_ns + 1);
+        assert!(intent.is_expired_with_clock(Arc::clone(&clock) as Arc<dyn Clock>),
+            "Intent should be expired 1ns past TTL");
     }
 
     #[test]

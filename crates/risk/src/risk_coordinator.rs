@@ -8,6 +8,7 @@ use unified_trading_core::metrics::GlobalMetrics;
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 use unified_trading_core::portfolio_manager::PortfolioManager;
 use unified_trading_core::channel_utils::{send_with_policy, PolicySendError};
+use unified_trading_core::clock::wall_time_ns;
 
 use crate::risk_checks::{RiskCheckRequest, RiskDecision, RiskEngine};
 
@@ -77,10 +78,7 @@ impl RiskCoordinator {
                     }
                     let elapsed_ns = check_start.elapsed().as_nanos() as u64;
                     self.metrics.risk_check_latency.record(elapsed_ns);
-                    let decision_latency_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
+                    let decision_latency_ns = wall_time_ns();
                     let total_latency = decision_latency_ns.saturating_sub(request.timestamp_ns);
                     self.metrics.decision_latency.record(total_latency);
                 }
@@ -122,15 +120,10 @@ impl RiskCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-use unified_trading_core::symbol_registry::SymbolId;
+    use unified_trading_core::symbol_registry::SymbolId;
 
     fn make_request(symbol_id: SymbolId) -> RiskCheckRequest {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = unified_trading_core::clock::wall_time_ns();
         RiskCheckRequest {
             request_id: unified_trading_core::symbol_registry::next_request_id(),
             symbol_id,

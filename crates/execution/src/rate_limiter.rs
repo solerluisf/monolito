@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use unified_trading_core::clock::wall_time_ns;
 
 pub struct TokenBucket {
     pub tokens: f64,
@@ -10,10 +10,7 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     pub fn new(max_tokens: f64, refill_rate: f64) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         Self {
             tokens: max_tokens,
             max_tokens,
@@ -34,10 +31,7 @@ impl TokenBucket {
     }
 
     fn refill(&mut self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = wall_time_ns();
         let elapsed_s = (now - self.last_refill_ns) as f64 / 1_000_000_000.0;
         self.tokens = (self.tokens + elapsed_s * self.refill_rate).min(self.max_tokens);
         self.last_refill_ns = now;
