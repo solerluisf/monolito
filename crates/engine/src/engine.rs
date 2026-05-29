@@ -98,11 +98,28 @@ use std::time::Instant;
 /// Phases of a staged config rollout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RolloutPhase {
-    /// Config has been applied to the first (canary) asset; monitoring.
     Monitoring,
-    /// Monitoring period passed without errors; applying globally.
-    RollingOut,
+    Completed,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RolloutError {
+    NotInProgress,
+    ValidationFailed(String),
+    NoCanaryAsset,
+}
+
+impl std::fmt::Display for RolloutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RolloutError::NotInProgress => write!(f, "no staged rollout in progress"),
+            RolloutError::ValidationFailed(msg) => write!(f, "validation failed: {}", msg),
+            RolloutError::NoCanaryAsset => write!(f, "no enabled assets for canary rollout"),
+        }
+    }
+}
+
+impl std::error::Error for RolloutError {}
 
 /// Holds the state of an in-progress staged rollout so the engine can
 /// promote or abort it after the observation window.
@@ -1059,19 +1076,17 @@ impl UnifiedEngine {
         &mut self,
         pending: EngineConfig,
         monitoring_duration_secs: Option<u64>,
-    ) -> Result<(), String> {
-        // 1. Validate in sandbox (no lock held on live config yet)
+    ) -> Result<(), RolloutError> {
         pending.validate()
-            .map_err(|e| format!("staged rollout rejected — {}", e))?;
+            .map_err(|e| RolloutError::ValidationFailed(format!("staged rollout rejected — {}", e)))?;
 
-        // 2. Pick canary symbol (first enabled asset)
         let canary_symbol = {
             let cfg = self.config.read();
             cfg.asset_configs
                 .iter()
                 .find(|a| a.enabled)
                 .map(|a| a.symbol.clone())
-                .ok_or_else(|| "no enabled assets for canary rollout".to_string())?
+                .ok_or(RolloutError::NoCanaryAsset)?
         };
 
         let duration = monitoring_duration_secs.unwrap_or(30);
@@ -1082,9 +1097,6 @@ impl UnifiedEngine {
             "Starting staged config rollout — applying to canary asset only"
         );
 
-        // 3. Apply per-asset overrides from pending config to the canary.
-        //    We selectively update fields that affect the canary's pipeline
-        //    without touching global state yet.
         {
             let mut cfg = self.config.write();
             if let Some(asset) = cfg.asset_configs.iter_mut().find(|a| a.symbol == canary_symbol) {
@@ -1094,7 +1106,6 @@ impl UnifiedEngine {
                     asset.enabled = pending_asset.enabled;
                 }
             }
-            // Also apply risk params that affect the canary's risk coordinator
             cfg.risk_config.max_leverage = pending.risk_config.max_leverage;
             cfg.risk_config.max_position_per_symbol = pending.risk_config.max_position_per_symbol;
             cfg.risk_config.max_drawdown_pct = pending.risk_config.max_drawdown_pct;
@@ -1116,25 +1127,24 @@ impl UnifiedEngine {
     /// - `Ok(true)` if rollout completed (global swap done)
     /// - `Ok(false)` if still in monitoring window
     /// - `Err(..)` if no rollout is in progress
-    pub fn poll_staged_rollout(&mut self) -> Result<bool, String> {
+    pub fn poll_staged_rollout(&mut self) -> Result<bool, RolloutError> {
         match &self.staged_rollout {
-            None => return Err("no staged rollout in progress".to_string()),
+            None => return Err(RolloutError::NotInProgress),
             Some(state) => {
                 if Instant::now() < state.deadline && state.phase == RolloutPhase::Monitoring {
-                    return Ok(false); // still watching
+                    return Ok(false);
                 }
             }
         }
 
-        // Window elapsed → promote globally
         self.complete_staged_rollout()
     }
 
     /// Promote the staged config to all assets immediately, regardless of
     /// deadline.  Called after successful monitoring or explicitly by operator.
-    pub fn complete_staged_rollout(&mut self) -> Result<bool, String> {
+    pub fn complete_staged_rollout(&mut self) -> Result<bool, RolloutError> {
         match self.staged_rollout.take() {
-            None => Err("no staged rollout in progress".to_string()),
+            None => Err(RolloutError::NotInProgress),
             Some(state) => {
                 tracing::info!(
                     canary = %state.canary_symbol,
@@ -1149,17 +1159,14 @@ impl UnifiedEngine {
 
     /// Abort an in-progress staged rollout, reverting the canary to the
     /// previous live config values.
-    pub fn cancel_staged_rollout(&mut self, reason: &str) -> Result<(), String> {
+    pub fn cancel_staged_rollout(&mut self, reason: &str) -> Result<(), RolloutError> {
         match self.staged_rollout.take() {
-            None => Err("no staged rollout in progress".to_string()),
+            None => Err(RolloutError::NotInProgress),
             Some(_state) => {
                 tracing::warn!(
                     reason = %reason,
                     "Staged rollout cancelled — reverting to previous config"
                 );
-                // Revert: we don't have a full snapshot of pre-rollout config,
-                // so we re-validate and keep current as-is (the partial canary
-                // changes are minor; the important thing is we did NOT go global).
                 Ok(())
             }
         }
@@ -1699,12 +1706,10 @@ mod tests {
 
         let result = engine.begin_staged_rollout(bad, None);
         assert!(result.is_err(), "staged rollout must reject invalid config");
-        let err_msg = result.unwrap_err();
-        assert!(
-            err_msg.contains("rejected"),
-            "error message should mention rejection: {}",
-            err_msg
-        );
+        match result.unwrap_err() {
+            RolloutError::ValidationFailed(msg) => assert!(msg.contains("rejected")),
+            _ => panic!("expected ValidationFailed error"),
+        }
         assert!(engine.staged_rollout.is_none(), "no rollout state should exist after rejection");
     }
 

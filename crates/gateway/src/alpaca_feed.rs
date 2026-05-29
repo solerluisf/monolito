@@ -8,6 +8,33 @@ use futures_util::{SinkExt, StreamExt};
 use market_data::RawTick;
 use unified_trading_core::symbol_registry::SymbolId;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedError {
+    Connect(String),
+    Parse(String),
+    Subscription(String),
+    AuthFailed(String),
+    OversizedMessage(String),
+    Disconnected,
+    Unknown(String),
+}
+
+impl std::fmt::Display for FeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeedError::Connect(msg) => write!(f, "Connect: {}", msg),
+            FeedError::Parse(msg) => write!(f, "Parse: {}", msg),
+            FeedError::Subscription(msg) => write!(f, "Subscription: {}", msg),
+            FeedError::AuthFailed(msg) => write!(f, "Auth failed: {}", msg),
+            FeedError::OversizedMessage(msg) => write!(f, "Oversized message: {}", msg),
+            FeedError::Disconnected => write!(f, "Disconnected"),
+            FeedError::Unknown(msg) => write!(f, "Unknown: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for FeedError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlpacaAuth {
     pub action: String,
@@ -204,9 +231,7 @@ impl AlpacaWebSocketFeed {
         }
     }
 
-    /// Validates that the message size does not exceed the configured limit.
-    /// Returns Ok(()) if the message is within limits, or an error if it's too large.
-    fn validate_message_size(&self, text: &str) -> Result<(), String> {
+    fn validate_message_size(&self, text: &str) -> Result<(), FeedError> {
         if text.len() > self.config.max_message_size_bytes {
             let error_msg = format!(
                 "Message size {} bytes exceeds configured limit of {} bytes",
@@ -214,7 +239,7 @@ impl AlpacaWebSocketFeed {
                 self.config.max_message_size_bytes
             );
             tracing::warn!("{}", error_msg);
-            Err(error_msg)
+            Err(FeedError::OversizedMessage(error_msg))
         } else {
             Ok(())
         }
@@ -246,14 +271,14 @@ impl AlpacaWebSocketFeed {
         }
     }
 
-    async fn connect_and_stream(&self) -> Result<(), String> {
+    async fn connect_and_stream(&self) -> Result<(), FeedError> {
         let ws_url = self.config.ws_url();
 
         tracing::info!("Connecting to Alpaca WebSocket: {}", ws_url);
 
         let (ws_stream, _) = connect_async(ws_url.clone())
             .await
-            .map_err(|e| format!("WebSocket connect failed: {}", e))?;
+            .map_err(|e| FeedError::Connect(format!("WebSocket connect failed: {}", e)))?;
 
         self.connected.store(true, Ordering::SeqCst);
         tracing::info!("Alpaca WebSocket connected");
@@ -265,11 +290,11 @@ impl AlpacaWebSocketFeed {
             key: self.config.api_key.clone(),
             secret: self.config.api_secret.clone(),
         };
-        let auth_msg = serde_json::to_string(&vec![&auth]).map_err(|e| e.to_string())?;
+        let auth_msg = serde_json::to_string(&vec![&auth]).map_err(|e| FeedError::Parse(e.to_string()))?;
         write
             .send(Message::Text(auth_msg.into()))
             .await
-            .map_err(|e| format!("Auth send failed: {}", e))?;
+            .map_err(|e| FeedError::Connect(format!("Auth send failed: {}", e)))?;
         tracing::info!("Sent auth request");
 
         loop {
@@ -294,7 +319,7 @@ impl AlpacaWebSocketFeed {
                     let _ = write.send(Message::Pong(data)).await;
                 }
                 Some(Err(e)) => {
-                    return Err(format!("WebSocket read error: {}", e));
+                    return Err(FeedError::Connect(format!("WebSocket read error: {}", e)));
                 }
                 None => {
                     return Ok(());
@@ -305,7 +330,7 @@ impl AlpacaWebSocketFeed {
 
         let channels = self.config.channels();
         if channels.is_empty() {
-            return Err("No channels to subscribe to".to_string());
+            return Err(FeedError::Subscription("No channels to subscribe to".to_string()));
         }
 
         let subscribe = AlpacaSubscribe {
@@ -314,14 +339,13 @@ impl AlpacaWebSocketFeed {
             quotes: self.config.symbols.iter().map(|s| format!("Q.{}", s)).collect(),
             bars: self.config.symbols.iter().map(|s| format!("B.{}", s)).collect(),
         };
-        let sub_msg = serde_json::to_string(&vec![&subscribe]).map_err(|e| e.to_string())?;
+        let sub_msg = serde_json::to_string(&vec![&subscribe]).map_err(|e| FeedError::Parse(e.to_string()))?;
         write
             .send(Message::Text(sub_msg.into()))
             .await
-            .map_err(|e| format!("Subscribe send failed: {}", e))?;
+            .map_err(|e| FeedError::Connect(format!("Subscribe send failed: {}", e)))?;
         tracing::info!("Sent subscription for {:?}", channels);
 
-        // Replay buffered ticks from previous session so downstream processors don't miss data
         self.replay_ticks();
 
         while self.running.load(Ordering::Relaxed) {
@@ -339,7 +363,7 @@ impl AlpacaWebSocketFeed {
                     let _ = write.send(Message::Pong(data)).await;
                 }
                 Some(Err(e)) => {
-                    return Err(format!("WebSocket read error: {}", e));
+                    return Err(FeedError::Connect(format!("WebSocket read error: {}", e)));
                 }
                 None => {
                     return Ok(());
@@ -351,10 +375,10 @@ impl AlpacaWebSocketFeed {
         Ok(())
     }
 
-    async fn handle_message(&self, text: &str) -> Result<bool, String> {
+    async fn handle_message(&self, text: &str) -> Result<bool, FeedError> {
         self.validate_message_size(text)?;
         let messages: Vec<serde_json::Value> = serde_json::from_str(text)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
+            .map_err(|e| FeedError::Parse(format!("JSON parse error: {}", e)))?;
 
         for msg in messages {
             if let Some(arr) = msg.as_array() {
@@ -373,7 +397,7 @@ impl AlpacaWebSocketFeed {
                             "error" => {
                                 let code = item.get("code").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let msg = item.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                return Err(format!("Alpaca error {}: {}", code, msg));
+                                return Err(FeedError::AuthFailed(format!("Alpaca error {}: {}", code, msg)));
                             }
                             _ => {}
                         }
@@ -417,10 +441,10 @@ impl AlpacaWebSocketFeed {
         }
     }
 
-    async fn handle_market_data(&self, text: &str) -> Result<(), String> {
+    async fn handle_market_data(&self, text: &str) -> Result<(), FeedError> {
         self.validate_message_size(text)?;
         let messages: Vec<serde_json::Value> = serde_json::from_str(text)
-            .map_err(|e| format!("JSON parse error: {}", e))?;
+            .map_err(|e| FeedError::Parse(format!("JSON parse error: {}", e)))?;
 
         for msg in messages {
             if let Some(arr) = msg.as_array() {
@@ -648,7 +672,10 @@ mod tests {
         // by testing the validation method directly
         let validation_result = feed.validate_message_size(&oversized_message);
         assert!(validation_result.is_err());
-        assert!(validation_result.unwrap_err().contains("exceeds configured limit"));
+        match validation_result.unwrap_err() {
+            FeedError::OversizedMessage(msg) => assert!(msg.contains("exceeds configured limit")),
+            _ => panic!("Expected OversizedMessage error"),
+        }
 
         // Test with a message that's within the limit
         let small_message = "x".repeat(50);

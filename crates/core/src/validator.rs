@@ -1,10 +1,34 @@
+use std::fmt;
 use crate::config::ValidatorConfig;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidationError {
+    EmptyField(&'static str),
+    TooLong(&'static str, usize),
+    InvalidCharacters(&'static str),
+    OutOfRange(&'static str),
+    InvalidNumber(&'static str),
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationError::EmptyField(field) => write!(f, "{} cannot be empty", field),
+            ValidationError::TooLong(field, max) => write!(f, "{} too long (max {} chars)", field, max),
+            ValidationError::InvalidCharacters(field) => write!(f, "{} contains invalid characters", field),
+            ValidationError::OutOfRange(field) => write!(f, "{} out of range", field),
+            ValidationError::InvalidNumber(field) => write!(f, "{} must be a valid number", field),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+pub type ValidationResult = Result<(), ValidationError>;
 
 pub struct RequestValidator {
     pub config: ValidatorConfig,
 }
-
-pub type ValidationResult = Result<(), String>;
 
 impl RequestValidator {
     pub fn new(config: ValidatorConfig) -> Self {
@@ -13,15 +37,15 @@ impl RequestValidator {
 
     pub fn validate_symbol(&self, symbol: &str) -> ValidationResult {
         if symbol.is_empty() {
-            return Err("symbol cannot be empty".to_string());
+            return Err(ValidationError::EmptyField("symbol"));
         }
 
         if symbol.len() > self.config.max_symbol_length {
-            return Err(format!("symbol too long (max {} chars)", self.config.max_symbol_length));
+            return Err(ValidationError::TooLong("symbol", self.config.max_symbol_length));
         }
 
         if !symbol.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-') {
-            return Err("symbol contains invalid characters".to_string());
+            return Err(ValidationError::InvalidCharacters("symbol"));
         }
 
         Ok(())
@@ -29,15 +53,15 @@ impl RequestValidator {
 
     pub fn validate_quantity(&self, qty: f64) -> ValidationResult {
         if qty <= 0.0 {
-            return Err("quantity must be greater than 0".to_string());
+            return Err(ValidationError::OutOfRange("quantity"));
         }
 
         if qty > self.config.max_quantity {
-            return Err(format!("quantity exceeds maximum ({:.0})", self.config.max_quantity));
+            return Err(ValidationError::TooLong("quantity", self.config.max_quantity as usize));
         }
 
         if !qty.is_finite() {
-            return Err("quantity must be a valid number".to_string());
+            return Err(ValidationError::InvalidNumber("quantity"));
         }
 
         Ok(())
@@ -45,11 +69,11 @@ impl RequestValidator {
 
     pub fn validate_price(&self, price: f64) -> ValidationResult {
         if price <= 0.0 {
-            return Err("price must be greater than 0".to_string());
+            return Err(ValidationError::OutOfRange("price"));
         }
 
         if !price.is_finite() {
-            return Err("price must be a valid number".to_string());
+            return Err(ValidationError::InvalidNumber("price"));
         }
 
         Ok(())
@@ -57,11 +81,11 @@ impl RequestValidator {
 
     pub fn validate_order_id(&self, order_id: &str) -> ValidationResult {
         if order_id.is_empty() {
-            return Err("order_id cannot be empty".to_string());
+            return Err(ValidationError::EmptyField("order_id"));
         }
 
         if order_id.len() > self.config.max_order_id_length {
-            return Err(format!("order_id too long (max {} chars)", self.config.max_order_id_length));
+            return Err(ValidationError::TooLong("order_id", self.config.max_order_id_length));
         }
 
         Ok(())
@@ -69,11 +93,11 @@ impl RequestValidator {
 
     pub fn validate_notional(&self, notional: f64) -> ValidationResult {
         if notional <= 0.0 {
-            return Err("notional must be greater than 0".to_string());
+            return Err(ValidationError::OutOfRange("notional"));
         }
 
         if !notional.is_finite() {
-            return Err("notional must be a valid number".to_string());
+            return Err(ValidationError::InvalidNumber("notional"));
         }
 
         Ok(())

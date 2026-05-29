@@ -1,10 +1,28 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::order_state_machine::{OrderEvent, OrderState, OrderStateMachine};
 use unified_trading_core::symbol_registry::next_request_id;
 use unified_trading_core::clock::wall_time_ns;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderTrackingError {
+    NotFound(String),
+    InvalidTransition(String),
+}
+
+impl fmt::Display for OrderTrackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OrderTrackingError::NotFound(id) => write!(f, "Order not found: {}", id),
+            OrderTrackingError::InvalidTransition(msg) => write!(f, "Invalid transition: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for OrderTrackingError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OrderStatus {
@@ -88,13 +106,13 @@ impl OrderTracker {
         order_id: &str,
         event: OrderEvent,
         timestamp_ns: u64,
-    ) -> Result<OrderState, String> {
+    ) -> Result<OrderState, OrderTrackingError> {
         let sm = self.state_machines
             .get_mut(order_id)
-            .ok_or_else(|| format!("Order {} not found", order_id))?;
+            .ok_or_else(|| OrderTrackingError::NotFound(order_id.to_string()))?;
 
         let new_state = sm.apply_event(event, timestamp_ns)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| OrderTrackingError::InvalidTransition(e.to_string()))?;
 
         let total_filled = sm.metadata().total_filled_qty;
         let rejection_reason = sm.metadata().rejection_reason.clone();
@@ -120,31 +138,31 @@ impl OrderTracker {
         Ok(new_state)
     }
 
-    pub fn submit_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn submit_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::Submit, timestamp_ns)
     }
 
-    pub fn partial_fill_order(&mut self, order_id: &str, filled_qty: f64, fill_price: f64, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn partial_fill_order(&mut self, order_id: &str, filled_qty: f64, fill_price: f64, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::PartialFill { filled_qty, fill_price }, timestamp_ns)
     }
 
-    pub fn full_fill_order(&mut self, order_id: &str, filled_qty: f64, fill_price: f64, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn full_fill_order(&mut self, order_id: &str, filled_qty: f64, fill_price: f64, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::FullFill { filled_qty, fill_price }, timestamp_ns)
     }
 
-    pub fn cancel_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn cancel_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::Cancel, timestamp_ns)
     }
 
-    pub fn reject_order(&mut self, order_id: &str, reason: String, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn reject_order(&mut self, order_id: &str, reason: String, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::Reject { reason }, timestamp_ns)
     }
 
-    pub fn expire_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn expire_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::Expire, timestamp_ns)
     }
 
-    pub fn replace_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, String> {
+    pub fn replace_order(&mut self, order_id: &str, timestamp_ns: u64) -> Result<OrderState, OrderTrackingError> {
         self.transition_order(order_id, OrderEvent::Replace, timestamp_ns)
     }
 

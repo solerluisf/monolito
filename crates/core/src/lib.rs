@@ -20,23 +20,21 @@ pub mod clock;
 pub use kill_switch::KillSwitch;
 pub use metrics::{GlobalMetrics, MetricsSnapshot};
 pub use config::{EngineConfig, CheckSeverity, default_check_severities, ConfigValidationError, ConfigViolation};
-pub use journal::JournalWriter;
-pub use journal::JournalEntry;
-pub use journal::JournalCommand;
+pub use journal::{JournalWriter, JournalEntry, JournalCommand, JournalError};
 pub use heartbeat::ThreadHeartbeatMonitor;
 pub use command_channel::{CommandChannel, CommandActor, ControlCommand, ControlResponse, StrategyParams,
     RiskConfigUpdate, BrokerConfigUpdate, FeatureConfigUpdate, ModelConfigUpdate, JournalConfigUpdate,
     AssetConfigUpdate, ExecutionDefaultsUpdate, CircuitBreakerConfigUpdate, RateLimitConfigUpdate,
     ChannelConfigUpdate, ReactorConfigUpdate, ValidatorConfigUpdate
 };
-pub use config_watcher::ConfigWatcher;
+pub use config_watcher::{ConfigWatcher, ConfigWatcherError};
 pub use ws::{create_ws_router, WsState};
 pub use threading::{pin_to_core, set_thread_priority, spawn_pinned, ThreadPriority, PinError};
-pub use validator::RequestValidator;
+pub use validator::{RequestValidator, ValidationError};
 pub use idempotency::IdempotencyStore;
 pub use position_manager::PositionManager;
 pub use portfolio_manager::PortfolioManager;
 pub use symbol_registry::{SymbolRegistry, SymbolId, SymbolIdArray, MAX_SYMBOLS};
-pub use large_pages::{enable_large_pages, allocate_large_pages, log_large_page_result, LargePageResult};
+pub use large_pages::{enable_large_pages, allocate_large_pages, log_large_page_result, LargePageResult, MemoryError};
 pub use crash_detector::CrashDetector;
 pub use clock::{Clock, WallClock, TestClock, wall_time_ns, monotonic_time_ns};

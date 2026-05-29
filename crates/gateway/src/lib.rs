@@ -8,7 +8,7 @@ pub use broker_adapter::{
     BrokerType, BrokerAdapterFactory,
 };
 pub use alpaca_execution::{
-    IExecutionPort, OrderCommand, OrderSide, OrderType, TimeInForce,
+    IExecutionPort, BrokerError, OrderCommand, OrderSide, OrderType, TimeInForce,
     CancelCommand, ReplaceCommand, StatusQuery, OrderStatusResponse,
     AlpacaExecutionPort, MockExecutionPort, MockConfig, MockExecutionPortBuilder,
     OpenOrderInfo, PositionInfo,
@@ -16,6 +16,6 @@ pub use alpaca_execution::{
 pub use alpaca::AlpacaAdapter;
 pub use circuit_breaker::CircuitBreaker;
 pub use alpaca_feed::{
-    AlpacaFeedConfig, AlpacaWebSocketFeed,
+    AlpacaFeedConfig, AlpacaWebSocketFeed, FeedError,
     AlpacaTrade, AlpacaQuote, AlpacaBar,
 };

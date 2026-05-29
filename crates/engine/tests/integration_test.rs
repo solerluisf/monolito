@@ -15,7 +15,7 @@ use model::{InferenceEngine, PredictionEngine};
 use strategy::{StrategyEngine, StrategyEngineExt};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent};
-use gateway::{MockExecutionPort, OrderCommand, IExecutionPort};
+use gateway::{MockExecutionPort, OrderCommand, IExecutionPort, BrokerError};
 use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 
 // ── Spy helpers ────────────────────────────────────────────────────
@@ -40,23 +40,23 @@ impl SpyExecutionPort {
 }
 
 impl IExecutionPort for SpyExecutionPort {
-    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
+    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, BrokerError> {
         self.submitted.lock().push(cmd.clone());
         self.inner.submit_order(cmd)
     }
-    fn cancel_order(&self, cmd: &gateway::CancelCommand) -> Result<(), String> {
+    fn cancel_order(&self, cmd: &gateway::CancelCommand) -> Result<(), BrokerError> {
         self.inner.cancel_order(cmd)
     }
-    fn replace_order(&self, cmd: &gateway::ReplaceCommand) -> Result<String, String> {
+    fn replace_order(&self, cmd: &gateway::ReplaceCommand) -> Result<String, BrokerError> {
         self.inner.replace_order(cmd)
     }
-    fn get_order_status(&self, query: &gateway::StatusQuery) -> Result<gateway::OrderStatusResponse, String> {
+    fn get_order_status(&self, query: &gateway::StatusQuery) -> Result<gateway::OrderStatusResponse, BrokerError> {
         self.inner.get_order_status(query)
     }
-    fn query_open_orders(&self) -> Result<Vec<gateway::OpenOrderInfo>, String> {
+    fn query_open_orders(&self) -> Result<Vec<gateway::OpenOrderInfo>, BrokerError> {
         self.inner.query_open_orders()
     }
-    fn query_positions(&self) -> Result<Vec<gateway::PositionInfo>, String> {
+    fn query_positions(&self) -> Result<Vec<gateway::PositionInfo>, BrokerError> {
         self.inner.query_positions()
     }
 }

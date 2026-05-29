@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -11,6 +12,23 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use crate::clock::{Clock, WallClock};
 use crate::metrics::GlobalMetrics;
 use crate::threading::{spawn_pinned, ThreadPriority};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JournalError {
+    Io(String),
+    Parse(String),
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JournalError::Io(msg) => write!(f, "IO error: {}", msg),
+            JournalError::Parse(msg) => write!(f, "Parse error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
 
 #[derive(Debug, Clone)]
 pub enum JournalEntry {
@@ -117,7 +135,7 @@ impl JournalWriter {
         }
     }
 
-    pub fn replay<F>(&self, mut handler: F) -> Result<u64, String>
+    pub fn replay<F>(&self, mut handler: F) -> Result<u64, JournalError>
     where
         F: FnMut(&JournalEntry),
     {
@@ -140,7 +158,7 @@ impl JournalWriter {
 
         for file_path in files {
             let content =
-                fs::read_to_string(&file_path).map_err(|e| format!("Failed to read {:?}: {}", file_path, e))?;
+                fs::read_to_string(&file_path).map_err(|e| JournalError::Io(format!("Failed to read {:?}: {}", file_path, e)))?;
 
             for line in content.lines() {
                 if line.trim().is_empty() {
@@ -335,19 +353,19 @@ impl JournalWriter {
     }
 }
 
-fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
+fn parse_entry_line(line: &str) -> Result<JournalEntry, JournalError> {
     let parts: Vec<&str> = line.splitn(4, '|').collect();
     if parts.len() < 3 {
-        return Err("Invalid journal line format".to_string());
+        return Err(JournalError::Parse("Invalid journal line format".to_string()));
     }
 
     let entry_type = parts[0];
-    let timestamp_ns: u64 = parts[2].parse().map_err(|e| format!("Bad timestamp: {}", e))?;
+    let timestamp_ns: u64 = parts[2].parse().map_err(|e| JournalError::Parse(format!("Bad timestamp: {}", e)))?;
 
     match entry_type {
         "TICK" => {
             if parts.len() != 4 {
-                return Err("Invalid TICK entry".to_string());
+                return Err(JournalError::Parse("Invalid TICK entry".to_string()));
             }
             Ok(JournalEntry::Tick {
                 symbol: parts[1].to_string(),
@@ -357,7 +375,7 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
         }
         "INTENT" => {
             if parts.len() != 4 {
-                return Err("Invalid INTENT entry".to_string());
+                return Err(JournalError::Parse("Invalid INTENT entry".to_string()));
             }
             Ok(JournalEntry::Intent {
                 symbol: parts[1].to_string(),
@@ -367,7 +385,7 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
         }
         "FILL" => {
             if parts.len() != 4 {
-                return Err("Invalid FILL entry".to_string());
+                return Err(JournalError::Parse("Invalid FILL entry".to_string()));
             }
             Ok(JournalEntry::Fill {
                 symbol: parts[1].to_string(),
@@ -377,7 +395,7 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
         }
         "ORDER" => {
             if parts.len() != 4 {
-                return Err("Invalid ORDER entry".to_string());
+                return Err(JournalError::Parse("Invalid ORDER entry".to_string()));
             }
             Ok(JournalEntry::Order {
                 symbol: parts[1].to_string(),
@@ -392,12 +410,12 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
                     data: parts[2].to_string(),
                 })
             } else {
-                Err("Invalid SNAPSHOT entry".to_string())
+                Err(JournalError::Parse("Invalid SNAPSHOT entry".to_string()))
             }
         }
         "EVENT" => {
             if parts.len() != 4 {
-                return Err("Invalid EVENT entry".to_string());
+                return Err(JournalError::Parse("Invalid EVENT entry".to_string()));
             }
             Ok(JournalEntry::Event {
                 event_type: parts[1].to_string(),
@@ -405,7 +423,7 @@ fn parse_entry_line(line: &str) -> Result<JournalEntry, String> {
                 data: parts[3].to_string(),
             })
         }
-        _ => Err(format!("Unknown journal entry type: {}", entry_type)),
+        _ => Err(JournalError::Parse(format!("Unknown journal entry type: {}", entry_type))),
     }
 }
 

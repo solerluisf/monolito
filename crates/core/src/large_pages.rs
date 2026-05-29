@@ -1,9 +1,22 @@
-//! Large page (huge page) memory allocation support for Windows
-//! 
-//! This module attempts to enable MEM_LARGE_PAGES (2MB pages on x64)
-//! for improved TLB performance and reduced page table overhead.
-
 use std::ffi::c_void;
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryError {
+    AllocationFailed(String),
+    InvalidLayout(String),
+}
+
+impl fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemoryError::AllocationFailed(msg) => write!(f, "Allocation failed: {}", msg),
+            MemoryError::InvalidLayout(msg) => write!(f, "Invalid layout: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for MemoryError {}
 
 /// Result of attempting to enable large pages
 #[derive(Debug, Clone)]
@@ -102,10 +115,8 @@ pub fn enable_large_pages() -> LargePageResult {
     LargePageResult::NotSupported
 }
 
-/// Attempts to allocate memory with large pages enabled.
-/// Falls back to regular allocation if large pages are not available.
 #[cfg(windows)]
-pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, String> {
+pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, MemoryError> {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::System::Memory::{
         VirtualAlloc, MEM_COMMIT, MEM_LARGE_PAGES, MEM_RESERVE, PAGE_READWRITE,
@@ -119,7 +130,6 @@ pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, String> {
             PAGE_READWRITE,
         );
         if ptr.is_null() {
-            // If MEM_LARGE_PAGES fails (e.g. privilege not held), fall back to standard allocation
             let err = GetLastError();
             tracing::warn!(
                 "VirtualAlloc with MEM_LARGE_PAGES failed ({:?}), falling back to standard pages",
@@ -133,18 +143,18 @@ pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, String> {
 }
 
 #[cfg(not(windows))]
-pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, String> {
+pub fn allocate_large_pages(size: usize) -> Result<*mut c_void, MemoryError> {
     allocate_standard(size)
 }
 
-fn allocate_standard(size: usize) -> Result<*mut c_void, String> {
+fn allocate_standard(size: usize) -> Result<*mut c_void, MemoryError> {
     let layout = std::alloc::Layout::from_size_align(size, 4096)
-        .map_err(|e| format!("Invalid layout: {}", e))?;
+        .map_err(|e| MemoryError::InvalidLayout(format!("Invalid layout: {}", e)))?;
     
     let ptr = unsafe { std::alloc::alloc(layout) };
     
     if ptr.is_null() {
-        Err("Allocation failed".to_string())
+        Err(MemoryError::AllocationFailed("Allocation failed".to_string()))
     } else {
         Ok(ptr as *mut c_void)
     }

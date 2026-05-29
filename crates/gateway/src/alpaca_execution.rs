@@ -112,13 +112,38 @@ pub struct PositionInfo {
     pub current_price: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrokerError {
+    ConnectionFailed(String),
+    Rejected(String),
+    ParseFailed(String),
+    AuthFailed,
+    RateLimited,
+    Unknown(String),
+}
+
+impl std::fmt::Display for BrokerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BrokerError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
+            BrokerError::Rejected(msg) => write!(f, "Rejected: {}", msg),
+            BrokerError::ParseFailed(msg) => write!(f, "Parse failed: {}", msg),
+            BrokerError::AuthFailed => write!(f, "Authentication failed"),
+            BrokerError::RateLimited => write!(f, "Rate limited"),
+            BrokerError::Unknown(msg) => write!(f, "Unknown error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
 pub trait IExecutionPort: Send + Sync {
-    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String>;
-    fn cancel_order(&self, cmd: &CancelCommand) -> Result<(), String>;
-    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, String>;
-    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String>;
-    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String>;
-    fn query_positions(&self) -> Result<Vec<PositionInfo>, String>;
+    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, BrokerError>;
+    fn cancel_order(&self, cmd: &CancelCommand) -> Result<(), BrokerError>;
+    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, BrokerError>;
+    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, BrokerError>;
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, BrokerError>;
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, BrokerError>;
 }
 
 /// Configuration for MockExecutionPort behavior.
@@ -253,7 +278,7 @@ pub struct AlpacaExecutionPort {
 }
 
 impl AlpacaExecutionPort {
-    pub fn new(api_key: &str, api_secret: &str, paper: bool) -> Result<Self, String> {
+    pub fn new(api_key: &str, api_secret: &str, paper: bool) -> Result<Self, BrokerError> {
         let base_url = if paper {
             "https://paper-api.alpaca.markets/v2"
         } else {
@@ -263,7 +288,7 @@ impl AlpacaExecutionPort {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             client,
@@ -299,7 +324,7 @@ impl AlpacaExecutionPort {
 }
 
 impl IExecutionPort for AlpacaExecutionPort {
-    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
+    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, BrokerError> {
         let side = match cmd.side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
@@ -335,34 +360,34 @@ impl IExecutionPort for AlpacaExecutionPort {
             .headers(self.get_headers_map())
             .json(&req)
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Order rejected: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Order rejected: {} - {}", status, body)));
         }
 
         let order: AlpacaOrderResponse = response.json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| BrokerError::ParseFailed(format!("Failed to parse response: {}", e)))?;
 
         tracing::info!(order_id = %order.id, symbol = %order.symbol, "Order submitted to Alpaca");
 
         Ok(order.id)
     }
 
-    fn cancel_order(&self, cmd: &CancelCommand) -> Result<(), String> {
+    fn cancel_order(&self, cmd: &CancelCommand) -> Result<(), BrokerError> {
         let url = format!("{}/orders/{}", self.base_url, cmd.execution_id);
 
         let response = self.client.delete(&url)
             .headers(self.get_headers_map())
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Cancel failed: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Cancel failed: {} - {}", status, body)));
         }
 
         tracing::info!(order_id = %cmd.execution_id, "Order cancelled on Alpaca");
@@ -370,7 +395,7 @@ impl IExecutionPort for AlpacaExecutionPort {
         Ok(())
     }
 
-    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, String> {
+    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, BrokerError> {
         let url = format!("{}/orders/{}", self.base_url, cmd.execution_id);
 
         let mut body = serde_json::Map::new();
@@ -385,38 +410,38 @@ impl IExecutionPort for AlpacaExecutionPort {
             .headers(self.get_headers_map())
             .json(&body)
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Replace failed: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Replace failed: {} - {}", status, body)));
         }
 
         let order: AlpacaOrderResponse = response.json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| BrokerError::ParseFailed(format!("Failed to parse response: {}", e)))?;
 
         tracing::info!(order_id = %order.id, "Order replaced on Alpaca");
 
         Ok(order.id)
     }
 
-    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String> {
+    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         let url = format!("{}/orders/{}", self.base_url, query.execution_id);
 
         let response = self.client.get(&url)
             .headers(self.get_headers_map())
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Query failed: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Query failed: {} - {}", status, body)));
         }
 
         let order: AlpacaOrderResponse = response.json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| BrokerError::ParseFailed(format!("Failed to parse response: {}", e)))?;
 
         let total_qty: u32 = order.qty.parse().unwrap_or(0);
         let filled_qty: u32 = order.filled_qty.parse().unwrap_or(0);
@@ -444,22 +469,22 @@ impl IExecutionPort for AlpacaExecutionPort {
         Ok(response)
     }
 
-    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, BrokerError> {
         let url = format!("{}/orders?status=open", self.base_url);
 
         let response = self.client.get(&url)
             .headers(self.get_headers_map())
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Query open orders failed: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Query open orders failed: {} - {}", status, body)));
         }
 
         let orders: Vec<AlpacaOrderResponse> = response.json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| BrokerError::ParseFailed(format!("Failed to parse response: {}", e)))?;
 
         let mut result = Vec::new();
         for order in orders {
@@ -479,22 +504,22 @@ impl IExecutionPort for AlpacaExecutionPort {
         Ok(result)
     }
 
-    fn query_positions(&self) -> Result<Vec<PositionInfo>, String> {
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, BrokerError> {
         let url = format!("{}/positions", self.base_url);
 
         let response = self.client.get(&url)
             .headers(self.get_headers_map())
             .send()
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            .map_err(|e| BrokerError::ConnectionFailed(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
-            return Err(format!("Query positions failed: {} - {}", status, body));
+            return Err(BrokerError::Rejected(format!("Query positions failed: {} - {}", status, body)));
         }
 
         let positions: Vec<AlpacaPosition> = response.json()
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| BrokerError::ParseFailed(format!("Failed to parse response: {}", e)))?;
 
         let mut result = Vec::new();
         for pos in positions {
@@ -592,28 +617,28 @@ impl Default for MockExecutionPort {
 }
 
 impl IExecutionPort for MockExecutionPort {
-    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, String> {
+    fn submit_order(&self, cmd: &OrderCommand) -> Result<String, BrokerError> {
         self.submit_count.fetch_add(1, Ordering::Relaxed);
         self.apply_latency();
 
         if self.should_fail() {
             self.failure_count.fetch_add(1, Ordering::Relaxed);
             let config = self.config.lock();
-            return Err(config.failure_message.clone());
+            return Err(BrokerError::Rejected(config.failure_message.clone()));
         }
 
         Ok(format!("mock-{}", cmd.order_id))
     }
 
-    fn cancel_order(&self, _cmd: &CancelCommand) -> Result<(), String> {
+    fn cancel_order(&self, _cmd: &CancelCommand) -> Result<(), BrokerError> {
         Ok(())
     }
 
-    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, String> {
+    fn replace_order(&self, cmd: &ReplaceCommand) -> Result<String, BrokerError> {
         Ok(format!("mock-replaced-{}", cmd.execution_id))
     }
 
-    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, String> {
+    fn get_order_status(&self, query: &StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         let total_qty = 100u32;
         let filled_qty = if self.should_partial_fill() {
             let config = self.config.lock();
@@ -631,11 +656,11 @@ impl IExecutionPort for MockExecutionPort {
         ).with_fill(filled_qty, 150.0))
     }
 
-    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, String> {
+    fn query_open_orders(&self) -> Result<Vec<OpenOrderInfo>, BrokerError> {
         Ok(self.open_orders.clone())
     }
 
-    fn query_positions(&self) -> Result<Vec<PositionInfo>, String> {
+    fn query_positions(&self) -> Result<Vec<PositionInfo>, BrokerError> {
         Ok(self.positions.clone())
     }
 }
@@ -741,7 +766,7 @@ mod tests {
 
         let result = port.submit_order(&cmd);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Test rejection");
+        assert_eq!(result.unwrap_err(), BrokerError::Rejected("Test rejection".to_string()));
         assert_eq!(port.submit_count(), 1);
         assert_eq!(port.failure_count(), 1);
     }

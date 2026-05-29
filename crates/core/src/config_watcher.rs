@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -6,6 +7,29 @@ use parking_lot::RwLock;
 use tracing::{info, warn, error};
 
 use crate::config::{EngineConfig, ConfigValidationError};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigWatcherError {
+    Io(String),
+    Parse(String),
+    Validation(String),
+    WatcherSetup(String),
+    NoConfigFile,
+}
+
+impl fmt::Display for ConfigWatcherError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigWatcherError::Io(msg) => write!(f, "IO error: {}", msg),
+            ConfigWatcherError::Parse(msg) => write!(f, "Parse error: {}", msg),
+            ConfigWatcherError::Validation(msg) => write!(f, "Validation error: {}", msg),
+            ConfigWatcherError::WatcherSetup(msg) => write!(f, "Watcher setup: {}", msg),
+            ConfigWatcherError::NoConfigFile => write!(f, "No TOML config file found"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigWatcherError {}
 
 pub struct ConfigWatcher {
     watcher: Option<RecommendedWatcher>,
@@ -28,7 +52,7 @@ impl ConfigWatcher {
     }
 
     #[tracing::instrument(skip(self), fields(path = %path))]
-    pub fn start(&mut self, path: &str) -> Result<(), String> {
+    pub fn start(&mut self, path: &str) -> Result<(), ConfigWatcherError> {
         let config = Arc::clone(&self.config);
         let running = Arc::clone(&self.running);
         let reload_count = Arc::clone(&self.reload_count);
@@ -55,8 +79,7 @@ impl ConfigWatcher {
                                 info!("Config reloaded successfully");
                             }
                             Err(e) => {
-                                // Distinguish validation errors from parse/I/O errors
-                                if e.contains("validation failed") {
+                                if matches!(e, ConfigWatcherError::Validation(_)) {
                                     rejected_count.fetch_add(1, Ordering::Relaxed);
                                     error!("Rejected invalid config — keeping previous config: {}", e);
                                 } else {
@@ -68,40 +91,34 @@ impl ConfigWatcher {
                 }
             },
             notify::Config::default(),
-        ).map_err(|e| e.to_string())?;
+        ).map_err(|e| ConfigWatcherError::WatcherSetup(e.to_string()))?;
 
         watcher
             .watch(&path_buf, RecursiveMode::Recursive)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ConfigWatcherError::WatcherSetup(e.to_string()))?;
 
         info!(path = %path, "Config watcher started (with sandbox validation)");
         self.watcher = Some(watcher);
         Ok(())
     }
 
-    /// Parse the TOML file, **validate** in a sandbox (no lock held yet),
-    /// and only then swap the live config.  If validation fails the old
-    /// config is left untouched and an error is returned.
-    fn reload_config(config: &Arc<RwLock<EngineConfig>>, paths: &[std::path::PathBuf]) -> Result<(), String> {
+    fn reload_config(config: &Arc<RwLock<EngineConfig>>, paths: &[std::path::PathBuf]) -> Result<(), ConfigWatcherError> {
         for path in paths {
             if path.extension().map_or(false, |ext| ext == "toml") {
-                // 1. Read + parse
                 let content = std::fs::read_to_string(path)
-                    .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+                    .map_err(|e| ConfigWatcherError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
                 let new_config: EngineConfig = toml::from_str(&content)
-                    .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+                    .map_err(|e| ConfigWatcherError::Parse(format!("Failed to parse {}: {}", path.display(), e)))?;
 
-                // 2. Sandbox validate (no write lock held — purely read-only check)
                 new_config.validate()
-                    .map_err(|e: ConfigValidationError| format!("validation failed: {}", e))?;
+                    .map_err(|e: ConfigValidationError| ConfigWatcherError::Validation(format!("validation failed: {}", e)))?;
 
-                // 3. Validation passed — acquire write lock and swap
                 let mut current = config.write();
                 *current = new_config;
                 return Ok(());
             }
         }
-        Err("No TOML config file found in event paths".to_string())
+        Err(ConfigWatcherError::NoConfigFile)
     }
 
     pub fn reload_count(&self) -> u64 {
@@ -234,10 +251,10 @@ mod tests {
 
         let result = ConfigWatcher::reload_config(&config, &[path.clone()]);
         assert!(result.is_err(), "reload should fail on negative leverage");
-        assert!(
-            result.unwrap_err().contains("validation failed"),
-            "error should mention validation failure"
-        );
+        match result.unwrap_err() {
+            ConfigWatcherError::Validation(msg) => assert!(msg.contains("validation failed")),
+            _ => panic!("expected Validation error"),
+        }
 
         // Verify original is untouched
         assert_eq!(config.read().risk_config.max_leverage, original.risk_config.max_leverage);
