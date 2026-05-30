@@ -43,6 +43,8 @@ pub struct NormalizedTick {
     pub volume: u64,
     /// Trace ID propagated from RawTick for causal tracing.
     pub trace_id: u64,
+    /// Tick type propagated from RawTick for tick-type-aware downstream processing.
+    pub tick_type: TickType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +136,7 @@ impl Normalizer {
             ask_size: raw.ask_size,
             volume: raw.last_size,
             trace_id: raw.trace_id,
+            tick_type: raw.tick_type,
         }, gap))
     }
 

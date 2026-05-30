@@ -227,8 +227,8 @@ impl AssetProcessor {
                 // Stage 3: Update signal context regardless of budget
                 self.signal_ctx.update_price(normalized.mid_price);
                 if normalized.mid_price > 0.0 {
-                    current_spread_bps = (normalized.ask - normalized.bid) / normalized.mid_price * 10000.0;
-                    self.signal_ctx.update_spread(current_spread_bps.max(0.0));
+                    current_spread_bps = normalized.spread_bps.max(0.0);
+                    self.signal_ctx.update_spread(current_spread_bps);
                 }
 
                 self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);

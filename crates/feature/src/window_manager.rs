@@ -1,4 +1,5 @@
 use crate::feature_engine::{EMAState, RSIState, ATRState, RollingWindow};
+use market_data::TickType;
 
 pub struct WindowManager {
     pub symbol: String,
@@ -48,7 +49,7 @@ impl WindowManager {
         }
     }
 
-    pub fn update(&mut self, mid_price: f64, volume: f64, spread: f64) {
+    pub fn update(&mut self, mid_price: f64, volume: f64, spread: f64, tick_type: TickType) {
         self.price_window.push(mid_price);
         self.volume_window.push(volume);
         self.spread_window.push(spread);
@@ -62,9 +63,16 @@ impl WindowManager {
 
         self.rsi_14.update(mid_price);
 
-        let high = mid_price + spread / 2.0;
-        let low = mid_price - spread / 2.0;
-        self.atr_14.update(high, low, mid_price);
+        match tick_type {
+            TickType::Trade => {
+                self.atr_14.update(mid_price, mid_price, mid_price);
+            }
+            _ => {
+                let high = mid_price + spread / 2.0;
+                let low = mid_price - spread / 2.0;
+                self.atr_14.update(high, low, mid_price);
+            }
+        }
 
         if self.last_mid_price > 0.0 {
             let ret = (mid_price - self.last_mid_price) / self.last_mid_price;
@@ -83,9 +91,9 @@ mod tests {
     #[test]
     fn test_window_manager_update() {
         let mut wm = WindowManager::new("AAPL", 14, 14, 9, 50, 20, 20, 1, 5, 20);
-        wm.update(150.0, 1000.0, 0.05);
-        wm.update(150.1, 1200.0, 0.04);
-        wm.update(150.2, 800.0, 0.06);
+        wm.update(150.0, 1000.0, 0.05, TickType::Quote);
+        wm.update(150.1, 1200.0, 0.04, TickType::Quote);
+        wm.update(150.2, 800.0, 0.06, TickType::Quote);
 
         assert!((wm.last_mid_price - 150.2).abs() < 0.001);
         assert!(wm.ema_9.initialized);
@@ -96,7 +104,7 @@ mod tests {
     fn test_window_manager_returns() {
         let mut wm = WindowManager::new("MSFT", 14, 14, 9, 50, 20, 20, 1, 5, 20);
         wm.last_mid_price = 400.0;
-        wm.update(401.0, 500.0, 0.04);
+        wm.update(401.0, 500.0, 0.04, TickType::Quote);
         assert!(wm.return_1.len() == 1);
     }
 }

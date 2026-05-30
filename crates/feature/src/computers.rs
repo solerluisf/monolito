@@ -34,12 +34,8 @@ impl MomentumComputer {
 }
 
 impl VolatilityComputer {
-    pub fn compute(wm: &mut WindowManager) -> (f32, f32) {
-        let atr = wm.atr_14.update(
-            wm.last_mid_price + wm.spread_window.last().unwrap_or(&0.01) / 2.0,
-            wm.last_mid_price - wm.spread_window.last().unwrap_or(&0.01) / 2.0,
-            wm.last_mid_price,
-        ) as f32;
+    pub fn compute(wm: &WindowManager) -> (f32, f32) {
+        let atr = wm.atr_14.tr_values.mean() as f32;
         let std_dev = wm.price_window.std_dev() as f32;
         (atr, std_dev)
     }
@@ -144,6 +140,7 @@ impl FeatureEngine {
             tick.mid_price,
             tick.volume as f64,
             tick.spread,
+            tick.tick_type,
         );
 
         let mut fv = FeatureVector::new(tick.symbol_id, tick.timestamp_ns, tick.trace_id);
@@ -162,7 +159,7 @@ impl FeatureEngine {
         fv.set(FeatureIndex::MacdSignal, macd_signal);
         fv.set(FeatureIndex::MacdHistogram, macd_histogram);
 
-        let (atr, std_dev) = VolatilityComputer::compute(&mut self.window_manager);
+        let (atr, std_dev) = VolatilityComputer::compute(&self.window_manager);
         fv.set(FeatureIndex::Atr14, atr);
         fv.set(FeatureIndex::RollingStd, std_dev);
 
@@ -224,7 +221,7 @@ impl FeatureEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use market_data::NormalizedTick;
+    use market_data::{NormalizedTick, TickType};
     use unified_trading_core::symbol_registry::SymbolId;
 
     fn make_tick(symbol_id: SymbolId, ts: u64, mid: f64, spread: f64) -> NormalizedTick {
@@ -240,6 +237,7 @@ mod tests {
             ask_size: 200,
             volume: 50,
             trace_id: 1,
+            tick_type: TickType::Quote,
         }
     }
 
