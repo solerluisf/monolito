@@ -1134,7 +1134,7 @@ impl UnifiedEngine {
             Arc::clone(&exec_shared.circuit_breaker),
             Arc::clone(&exec_shared.idempotency_store),
             unified_trading_core::validator::RequestValidator::new(config.validator_config.clone()),
-            self.journal.as_ref().map(|j| j.tx.clone()),
+            self.journal.as_ref().map(|j| j.handle()),
             config.broker_config.max_retries,
             config.broker_config.retry_backoff_ms,
         );

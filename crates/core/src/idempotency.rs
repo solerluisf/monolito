@@ -94,6 +94,35 @@ impl IdempotencyStore {
             processed.insert(key.clone(), entry);
             access_order.push_front(key);
         }
+
+        Self::evict_until_under_cap(
+            &mut processed,
+            &mut access_order,
+            &mut current_memory_bytes,
+            self.capacity,
+            self.max_memory_bytes,
+        );
+    }
+
+    /// Evict LRU entries until both `capacity` and `max_memory_bytes` are satisfied.
+    fn evict_until_under_cap(
+        processed: &mut HashMap<String, Entry>,
+        access_order: &mut VecDeque<String>,
+        current_memory_bytes: &mut usize,
+        capacity: usize,
+        max_memory_bytes: usize,
+    ) {
+        while (processed.len() > capacity || *current_memory_bytes > max_memory_bytes)
+            && !access_order.is_empty()
+        {
+            if let Some(lru_key) = access_order.pop_back() {
+                if let Some(evicted) = processed.remove(&lru_key) {
+                    *current_memory_bytes = current_memory_bytes.saturating_sub(
+                        Entry::estimated_bytes_for(&lru_key, &evicted.result),
+                    );
+                }
+            }
+        }
     }
 
     fn append_to_disk(&self, key: &str, result: &str) {

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use unified_trading_core::clock::{Clock, WallClock};
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
-use unified_trading_core::journal::{JournalCommand, JournalEntry};
+use unified_trading_core::journal::{JournalHandle, JournalEntry};
 use unified_trading_core::validator::RequestValidator;
 use unified_trading_core::idempotency::IdempotencyStore;
 use unified_trading_core::portfolio_manager::PortfolioManager;
@@ -28,7 +28,7 @@ pub struct ExecutionManager {
     pub idempotency_store: Arc<IdempotencyStore>,
     pub portfolio_manager: Arc<PortfolioManager>,
     pub metrics: Arc<GlobalMetrics>,
-    pub journal: Option<crossbeam_channel::Sender<JournalCommand>>,
+    pub journal_handle: Option<JournalHandle>,
     pub kill_switch: Arc<KillSwitch>,
     pub validator: RequestValidator,
     running: Arc<AtomicBool>,
@@ -52,7 +52,7 @@ impl ExecutionManager {
         circuit_breaker: Arc<CircuitBreaker>,
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
-        journal: Option<crossbeam_channel::Sender<JournalCommand>>,
+        journal_handle: Option<JournalHandle>,
         max_retries: u32,
         retry_backoff_ms: u64,
     ) -> Self {
@@ -71,7 +71,7 @@ impl ExecutionManager {
             idempotency_store,
             validator,
             Arc::new(WallClock::new()),
-            journal,
+            journal_handle,
             max_retries,
             retry_backoff_ms,
         )
@@ -92,7 +92,7 @@ impl ExecutionManager {
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
         clock: Arc<dyn Clock>,
-        journal: Option<crossbeam_channel::Sender<JournalCommand>>,
+        journal_handle: Option<JournalHandle>,
         max_retries: u32,
         retry_backoff_ms: u64,
     ) -> Self {
@@ -106,7 +106,7 @@ impl ExecutionManager {
             idempotency_store,
             portfolio_manager,
             metrics,
-            journal,
+            journal_handle,
             kill_switch,
             validator,
             running: Arc::new(AtomicBool::new(true)),
@@ -252,16 +252,15 @@ impl ExecutionManager {
 
         // Write Pending journal entry BEFORE submitting to broker
         // On crash recovery, all Pending entries are replayed/retried.
-        if let Some(ref journal) = self.journal {
-            let entry = JournalEntry::Order {
+        if let Some(ref handle) = self.journal_handle {
+            let _ = handle.try_write(JournalEntry::Order {
                 symbol: symbol_key.clone(),
                 timestamp_ns: now,
                 data: format!(
                     "intent_id={},order_id={},side={:?},qty={},request_id={},status=Pending",
                     intent_id, order_id, side, quantity, decision.request_id
                 ),
-            };
-            let _ = journal.try_send(JournalCommand::Write(entry));
+            });
         }
 
         let cmd = OrderCommand {
@@ -301,16 +300,15 @@ impl ExecutionManager {
                 self.idempotency_store.mark_processed(idempotency_key, execution_id.clone());
 
                 // Mark as Submitted in journal (allows recovery to skip this intent)
-                if let Some(ref journal) = self.journal {
-                    let entry = JournalEntry::Order {
+                if let Some(ref handle) = self.journal_handle {
+                    let _ = handle.try_write(JournalEntry::Order {
                         symbol: symbol_key.clone(),
                         timestamp_ns: now,
                         data: format!(
                             "intent_id={},order_id={},side={:?},qty={},request_id={},status=Submitted,execution_id={}",
                             intent_id, order_id, side, quantity, decision.request_id, execution_id
                         ),
-                    };
-                    let _ = journal.try_send(JournalCommand::Write(entry));
+                    });
                 }
 
                 self.metrics.lifecycle_channel_depth.fetch_add(1, Ordering::Relaxed);
@@ -325,16 +323,15 @@ impl ExecutionManager {
                 self.circuit_breaker.record_failure();
                 tracing::warn!(symbol = %symbol_key, error = %e, "Order submission failed");
 
-                if let Some(ref journal) = self.journal {
-                    let entry = JournalEntry::Event {
+                if let Some(ref handle) = self.journal_handle {
+                    let _ = handle.try_write(JournalEntry::Event {
                         event_type: "ORDER_FAILED".to_string(),
                         timestamp_ns: now,
                         data: format!(
                             "intent_id={},symbol={},error={},status=Failed",
                             intent_id, symbol_key, e
                         ),
-                    };
-                    let _ = journal.try_send(JournalCommand::Write(entry));
+                    });
                 }
             }
         }

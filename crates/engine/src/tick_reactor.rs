@@ -143,16 +143,24 @@ impl TickReactor {
     fn process_tick_batch(&mut self) {
         let mut batch = Vec::with_capacity(self.max_batch_size);
 
-        for _ in 0..self.max_batch_size {
-            match self.tick_rx.try_recv() {
-                Ok(tick) => batch.push(tick),
-                Err(_) => break,
+        crossbeam_channel::select! {
+            recv(self.tick_rx) -> msg => {
+                if let Ok(tick) = msg {
+                    batch.push(tick);
+                }
             }
+            default(std::time::Duration::from_micros(self.sleep_on_empty_us)) => {}
         }
 
         if batch.is_empty() {
-            std::thread::sleep(std::time::Duration::from_micros(self.sleep_on_empty_us));
             return;
+        }
+
+        while let Ok(tick) = self.tick_rx.try_recv() {
+            batch.push(tick);
+            if batch.len() >= self.max_batch_size {
+                break;
+            }
         }
 
         let now = wall_time_ns();
@@ -406,5 +414,81 @@ mod tests {
         reactor.process_tick_batch();
 
         assert!(reactor.total_dropped() > 0);
+    }
+
+    #[test]
+    fn test_reactor_burst_1000_ticks() {
+        let (tick_tx, tick_rx) = bounded::<RawTick>(2000);
+
+        let (mut reactor, _control_tx) = make_reactor(tick_rx);
+
+        let (handler_tx, handler_rx) = bounded::<RawTick>(2000);
+        reactor.subscribe("AAPL".to_string(), handler_tx);
+
+        let symbol_id = reactor.registry.lookup("AAPL").unwrap();
+        let tick = RawTick {
+            symbol_id,
+            symbol: "AAPL".to_string(),
+            tick_type: TickType::Quote,
+            timestamp_ns: 0,
+            bid: 150.0,
+            ask: 150.01,
+            bid_size: 100,
+            ask_size: 100,
+            last_price: 150.0,
+            last_size: 100,
+            exchange: "V".to_string(),
+            trace_id: 0,
+            symbol_name: None,
+        };
+
+        for _ in 0..1000 {
+            tick_tx.send(tick.clone()).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        while reactor.total_ticks() < 1000 {
+            reactor.process_tick_batch();
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(reactor.total_ticks(), 1000, "All 1000 ticks must be processed");
+        assert_eq!(reactor.total_dropped(), 0, "No ticks should be dropped when handler channel has capacity");
+
+        let mut received = 0;
+        while let Ok(_) = handler_rx.try_recv() {
+            received += 1;
+        }
+        assert_eq!(received, 1000, "All 1000 ticks must reach the handler");
+        assert!(
+            elapsed.as_micros() < 50_000,
+            "1000 ticks must be processed within 50ms, took {:?}",
+            elapsed,
+        );
+    }
+
+    #[test]
+    fn test_reactor_idle_blocks_with_timeout() {
+        let (_tick_tx, tick_rx) = bounded::<RawTick>(1000);
+
+        let kill_switch = Arc::new(KillSwitch::new());
+        let metrics = Arc::new(GlobalMetrics::new());
+        let mut reactor = TickReactor::new(tick_rx, kill_switch, metrics, 64, 16, 5_000, 1000).0;
+
+        let start = std::time::Instant::now();
+        reactor.process_tick_batch();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_micros() >= 4_000,
+            "Idle reactor must block for ~timeout (5000µs), but returned in {:?}",
+            elapsed,
+        );
+        assert!(
+            elapsed.as_micros() < 50_000,
+            "Idle reactor should not block indefinitely, took {:?}",
+            elapsed,
+        );
+        assert_eq!(reactor.total_ticks(), 0, "No ticks should be processed when idle");
     }
 }

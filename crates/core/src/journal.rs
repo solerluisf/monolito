@@ -13,6 +13,35 @@ use crate::clock::{Clock, WallClock};
 use crate::metrics::GlobalMetrics;
 use crate::threading::{spawn_pinned, ThreadPriority};
 
+/// A `Send + Sync` handle for non-blocking journal writes from hot paths.
+/// Clones the channel sender and metric references — lightweight.
+pub struct JournalHandle {
+    tx: Sender<JournalCommand>,
+    metrics: Arc<GlobalMetrics>,
+}
+
+impl JournalHandle {
+    pub fn try_write(&self, entry: JournalEntry) -> Result<(), &'static str> {
+        self.metrics.journal_channel_depth.fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(JournalCommand::Write(entry)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                Err("Journal channel full")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.metrics.journal_channel_depth.fetch_sub(1, Ordering::Relaxed);
+                Err("Journal channel closed")
+            }
+        }
+    }
+
+    pub fn tx(&self) -> Sender<JournalCommand> {
+        self.tx.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JournalError {
     Io(String),
@@ -305,6 +334,15 @@ impl JournalWriter {
 
     pub fn trigger_compaction(&self) {
         let _ = self.tx.send(JournalCommand::Compaction);
+    }
+
+    /// Returns a `JournalHandle` suitable for sharing across threads (Send + Sync).
+    /// The handle clones the channel sender and metric reference — cheap.
+    pub fn handle(&self) -> JournalHandle {
+        JournalHandle {
+            tx: self.tx.clone(),
+            metrics: Arc::clone(&self.metrics),
+        }
     }
 
     pub fn write(&self, entry: JournalEntry) -> Result<(), &'static str> {
