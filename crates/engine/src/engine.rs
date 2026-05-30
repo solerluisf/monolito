@@ -44,6 +44,7 @@ pub struct AssetPipeline {
     pub md_tx: crossbeam_channel::Sender<RawTick>,
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     pub strategy_ref: StrategySwapRef,
+    pub inference_engine: Arc<ArcSwap<InferenceEngine>>,
 }
 
 pub fn recv_batch<T>(rx: &Receiver<T>, buf: &mut Vec<T>, max: usize) -> usize {
@@ -154,7 +155,7 @@ pub struct AssetProcessor {
     pub normalizer: Normalizer,
     pub feature_engine: FeatureEngine,
     pub strategy: StrategySwapRef,
-    pub inference_engine: Arc<InferenceEngine>,
+    pub inference_engine: Arc<ArcSwap<InferenceEngine>>,
     pub signal_ctx: strategy::SignalContext,
     pub coordinator_tx: Sender<RiskCheckRequest>,
     pub coordinator_rx: Receiver<RiskCheckRequest>,
@@ -268,7 +269,7 @@ impl AssetProcessor {
                 // Stage 5: Inline prediction — compute directly, no channel hop
                 // Falls back to heuristic if inference produces invalid output (NaN/Inf).
                 self.current_prediction_version += 1;
-                let model_pred = self.inference_engine.predict(&features);
+                let model_pred = self.inference_engine.load().predict(&features);
                 let prediction = if model_pred.is_valid() {
                     Arc::new(Prediction::with_version(model_pred, self.current_prediction_version, false))
                 } else {
@@ -1038,7 +1039,7 @@ impl UnifiedEngine {
 
         let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", symbol)));
 
-        let inference_engine = Arc::new(InferenceEngine::new(
+        let inference_engine = Arc::new(ArcSwap::new(Arc::new(InferenceEngine::new(
             config.model_config.feature_vector_size,
             config.model_config.action_score_rsi_weight,
             config.model_config.action_score_macd_weight,
@@ -1052,7 +1053,7 @@ impl UnifiedEngine {
             config.model_config.forecast_volume_weight,
             config.feature_config.volume_ratio_clamp,
             config.model_config.volume_confirmation_threshold,
-        ));
+        ))));
 
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
@@ -1096,7 +1097,7 @@ impl UnifiedEngine {
         let infer_fn = {
             let inference_engine = Arc::clone(&inference_engine);
             move |features: &FeatureVector| -> Prediction {
-                inference_engine.predict(features)
+                inference_engine.load().predict(features)
             }
         };
         let pred_handle = pred_engine.start(infer_fn, pred_core_id);
@@ -1161,6 +1162,7 @@ impl UnifiedEngine {
             md_tx,
             thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle.expect("spawn_pinned failed")],
             strategy_ref: strategy_arc,
+            inference_engine: Arc::clone(&inference_engine),
         }
     }
 
@@ -1507,6 +1509,7 @@ impl UnifiedEngine {
                 cfg.model_config.rsi_oversold = update.inference_rsi_bullish_threshold as f64;
                 cfg.model_config.rsi_neutral = update.inference_rsi_center as f64;
                 cfg.model_config.atr_penalty_threshold = update.inference_atr_penalty_threshold as f64;
+                cfg.model_config.atr_penalty_value = update.inference_atr_penalty_value as f64;
                 cfg.model_config.volume_confirmation_threshold = update.inference_volume_confirmation_threshold as f64;
                 cfg.model_config.action_score_rsi_weight = update.action_score_rsi_weight as f64;
                 cfg.model_config.action_score_macd_weight = update.action_score_macd_weight as f64;
@@ -1514,7 +1517,30 @@ impl UnifiedEngine {
                 cfg.model_config.confidence_rsi_weight = update.confidence_rsi_weight as f64;
                 cfg.model_config.confidence_macd_weight = update.confidence_macd_weight as f64;
                 cfg.model_config.confidence_regime_weight = update.confidence_regime_weight as f64;
-                tracing::info!("Model parameters updated via API");
+
+                // Propagate to running InferenceEngine instances via hot-swap
+                for (symbol, pipeline) in self.asset_pipelines.iter() {
+                    let new_ie = Arc::new(InferenceEngine::new(
+                        cfg.model_config.feature_vector_size,
+                        cfg.model_config.action_score_rsi_weight,
+                        cfg.model_config.action_score_macd_weight,
+                        cfg.model_config.action_score_volatility_weight,
+                        cfg.model_config.atr_penalty_threshold,
+                        cfg.model_config.atr_penalty_value,
+                        cfg.model_config.rsi_overbought,
+                        cfg.model_config.rsi_oversold,
+                        cfg.model_config.rsi_neutral,
+                        cfg.model_config.forecast_momentum_weight,
+                        cfg.model_config.forecast_volume_weight,
+                        cfg.feature_config.volume_ratio_clamp,
+                        cfg.model_config.volume_confirmation_threshold,
+                    ));
+                    pipeline.inference_engine.store(new_ie);
+                }
+
+                let count = self.asset_pipelines.len();
+                drop(cfg);
+                tracing::info!("Model parameters updated — hot-swapped {} InferenceEngine(s)", count);
                 ControlResponse::Ok
             }
             ControlCommand::SetJournalParams(update) => {
@@ -1855,6 +1881,7 @@ mod tests {
     use feature::{FeatureVector, FeatureIndex};
     use unified_trading_core::symbol_registry::SymbolId;
     use std::sync::atomic::AtomicBool;
+    use unified_trading_core::command_channel::ModelConfigUpdate;
 
     #[test]
     fn test_dynamic_subscribe_unsubscribe() {
@@ -2226,5 +2253,121 @@ mod tests {
             "Staleness rate {:.2}% exceeds 5% under CPU contention with inline inference",
             rate * 100.0,
         );
+    }
+
+    #[test]
+    fn test_set_model_params_propagates_to_live_inference_engine() {
+        let mut engine = UnifiedEngine::new(EngineConfig::default());
+
+        let (reactor_tx, _reactor_rx) = bounded::<ReactorCommand>(100);
+        let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        engine.tick_reactor_tx = Some(reactor_tx);
+        engine.lifecycle_tx = Some(lifecycle_tx);
+        engine.execution_port = Some(Arc::new(MockExecutionPort::default()));
+
+        let resp = engine.handle_command(ControlCommand::SubscribeFeed { symbol: "AAPL".to_string() });
+        assert!(matches!(resp, ControlResponse::Ok));
+        assert!(engine.asset_pipelines.contains_key("AAPL"));
+
+        // Verify default weight before update
+        {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            let ie = pipeline.inference_engine.load();
+            assert!(
+                (ie.action_score_rsi_weight - 0.4).abs() < f64::EPSILON,
+                "Expected default rsi_weight=0.4, got {}",
+                ie.action_score_rsi_weight,
+            );
+        }
+
+        // Build features that produce a known prediction
+        let mut fv = FeatureVector::new(SymbolId::from_raw(1), 1000, 42);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 25.0);
+        fv.set(FeatureIndex::MacdHistogram, 0.5);
+        fv.set(FeatureIndex::Atr14, 0.1);
+        fv.set(FeatureIndex::VolumeRatio, 1.5);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.6);
+        fv.set(FeatureIndex::Confidence, 0.8);
+
+        // Get prediction before update
+        let pred_before = {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            pipeline.inference_engine.load().predict(&fv)
+        };
+
+        // Update model params: zero out rsi/macd weights, max out volatility weight
+        let update = ModelConfigUpdate {
+            model_dir: "models/default".to_string(),
+            inference_threads: 2,
+            max_inference_latency_ms: 100,
+            feature_vector_size: 128,
+            inference_rsi_bearish_threshold: 70.0,
+            inference_rsi_bullish_threshold: 30.0,
+            inference_rsi_center: 50.0,
+            inference_atr_penalty_threshold: 2.0,
+            inference_atr_penalty_value: -0.2,
+            inference_volume_confirmation_threshold: 1.2,
+            action_score_rsi_weight: 0.0,
+            action_score_macd_weight: 0.0,
+            action_score_volatility_weight: 1.0,
+            confidence_rsi_weight: 0.4,
+            confidence_macd_weight: 0.3,
+            confidence_regime_weight: 0.3,
+        };
+
+        let resp = engine.handle_command(ControlCommand::SetModelParams(update));
+        assert!(matches!(resp, ControlResponse::Ok));
+
+        // Verify the live InferenceEngine was hot-swapped with new params
+        {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            let ie = pipeline.inference_engine.load();
+            assert!(
+                (ie.action_score_rsi_weight - 0.0).abs() < f64::EPSILON,
+                "Expected updated rsi_weight=0.0, got {}",
+                ie.action_score_rsi_weight,
+            );
+            assert!(
+                (ie.action_score_macd_weight - 0.0).abs() < f64::EPSILON,
+                "Expected updated macd_weight=0.0, got {}",
+                ie.action_score_macd_weight,
+            );
+            assert!(
+                (ie.action_score_volatility_weight - 1.0).abs() < f64::EPSILON,
+                "Expected updated vol_weight=1.0, got {}",
+                ie.action_score_volatility_weight,
+            );
+        }
+
+        // Verify prediction output changed
+        let pred_after = {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            pipeline.inference_engine.load().predict(&fv)
+        };
+        assert!(
+            (pred_before.action_score - pred_after.action_score).abs() > 0.01,
+            "Prediction should differ after weight update: before={}, after={}",
+            pred_before.action_score,
+            pred_after.action_score,
+        );
+
+        // Verify the static config was also updated
+        {
+            let cfg = engine.config.read();
+            assert!(
+                (cfg.model_config.action_score_rsi_weight - 0.0).abs() < f64::EPSILON,
+                "Config rsi_weight was not updated",
+            );
+            assert!(
+                (cfg.model_config.action_score_macd_weight - 0.0).abs() < f64::EPSILON,
+                "Config macd_weight was not updated",
+            );
+            assert!(
+                (cfg.model_config.action_score_volatility_weight - 1.0).abs() < f64::EPSILON,
+                "Config vol_weight was not updated",
+            );
+        }
     }
 }

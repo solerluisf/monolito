@@ -70,7 +70,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         Box::new(SlowNoopStrategy { sleep_ms: 10 }) as Box<dyn strategy::Strategy>
     )));
 
-    let inference_engine = Arc::new(InferenceEngine::new(
+    let inference_engine = Arc::new(ArcSwap::new(Arc::new(InferenceEngine::new(
         6,   // feature_vector_size
         0.3, // action_score_rsi_weight
         0.3, // action_score_macd_weight
@@ -84,7 +84,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         0.3,  // forecast_volume_weight
         3.0,  // volume_ratio_clamp
         1.5,  // volume_confirmation_threshold
-    ));
+    ))));
 
     let (md_tx, md_rx) = bounded::<RawTick>(16);
     let (feature_tx, feature_rx) = bounded::<FeatureVector>(16);

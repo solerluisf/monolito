@@ -72,6 +72,7 @@ pub struct ModelConfigUpdate {
     pub inference_rsi_bullish_threshold: f32,
     pub inference_rsi_center: f32,
     pub inference_atr_penalty_threshold: f32,
+    pub inference_atr_penalty_value: f32,
     pub inference_volume_confirmation_threshold: f32,
     pub action_score_rsi_weight: f32,
     pub action_score_macd_weight: f32,
