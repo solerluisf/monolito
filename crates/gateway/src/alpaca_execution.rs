@@ -545,6 +545,7 @@ pub struct MockExecutionPort {
     config: parking_lot::Mutex<MockConfig>,
     submit_count: AtomicU64,
     failure_count: AtomicU64,
+    transient_failures_remaining: AtomicU64,
 }
 
 impl MockExecutionPort {
@@ -559,7 +560,16 @@ impl MockExecutionPort {
             config: parking_lot::Mutex::new(config),
             submit_count: AtomicU64::new(0),
             failure_count: AtomicU64::new(0),
+            transient_failures_remaining: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_transient_failures(&self, count: u64) {
+        self.transient_failures_remaining.store(count, Ordering::Relaxed);
+    }
+
+    pub fn transient_failures_remaining(&self) -> u64 {
+        self.transient_failures_remaining.load(Ordering::Relaxed)
     }
 
     pub fn config(&self) -> MockConfig {
@@ -620,6 +630,22 @@ impl IExecutionPort for MockExecutionPort {
     fn submit_order(&self, cmd: &OrderCommand) -> Result<String, BrokerError> {
         self.submit_count.fetch_add(1, Ordering::Relaxed);
         self.apply_latency();
+
+        // Simulate transient failures for retry testing
+        loop {
+            let remaining = self.transient_failures_remaining.load(Ordering::Relaxed);
+            if remaining == 0 {
+                break;
+            }
+            if self.transient_failures_remaining.compare_exchange(
+                remaining, remaining - 1, Ordering::AcqRel, Ordering::Relaxed
+            ).is_ok() {
+                self.failure_count.fetch_add(1, Ordering::Relaxed);
+                return Err(BrokerError::ConnectionFailed(
+                    "Simulated transient failure".to_string(),
+                ));
+            }
+        }
 
         if self.should_fail() {
             self.failure_count.fetch_add(1, Ordering::Relaxed);

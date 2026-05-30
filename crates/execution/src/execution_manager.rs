@@ -15,7 +15,7 @@ use unified_trading_core::threading::{spawn_pinned, ThreadPriority};
 use crate::order_tracker::{OrderTracker, OrderStatus};
 use crate::rate_limiter::RateLimiter;
 use crate::order_lifecycle::{OrderLifecycleEvent, OrderLifecycleEventType};
-use gateway::{CircuitBreaker, IExecutionPort, OrderCommand, OrderSide, OrderType, TimeInForce};
+use gateway::{BrokerError, CircuitBreaker, IExecutionPort, OrderCommand, OrderSide, OrderType, TimeInForce};
 use risk::RiskDecision;
 
 pub struct ExecutionManager {
@@ -141,6 +141,63 @@ impl ExecutionManager {
         }
     }
 
+    /// Returns true if the error is transient and retryable.
+    fn is_transient_error(e: &BrokerError) -> bool {
+        matches!(e, BrokerError::ConnectionFailed(_) | BrokerError::RateLimited | BrokerError::Unknown(_))
+    }
+
+    /// Submit an order with exponential backoff retry for transient errors.
+    fn submit_with_retry(
+        &self,
+        cmd: &OrderCommand,
+        symbol_key: &str,
+        intent_id: u64,
+        decision: &RiskDecision,
+        now: u64,
+    ) -> Result<String, BrokerError> {
+        let max_retries: u64 = 3;
+        let base_delay_ms: u64 = 100;
+
+        for attempt in 0..max_retries {
+            let result = self.execution_port.submit_order(cmd);
+
+            match &result {
+                Ok(_) => return result,
+                Err(e) if Self::is_transient_error(e) => {
+                    if attempt + 1 < max_retries {
+                        let delay_ms = base_delay_ms * (1u64 << attempt); // 100, 200, 400
+                        tracing::warn!(
+                            symbol = %symbol_key,
+                            intent_id = intent_id,
+                            attempt = attempt + 1,
+                            max_retries = max_retries,
+                            delay_ms = delay_ms,
+                            error = %e,
+                            "Order submission transient error, retrying"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    } else {
+                        tracing::error!(
+                            symbol = %symbol_key,
+                            intent_id = intent_id,
+                            error = %e,
+                            "Order submission failed after {} retries",
+                            max_retries
+                        );
+                        return result;
+                    }
+                }
+                Err(_) => {
+                    // Non-transient error — fail immediately
+                    return result;
+                }
+            }
+        }
+
+        // Shouldn't reach here, but satisfy the compiler
+        self.execution_port.submit_order(cmd)
+    }
+
     #[tracing::instrument(skip_all, fields(request_id = %decision.request_id))]
     fn execute_decision(&mut self, decision: &RiskDecision) {
         let now = self.clock.now_ns();
@@ -212,7 +269,7 @@ impl ExecutionManager {
 
         let broker_start = self.clock.now_monotonic_ns();
 
-        match self.execution_port.submit_order(&cmd) {
+        match self.submit_with_retry(&cmd, &symbol_key, intent_id, decision, now) {
             Ok(execution_id) => {
                 let broker_end = self.clock.now_monotonic_ns();
                 let rtt_ns = broker_end.saturating_sub(broker_start);
@@ -401,6 +458,7 @@ use unified_trading_core::symbol_registry::SymbolId;
         metrics: Arc<GlobalMetrics>,
         kill_switch: Arc<KillSwitch>,
         portfolio_manager: Arc<PortfolioManager>,
+        execution_port: Arc<dyn IExecutionPort>,
     ) -> ExecutionManager {
         let order_tracker = Arc::new(parking_lot::Mutex::new(OrderTracker::new()));
         let rate_limiter = Arc::new(parking_lot::Mutex::new(RateLimiter::new(global_rate, per_symbol_rate)));
@@ -409,7 +467,7 @@ use unified_trading_core::symbol_registry::SymbolId;
         ExecutionManager::new(
             dec_rx,
             lifecycle_tx,
-            Arc::new(MockExecutionPort::default()),
+            execution_port,
             global_rate,
             per_symbol_rate,
             metrics,
@@ -440,6 +498,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
             portfolio_manager,
+            Arc::new(MockExecutionPort::default()),
         );
 
         dec_tx.send(make_approved_decision()).unwrap();
@@ -468,6 +527,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
             portfolio_manager,
+            Arc::new(MockExecutionPort::default()),
         );
 
         dec_tx.send(make_approved_decision()).unwrap();
@@ -494,6 +554,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
             Arc::clone(&portfolio_manager),
+            Arc::new(MockExecutionPort::default()),
         );
 
         let order_id = {
@@ -525,6 +586,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             Arc::clone(&metrics),
             Arc::clone(&kill_switch),
             portfolio_manager,
+            Arc::new(MockExecutionPort::default()),
         );
 
         for _ in 0..5 {
@@ -537,5 +599,77 @@ use unified_trading_core::symbol_registry::SymbolId;
         manager.run_loop();
 
         assert!(metrics.circuit_breaker_trips.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn test_execution_manager_retry_transient_then_success() {
+        let (dec_tx, dec_rx) = bounded::<RiskDecision>(100);
+        let (lifecycle_tx, lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        let kill_switch = Arc::new(KillSwitch::new());
+        let metrics = Arc::new(GlobalMetrics::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
+
+        // Mock that fails twice transiently then succeeds
+        let mock_port = Arc::new(MockExecutionPort::default());
+        mock_port.set_transient_failures(2);
+
+        let mut manager = make_manager(
+            dec_rx,
+            lifecycle_tx,
+            10.0,
+            5.0,
+            Arc::clone(&metrics),
+            Arc::clone(&kill_switch),
+            portfolio_manager,
+            mock_port.clone(),
+        );
+
+        dec_tx.send(make_approved_decision()).unwrap();
+        drop(dec_tx);
+
+        // run_loop will execute the decision with retry
+        manager.run_loop();
+
+        // After 2 transient failures + 1 success = 3 submit calls total
+        // The retry loop should succeed on 3rd attempt
+        let event = lifecycle_rx.recv_timeout(std::time::Duration::from_millis(300)).unwrap();
+        assert!(matches!(event.event_type, OrderLifecycleEventType::Submitted));
+        assert_eq!(mock_port.submit_count(), 3);
+        assert_eq!(mock_port.transient_failures_remaining(), 0);
+        assert_eq!(metrics.orders_submitted.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_execution_manager_retry_exhausted() {
+        let (dec_tx, dec_rx) = bounded::<RiskDecision>(100);
+        let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        let kill_switch = Arc::new(KillSwitch::new());
+        let metrics = Arc::new(GlobalMetrics::new());
+        let portfolio_manager = Arc::new(PortfolioManager::new(100_000.0, 0.001));
+
+        // Mock that fails 5 times transiently (more than max 3 retries)
+        let mock_port = Arc::new(MockExecutionPort::default());
+        mock_port.set_transient_failures(5);
+
+        let mut manager = make_manager(
+            dec_rx,
+            lifecycle_tx,
+            10.0,
+            5.0,
+            Arc::clone(&metrics),
+            Arc::clone(&kill_switch),
+            portfolio_manager,
+            mock_port.clone(),
+        );
+
+        dec_tx.send(make_approved_decision()).unwrap();
+        drop(dec_tx);
+
+        manager.run_loop();
+
+        // After 3 retry attempts + 0 success = 3 submit calls, all failed
+        assert_eq!(mock_port.submit_count(), 3);
+        assert!(mock_port.transient_failures_remaining() > 0); // Still have failures left
+        assert_eq!(metrics.orders_rejected.load(Ordering::Relaxed), 1);
     }
 }
