@@ -1763,6 +1763,7 @@ mod tests {
     use model::InferenceEngine;
     use feature::{FeatureVector, FeatureIndex};
     use unified_trading_core::symbol_registry::SymbolId;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_dynamic_subscribe_unsubscribe() {
@@ -2062,5 +2063,77 @@ mod tests {
             "Position changes {} should be ≤ 2 with alternating fallback; \
              heuristic fallback must not cause flip-flop oscillation",
             position_changes);
+    }
+
+    #[test]
+    fn test_inline_prediction_staleness_under_contention() {
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(2);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(num_workers + 1));
+
+        let mut handles = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let stop = Arc::clone(&stop);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let mut x = 0.0_f64;
+                    for _ in 0..20_000 {
+                        x = (x + 1.234).sin().cos().tan().sin();
+                    }
+                    std::hint::spin_loop();
+                }
+            }));
+        }
+
+        let ie = InferenceEngine::new(
+            128, 0.4, 0.4, 0.2, 2.0, -0.2,
+            70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+        );
+
+        let mut fv = FeatureVector::new(SymbolId::from_raw(42), 0, 0);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 55.0);
+        fv.set(FeatureIndex::MacdHistogram, 0.4);
+        fv.set(FeatureIndex::Atr14, 0.5);
+        fv.set(FeatureIndex::VolumeRatio, 1.2);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.6);
+        fv.set(FeatureIndex::Confidence, 0.7);
+
+        barrier.wait();
+
+        let num_ticks = 200;
+        let mut staleness_events = 0u64;
+
+        for i in 0..num_ticks {
+            fv.trace_id = i as u64;
+            fv.timestamp_ns = i as u64;
+
+            let pred = ie.predict(&fv);
+
+            assert!(pred.is_valid(), "Prediction must be valid with normal features");
+            assert!(pred.action_score.is_finite(), "Score must be finite");
+
+            if pred.trace_id != i as u64 {
+                staleness_events += 1;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let rate = staleness_events as f64 / num_ticks as f64;
+        assert!(
+            rate < 0.05,
+            "Staleness rate {:.2}% exceeds 5% under CPU contention with inline inference",
+            rate * 100.0,
+        );
     }
 }
