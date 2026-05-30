@@ -45,6 +45,7 @@ pub struct AssetPipeline {
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     pub strategy_ref: StrategySwapRef,
     pub inference_engine: Arc<ArcSwap<InferenceEngine>>,
+    pub feature_engine: Arc<Mutex<FeatureEngine>>,
 }
 
 pub fn recv_batch<T>(rx: &Receiver<T>, buf: &mut Vec<T>, max: usize) -> usize {
@@ -153,7 +154,7 @@ pub struct AssetProcessor {
     pub symbol: String,
     pub symbol_id: SymbolId,
     pub normalizer: Normalizer,
-    pub feature_engine: FeatureEngine,
+    pub feature_engine: Arc<Mutex<FeatureEngine>>,
     pub strategy: StrategySwapRef,
     pub inference_engine: Arc<ArcSwap<InferenceEngine>>,
     pub signal_ctx: strategy::SignalContext,
@@ -220,7 +221,7 @@ impl AssetProcessor {
                 }
 
                 // Stage 2: Always compute features — updates FeatureEngine state (EMA, ATR, RSI, etc.)
-                let features = self.feature_engine.compute(&normalized);
+                let features = self.feature_engine.lock().compute(&normalized);
 
                 // Stage 3: Update signal context regardless of budget
                 self.signal_ctx.update_price(normalized.mid_price);
@@ -246,7 +247,7 @@ impl AssetProcessor {
                     let mut skipped = 1u64;
                     for remaining in &mut iter {
                         if let Some((n, _)) = self.normalizer.process(remaining.clone()) {
-                            self.feature_engine.compute(&n);
+                            self.feature_engine.lock().compute(&n);
                         }
                         self.metrics.increment_per_symbol_tick_skipped(&self.symbol);
                         skipped += 1;
@@ -1055,27 +1056,29 @@ impl UnifiedEngine {
             config.model_config.volume_confirmation_threshold,
         ))));
 
+        let feature_engine = Arc::new(Mutex::new(FeatureEngine::new(
+            symbol,
+            config.feature_config.rsi_period,
+            config.feature_config.atr_period,
+            config.feature_config.macd_signal,
+            config.feature_config.feature_capacity,
+            config.feature_config.price_window_size,
+            config.feature_config.volume_window_size,
+            config.feature_config.spread_window_size,
+            config.feature_config.return_1_window,
+            config.feature_config.return_5_window,
+            config.feature_config.return_20_window,
+            config.feature_config.volume_ratio_clamp,
+            config.feature_config.regime_volatile_atr_threshold,
+            config.feature_config.regime_strength_atr_divisor,
+            config.feature_config.regime_trending_threshold,
+        )));
+
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
             symbol_id,
             normalizer: Normalizer::new(symbol_id),
-            feature_engine: FeatureEngine::new(
-                symbol,
-                config.feature_config.rsi_period,
-                config.feature_config.atr_period,
-                config.feature_config.macd_signal,
-                config.feature_config.feature_capacity,
-                config.feature_config.price_window_size,
-                config.feature_config.volume_window_size,
-                config.feature_config.spread_window_size,
-                config.feature_config.return_1_window,
-                config.feature_config.return_5_window,
-                config.feature_config.return_20_window,
-                config.feature_config.volume_ratio_clamp,
-                config.feature_config.regime_volatile_atr_threshold,
-                config.feature_config.regime_strength_atr_divisor,
-                config.feature_config.regime_trending_threshold,
-            ),
+            feature_engine: Arc::clone(&feature_engine),
             strategy: strategy_arc.clone(),
             inference_engine: Arc::clone(&inference_engine),
             signal_ctx,
@@ -1163,6 +1166,7 @@ impl UnifiedEngine {
             thread_handles: vec![pred_handle, risk_handle, exec_handle, asset_handle.expect("spawn_pinned failed")],
             strategy_ref: strategy_arc,
             inference_engine: Arc::clone(&inference_engine),
+            feature_engine: Arc::clone(&feature_engine),
         }
     }
 
@@ -1496,7 +1500,32 @@ impl UnifiedEngine {
                 cfg.feature_config.atr_period = update.atr_period;
                 cfg.feature_config.ema_periods = update.ema_periods;
                 cfg.feature_config.rolling_window_sizes = update.rolling_window_sizes;
-                tracing::info!("Feature parameters updated via API");
+                cfg.feature_config.price_window_size = update.price_window_size;
+                cfg.feature_config.volume_window_size = update.volume_window_size;
+                cfg.feature_config.regime_volatile_atr_threshold = update.regime_volatile_atr_threshold;
+                cfg.feature_config.regime_trending_threshold = update.regime_trending_threshold as f64;
+                // Propagate to all running FeatureEngine instances
+                for pipeline in self.asset_pipelines.values() {
+                    let mut fe = pipeline.feature_engine.lock();
+                    *fe = FeatureEngine::new(
+                        &pipeline.symbol,
+                        cfg.feature_config.rsi_period,
+                        cfg.feature_config.atr_period,
+                        cfg.feature_config.macd_signal,
+                        cfg.feature_config.feature_capacity,
+                        cfg.feature_config.price_window_size,
+                        cfg.feature_config.volume_window_size,
+                        cfg.feature_config.spread_window_size,
+                        cfg.feature_config.return_1_window,
+                        cfg.feature_config.return_5_window,
+                        cfg.feature_config.return_20_window,
+                        cfg.feature_config.volume_ratio_clamp,
+                        cfg.feature_config.regime_volatile_atr_threshold,
+                        cfg.feature_config.regime_strength_atr_divisor,
+                        cfg.feature_config.regime_trending_threshold,
+                    );
+                }
+                tracing::info!("Feature parameters updated via API and propagated to {} asset(s)", self.asset_pipelines.len());
                 ControlResponse::Ok
             }
             ControlCommand::SetModelParams(update) => {
@@ -1881,7 +1910,7 @@ mod tests {
     use feature::{FeatureVector, FeatureIndex};
     use unified_trading_core::symbol_registry::SymbolId;
     use std::sync::atomic::AtomicBool;
-    use unified_trading_core::command_channel::ModelConfigUpdate;
+    use unified_trading_core::command_channel::{ModelConfigUpdate, FeatureConfigUpdate};
 
     #[test]
     fn test_dynamic_subscribe_unsubscribe() {
@@ -2367,6 +2396,110 @@ mod tests {
             assert!(
                 (cfg.model_config.action_score_volatility_weight - 1.0).abs() < f64::EPSILON,
                 "Config vol_weight was not updated",
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_feature_params_propagates_to_live_feature_engine() {
+        let mut engine = UnifiedEngine::new(EngineConfig::default());
+
+        let (reactor_tx, _reactor_rx) = bounded::<ReactorCommand>(100);
+        let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        engine.tick_reactor_tx = Some(reactor_tx);
+        engine.lifecycle_tx = Some(lifecycle_tx);
+        engine.execution_port = Some(Arc::new(MockExecutionPort::default()));
+
+        let resp = engine.handle_command(ControlCommand::SubscribeFeed { symbol: "AAPL".to_string() });
+        assert!(matches!(resp, ControlResponse::Ok));
+        assert!(engine.asset_pipelines.contains_key("AAPL"));
+
+        // Verify default params before update
+        {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            let fe = pipeline.feature_engine.lock();
+            assert!(
+                (fe.volume_ratio_clamp - 0.3).abs() < f64::EPSILON,
+                "Expected default volume_ratio_clamp=0.3, got {}",
+                fe.volume_ratio_clamp,
+            );
+            assert!(
+                (fe.regime_volatile_atr_threshold - 0.02).abs() < f64::EPSILON,
+                "Expected default regime_volatile_atr_threshold=0.02, got {}",
+                fe.regime_volatile_atr_threshold,
+            );
+            assert!(
+                (fe.regime_trending_threshold - 0.5).abs() < 1e-4,
+                "Expected default regime_trending_threshold=0.5, got {}",
+                fe.regime_trending_threshold,
+            );
+        }
+
+        // Update feature params with new values
+        let update = FeatureConfigUpdate {
+            rsi_period: 21,
+            macd_fast: 12,
+            macd_slow: 26,
+            macd_signal: 9,
+            atr_period: 21,
+            ema_periods: vec![9, 21, 50],
+            rolling_window_sizes: vec![5, 20],
+            price_window_size: 100,
+            volume_window_size: 40,
+            regime_volatile_atr_threshold: 0.05,
+            regime_trending_threshold: 0.3,
+        };
+
+        let resp = engine.handle_command(ControlCommand::SetFeatureParams(update));
+        assert!(matches!(resp, ControlResponse::Ok));
+
+        // Verify the live FeatureEngine was hot-swapped with new params
+        {
+            let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+            let fe = pipeline.feature_engine.lock();
+            assert!(
+                (fe.volume_ratio_clamp - 0.3).abs() < f64::EPSILON,
+                "volume_ratio_clamp should remain default 0.3 (not in update), got {}",
+                fe.volume_ratio_clamp,
+            );
+            assert!(
+                (fe.regime_volatile_atr_threshold - 0.05).abs() < f64::EPSILON,
+                "Expected updated regime_volatile_atr_threshold=0.05, got {}",
+                fe.regime_volatile_atr_threshold,
+            );
+            assert!(
+                (fe.regime_trending_threshold - 0.3).abs() < 1e-4,
+                "Expected updated regime_trending_threshold=0.3, got {}",
+                fe.regime_trending_threshold,
+            );
+        }
+
+        // Verify the static config was also updated
+        {
+            let cfg = engine.config.read();
+            assert!(
+                cfg.feature_config.rsi_period == 21,
+                "Config rsi_period was not updated",
+            );
+            assert!(
+                cfg.feature_config.atr_period == 21,
+                "Config atr_period was not updated",
+            );
+            assert!(
+                (cfg.feature_config.regime_volatile_atr_threshold - 0.05).abs() < f64::EPSILON,
+                "Config regime_volatile_atr_threshold was not updated",
+            );
+            assert!(
+                (cfg.feature_config.regime_trending_threshold - 0.3).abs() < 1e-4,
+                "Config regime_trending_threshold was not updated",
+            );
+            assert!(
+                cfg.feature_config.price_window_size == 100,
+                "Config price_window_size was not updated",
+            );
+            assert!(
+                cfg.feature_config.volume_window_size == 40,
+                "Config volume_window_size was not updated",
             );
         }
     }

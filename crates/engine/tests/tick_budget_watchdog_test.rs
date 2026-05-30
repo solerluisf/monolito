@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use crossbeam_channel::bounded;
 
 use unified_trading_engine::engine::{AssetProcessor, StrategySwapRef};
@@ -86,6 +87,10 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         1.5,  // volume_confirmation_threshold
     ))));
 
+    let feature_engine = Arc::new(Mutex::new(FeatureEngine::new(
+        "SYNTH", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5
+    )));
+
     let (md_tx, md_rx) = bounded::<RawTick>(16);
     let (feature_tx, feature_rx) = bounded::<FeatureVector>(16);
     let (risk_tx, risk_rx) = bounded::<RiskCheckRequest>(16);
@@ -98,9 +103,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         symbol: "SYNTH".to_string(),
         symbol_id,
         normalizer: Normalizer::new(symbol_id),
-        feature_engine: FeatureEngine::new(
-            "SYNTH", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5
-        ),
+        feature_engine: Arc::clone(&feature_engine),
         strategy,
         inference_engine,
         signal_ctx: SignalContext::new(symbol_id),
