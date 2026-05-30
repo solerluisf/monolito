@@ -101,18 +101,23 @@ impl IdempotencyStore {
             &mut current_memory_bytes,
             self.capacity,
             self.max_memory_bytes,
+            0,
+            0,
         );
     }
 
     /// Evict LRU entries until both `capacity` and `max_memory_bytes` are satisfied.
+    /// `reserve_slots` and `reserve_bytes` account for an upcoming insertion.
     fn evict_until_under_cap(
         processed: &mut HashMap<String, Entry>,
         access_order: &mut VecDeque<String>,
         current_memory_bytes: &mut usize,
         capacity: usize,
         max_memory_bytes: usize,
+        reserve_slots: usize,
+        reserve_bytes: usize,
     ) {
-        while (processed.len() > capacity || *current_memory_bytes > max_memory_bytes)
+        while (processed.len() + reserve_slots > capacity || *current_memory_bytes + reserve_bytes > max_memory_bytes)
             && !access_order.is_empty()
         {
             if let Some(lru_key) = access_order.pop_back() {
@@ -142,15 +147,33 @@ impl IdempotencyStore {
 
     pub fn is_processed(&self, key: &str) -> bool {
         let mut processed = self.processed.lock();
+        if !processed.contains_key(key) {
+            return false;
+        }
+
+        let mut access_order = self.access_order.lock();
+        let mut current_memory_bytes = self.current_memory_bytes.lock();
 
         if let Some(entry) = processed.get_mut(key) {
             entry.last_accessed = Instant::now();
-            drop(processed);
-            self.update_access_order(key);
-            true
-        } else {
-            false
         }
+
+        if let Some(pos) = access_order.iter().position(|k| k == key) {
+            access_order.remove(pos);
+        }
+        access_order.push_front(key.to_string());
+
+        Self::evict_until_under_cap(
+            &mut *processed,
+            &mut *access_order,
+            &mut *current_memory_bytes,
+            self.capacity,
+            self.max_memory_bytes,
+            0,
+            0,
+        );
+
+        true
     }
 
     pub fn mark_processed(&self, key: String, result: String) {
@@ -167,17 +190,15 @@ impl IdempotencyStore {
 
         let new_entry_bytes = Entry::estimated_bytes_for(&key, &result);
 
-        while (processed.len() >= self.capacity || *current_memory_bytes + new_entry_bytes > self.max_memory_bytes)
-            && !access_order.is_empty()
-        {
-            if let Some(lru_key) = access_order.pop_back() {
-                if let Some(evicted) = processed.remove(&lru_key) {
-                    *current_memory_bytes = current_memory_bytes.saturating_sub(
-                        Entry::estimated_bytes_for(&lru_key, &evicted.result),
-                    );
-                }
-            }
-        }
+        Self::evict_until_under_cap(
+            &mut *processed,
+            &mut *access_order,
+            &mut *current_memory_bytes,
+            self.capacity,
+            self.max_memory_bytes,
+            1,
+            new_entry_bytes,
+        );
 
         let entry = Entry {
             result: result.clone(),
@@ -200,16 +221,34 @@ impl IdempotencyStore {
 
     pub fn get_result(&self, key: &str) -> Option<String> {
         let mut processed = self.processed.lock();
-
-        if let Some(entry) = processed.get_mut(key) {
-            entry.last_accessed = Instant::now();
-            let result = entry.result.clone();
-            drop(processed);
-            self.update_access_order(key);
-            Some(result)
-        } else {
-            None
+        if !processed.contains_key(key) {
+            return None;
         }
+
+        let mut access_order = self.access_order.lock();
+        let mut current_memory_bytes = self.current_memory_bytes.lock();
+
+        let result = processed.get_mut(key).map(|e| {
+            e.last_accessed = Instant::now();
+            e.result.clone()
+        });
+
+        if let Some(pos) = access_order.iter().position(|k| k == key) {
+            access_order.remove(pos);
+        }
+        access_order.push_front(key.to_string());
+
+        Self::evict_until_under_cap(
+            &mut *processed,
+            &mut *access_order,
+            &mut *current_memory_bytes,
+            self.capacity,
+            self.max_memory_bytes,
+            0,
+            0,
+        );
+
+        result
     }
 
     pub fn len(&self) -> usize {
@@ -247,15 +286,6 @@ impl IdempotencyStore {
         }
     }
 
-    fn update_access_order(&self, key: &str) {
-        let mut access_order = self.access_order.lock();
-
-        if let Some(pos) = access_order.iter().position(|k| k == key) {
-            access_order.remove(pos);
-        }
-
-        access_order.push_front(key.to_string());
-    }
 }
 
 impl Default for IdempotencyStore {
