@@ -2,6 +2,14 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A consistent point-in-time snapshot of portfolio state for risk evaluation.
+/// Captured under a single read lock so all checks see the same state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskSnapshot {
+    pub metrics: PortfolioMetrics,
+    pub net_positions: HashMap<String, f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: String,
@@ -124,8 +132,7 @@ impl PortfolioManager {
             pos.avg_entry_price = 0.0;
         }
 
-        drop(state);
-        self.recalculate_equity();
+        Self::recalculate_equity(&mut state);
     }
 
     pub fn update_price(&self, symbol: &str, price: f64) {
@@ -133,27 +140,10 @@ impl PortfolioManager {
         if let Some(pos) = state.positions.get_mut(symbol) {
             pos.current_price = price;
         }
-        drop(state);
-        self.recalculate_equity();
+        Self::recalculate_equity(&mut state);
     }
 
-    fn recalculate_equity(&self) {
-        let mut state = self.state.write();
-        let unrealized: f64 = state.positions.values().map(|p| {
-            p.net_position * (p.current_price - p.avg_entry_price)
-        }).sum();
-
-        let realized: f64 = state.positions.values().map(|p| p.realized_pnl).sum();
-
-        state.current_equity = state.initial_equity + unrealized + realized;
-
-        if state.current_equity > state.peak_equity {
-            state.peak_equity = state.current_equity;
-        }
-    }
-
-    pub fn get_metrics(&self) -> PortfolioMetrics {
-        let state = self.state.read();
+    fn metrics_from_state(state: &PortfolioState) -> PortfolioMetrics {
         let gross: f64 = state.positions.values().map(|p| p.net_position.abs() * p.current_price).sum();
         let net: f64 = state.positions.values().map(|p| p.net_position * p.current_price).sum();
         let unrealized: f64 = state.positions.values().map(|p| p.unrealized_pnl()).sum();
@@ -182,6 +172,45 @@ impl PortfolioManager {
             current_equity: state.current_equity,
             drawdown_pct: drawdown,
         }
+    }
+
+    fn recalculate_equity(state: &mut PortfolioState) {
+        let unrealized: f64 = state.positions.values().map(|p| {
+            p.net_position * (p.current_price - p.avg_entry_price)
+        }).sum();
+
+        let realized: f64 = state.positions.values().map(|p| p.realized_pnl).sum();
+
+        state.current_equity = state.initial_equity + unrealized + realized;
+
+        if state.current_equity > state.peak_equity {
+            state.peak_equity = state.current_equity;
+        }
+    }
+
+    pub fn get_metrics(&self) -> PortfolioMetrics {
+        let state = self.state.read();
+        Self::metrics_from_state(&state)
+    }
+
+    /// Consistent point-in-time snapshot for risk evaluation.
+    /// All fields are derived under a single read lock.
+    pub fn get_risk_snapshot(&self) -> RiskSnapshot {
+        let state = self.state.read();
+        let metrics = Self::metrics_from_state(&state);
+        let net_positions = state.positions.iter()
+            .map(|(k, v)| (k.clone(), v.net_position))
+            .collect();
+        RiskSnapshot { metrics, net_positions }
+    }
+
+    /// Set the average entry price for a position (used during broker reconciliation).
+    pub fn set_avg_entry_price(&self, symbol: &str, price: f64) {
+        let mut state = self.state.write();
+        if let Some(pos) = state.positions.get_mut(symbol) {
+            pos.avg_entry_price = price;
+        }
+        Self::recalculate_equity(&mut state);
     }
 
     pub fn get_position(&self, symbol: &str) -> Option<Position> {
@@ -222,6 +251,8 @@ impl Default for PortfolioManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn test_initial_state() {
@@ -294,5 +325,91 @@ mod tests {
         pm.on_fill("AAPL", 150.0, 10.0, true);
         pm.on_fill("AAPL", 152.0, 5.0, true);
         assert_eq!(pm.net_position("AAPL"), 15.0);
+    }
+
+    #[test]
+    fn test_concurrent_fills_and_snapshots_are_consistent() {
+        let pm = Arc::new(PortfolioManager::new(1_000_000.0, 0.001));
+        let symbols: Vec<String> = (0..8).map(|i| format!("SYM{}", i)).collect();
+        let num_writers = 4;
+        let ops_per_writer = 500;
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn writer threads that hammer on_fill and update_price
+        let mut writers = Vec::new();
+        for w in 0..num_writers {
+            let pm = Arc::clone(&pm);
+            let syms = symbols.clone();
+            let run = Arc::clone(&running);
+            writers.push(std::thread::spawn(move || {
+                for i in 0..ops_per_writer {
+                    let idx = (w * ops_per_writer + i) % syms.len();
+                    let price = 100.0 + (i % 50) as f64;
+                    let qty = 1.0 + (i % 10) as f64;
+                    let is_buy = i % 2 == 0;
+                    pm.on_fill(&syms[idx], price, qty, is_buy);
+                    // Every 10 ops, also update price to generate equity churn
+                    if i % 10 == 0 {
+                        pm.update_price(&syms[(idx + 1) % syms.len()], price * 1.02);
+                    }
+                }
+                run.store(false, Ordering::Relaxed);
+            }));
+        }
+
+        // Reader: continuously capture RiskSnapshot and verify invariants
+        let pm_reader = Arc::clone(&pm);
+        let run_reader = Arc::clone(&running);
+        let reader = std::thread::spawn(move || {
+            let initial_eq = 1_000_000.0;
+            loop {
+                let snap = pm_reader.get_risk_snapshot();
+
+                // Invariant 1: All values are finite
+                assert!(snap.metrics.current_equity.is_finite());
+                assert!(snap.metrics.gross_exposure.is_finite());
+                assert!(snap.metrics.leverage.is_finite());
+                assert!(snap.metrics.drawdown_pct.is_finite());
+                assert!(snap.metrics.total_unrealized_pnl.is_finite());
+                assert!(snap.metrics.total_realized_pnl.is_finite());
+
+                // Invariant 2: Non-negative where expected
+                assert!(snap.metrics.current_equity >= 0.0);
+                assert!(snap.metrics.gross_exposure >= 0.0);
+                assert!(snap.metrics.leverage >= 0.0);
+                assert!(snap.metrics.drawdown_pct >= 0.0);
+
+                // Invariant 3: net_positions map entries have finite values
+                for (_, &net) in &snap.net_positions {
+                    assert!(net.is_finite(), "non-finite net_position in snapshot");
+                }
+
+                // Invariant 4: current_equity = initial_equity + unrealized + realized
+                let computed_equity = initial_eq
+                    + snap.metrics.total_unrealized_pnl
+                    + snap.metrics.total_realized_pnl;
+                assert!((snap.metrics.current_equity - computed_equity).abs() < 0.01,
+                    "equity mismatch: current={} vs computed={} (unrealized={}, realized={})",
+                    snap.metrics.current_equity, computed_equity,
+                    snap.metrics.total_unrealized_pnl, snap.metrics.total_realized_pnl);
+
+                // Invariant 5: leverage = gross_exposure / current_equity (when equity > 0)
+                if snap.metrics.current_equity > 0.0 && snap.metrics.leverage > 0.0 {
+                    let expected_lev = snap.metrics.gross_exposure / snap.metrics.current_equity;
+                    assert!((snap.metrics.leverage - expected_lev).abs() < 0.01,
+                        "leverage mismatch: {} vs {}", snap.metrics.leverage, expected_lev);
+                }
+
+                if !run_reader.load(Ordering::Relaxed) {
+                    // Writers done; do one final verification and exit
+                    break;
+                }
+            }
+        });
+
+        for h in writers {
+            h.join().expect("writer panicked");
+        }
+        reader.join().expect("reader panicked");
     }
 }

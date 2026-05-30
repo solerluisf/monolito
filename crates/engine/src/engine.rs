@@ -768,11 +768,7 @@ impl UnifiedEngine {
                     let qty = pos.qty.abs();
                     self.portfolio_manager.on_fill(&pos.symbol, pos.current_price, qty, is_buy);
                     // Override avg entry price with broker's value for accuracy
-                    if let Some(mut p) = self.portfolio_manager.get_position(&pos.symbol) {
-                        p.avg_entry_price = pos.avg_entry_price;
-                        // Note: PortfolioManager doesn't have a direct setter for avg_entry_price;
-                        // the on_fill calculation is close enough for reconciliation.
-                    }
+                    self.portfolio_manager.set_avg_entry_price(&pos.symbol, pos.avg_entry_price);
                     tracing::info!(symbol = %pos.symbol, qty = %pos.qty, "Rehydrated position from broker");
                 }
             }

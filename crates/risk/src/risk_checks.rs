@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-
 use unified_trading_core::config::{RiskConfig, CheckSeverity, default_check_severities};
-use unified_trading_core::portfolio_manager::PortfolioManager;
+use unified_trading_core::portfolio_manager::{PortfolioManager, RiskSnapshot};
 use unified_trading_core::symbol_registry::SymbolId;
 use unified_trading_core::clock::wall_time_ns;
 
@@ -95,6 +94,11 @@ impl RiskEngine {
     pub fn check(&mut self, request: &RiskCheckRequest, kill_switch_active: bool) -> RiskDecision {
         let mut warnings: Vec<String> = Vec::new();
 
+        // Capture a consistent point-in-time portfolio snapshot under one read lock.
+        // All portfolio-dependent checks share this snapshot so a writer cannot
+        // interleave between checks within a single evaluation.
+        let snapshot = self.portfolio.get_risk_snapshot();
+
         // Phase 1: Run all hard Veto checks first (these block the order)
         macro_rules! run_veto {
             ($name:literal, $index:expr, $check:expr) => {
@@ -119,10 +123,10 @@ impl RiskEngine {
         run_veto!("idempotency", 1, self.check_idempotency(request));
         run_veto!("staleness", 2, self.check_staleness(request));
         run_veto!("order_rate", 3, self.check_order_rate(request));
-        run_veto!("position_limit", 4, self.check_position_limit(request));
-        run_veto!("portfolio_exposure", 5, self.check_portfolio_exposure(request));
-        run_veto!("leverage", 6, self.check_leverage(request));
-        run_veto!("drawdown", 7, self.check_drawdown(request));
+        run_veto!("position_limit", 4, self.check_position_limit(request, &snapshot));
+        run_veto!("portfolio_exposure", 5, self.check_portfolio_exposure(request, &snapshot));
+        run_veto!("leverage", 6, self.check_leverage(request, &snapshot));
+        run_veto!("drawdown", 7, self.check_drawdown(request, &snapshot));
 
         // Phase 2: Run Advisory / Info checks (volatility, spread)
         if let Some(reason) = self.check_volatility(request) {
@@ -205,9 +209,9 @@ impl RiskEngine {
         }
     }
 
-    fn check_position_limit(&self, request: &RiskCheckRequest) -> Option<String> {
+    fn check_position_limit(&self, request: &RiskCheckRequest, snapshot: &RiskSnapshot) -> Option<String> {
         let symbol_key = request.symbol_id.as_u16().to_string();
-        let current = self.portfolio.net_position(&symbol_key);
+        let current = snapshot.net_positions.get(&symbol_key).copied().unwrap_or(0.0);
         let new_position = current + request.quantity;
         if new_position.abs() * request.price > self.config.max_position_per_symbol {
             Some("Position limit exceeded".to_string())
@@ -220,9 +224,8 @@ impl RiskEngine {
         None
     }
 
-    fn check_portfolio_exposure(&self, request: &RiskCheckRequest) -> Option<String> {
-        let metrics = self.portfolio.get_metrics();
-        let new_exposure = metrics.gross_exposure + request.quantity * request.price;
+    fn check_portfolio_exposure(&self, request: &RiskCheckRequest, snapshot: &RiskSnapshot) -> Option<String> {
+        let new_exposure = snapshot.metrics.gross_exposure + request.quantity * request.price;
         if new_exposure > self.config.max_portfolio_exposure {
             Some("Portfolio exposure limit exceeded".to_string())
         } else {
@@ -230,11 +233,10 @@ impl RiskEngine {
         }
     }
 
-    fn check_leverage(&self, request: &RiskCheckRequest) -> Option<String> {
-        let metrics = self.portfolio.get_metrics();
-        let new_exposure = metrics.gross_exposure + request.quantity * request.price;
-        let new_leverage = if metrics.current_equity > 0.0 {
-            new_exposure / metrics.current_equity
+    fn check_leverage(&self, request: &RiskCheckRequest, snapshot: &RiskSnapshot) -> Option<String> {
+        let new_exposure = snapshot.metrics.gross_exposure + request.quantity * request.price;
+        let new_leverage = if snapshot.metrics.current_equity > 0.0 {
+            new_exposure / snapshot.metrics.current_equity
         } else {
             0.0
         };
@@ -245,9 +247,8 @@ impl RiskEngine {
         }
     }
 
-    fn check_drawdown(&self, _request: &RiskCheckRequest) -> Option<String> {
-        let metrics = self.portfolio.get_metrics();
-        if metrics.drawdown_pct > self.config.max_drawdown_pct {
+    fn check_drawdown(&self, _request: &RiskCheckRequest, snapshot: &RiskSnapshot) -> Option<String> {
+        if snapshot.metrics.drawdown_pct > self.config.max_drawdown_pct {
             Some("Drawdown limit exceeded".to_string())
         } else {
             None
