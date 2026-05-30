@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, AtomicU64};
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -46,6 +46,7 @@ pub struct AssetPipeline {
     pub strategy_ref: StrategySwapRef,
     pub inference_engine: Arc<ArcSwap<InferenceEngine>>,
     pub feature_engine: Arc<Mutex<FeatureEngine>>,
+    pub prediction_staleness_ns: Arc<AtomicU64>,
 }
 
 pub fn recv_batch<T>(rx: &Receiver<T>, buf: &mut Vec<T>, max: usize) -> usize {
@@ -164,7 +165,7 @@ pub struct AssetProcessor {
     pub feature_rx: Receiver<FeatureVector>,
     pub kill_switch: Arc<KillSwitch>,
     pub metrics: Arc<GlobalMetrics>,
-    pub prediction_staleness_ns: u64,
+    pub prediction_staleness_ns: Arc<AtomicU64>,
     pub default_order_quantity: f64,
     pub tick_processing_budget_us: u64,
     pub feature_backpressure_policy: BackpressurePolicy,
@@ -1074,6 +1075,8 @@ impl UnifiedEngine {
             config.feature_config.regime_trending_threshold,
         )));
 
+        let prediction_staleness_ns = Arc::new(AtomicU64::new(config.strategy_config.prediction_staleness_ns));
+
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
             symbol_id,
@@ -1088,7 +1091,7 @@ impl UnifiedEngine {
             feature_rx: feature_rx.clone(),
             kill_switch: Arc::clone(&ks),
             metrics: Arc::clone(&metrics),
-            prediction_staleness_ns: config.strategy_config.prediction_staleness_ns,
+            prediction_staleness_ns: Arc::clone(&prediction_staleness_ns),
             default_order_quantity: config.execution_defaults.default_order_quantity,
             tick_processing_budget_us: config.threading_config.tick_processing_budget_us,
             feature_backpressure_policy: config.channel_config.feature_backpressure_policy.clone(),
@@ -1167,6 +1170,7 @@ impl UnifiedEngine {
             strategy_ref: strategy_arc,
             inference_engine: Arc::clone(&inference_engine),
             feature_engine: Arc::clone(&feature_engine),
+            prediction_staleness_ns: Arc::clone(&prediction_staleness_ns),
         }
     }
 
@@ -1433,6 +1437,9 @@ impl UnifiedEngine {
                     strat_cfg.volume_ratio_clamp = feature_cfg.volume_ratio_clamp;
                     let new_strategy: Box<dyn strategy::Strategy> = Box::new(StrategyEngine::new(sid, &strat_cfg));
                     strategy_ref.store(Arc::new(new_strategy));
+                    if let Some(pipeline) = self.asset_pipelines.get(&symbol) {
+                        pipeline.prediction_staleness_ns.store(staleness, Ordering::Relaxed);
+                    }
                     tracing::info!(symbol = %symbol, from = %old_name, to = %strategy_type, "Strategy swapped");
                     ControlResponse::Ok
                 } else {
@@ -2502,5 +2509,67 @@ mod tests {
                 "Config volume_window_size was not updated",
             );
         }
+    }
+
+    #[test]
+    fn test_swap_strategy_updates_prediction_staleness_on_pipeline() {
+        use unified_trading_core::command_channel::StrategyParams;
+        use std::sync::atomic::Ordering;
+
+        let mut engine = UnifiedEngine::new(EngineConfig::default());
+
+        let (reactor_tx, _reactor_rx) = bounded::<ReactorCommand>(100);
+        let (lifecycle_tx, _lifecycle_rx) = bounded::<OrderLifecycleEvent>(100);
+        engine.tick_reactor_tx = Some(reactor_tx);
+        engine.lifecycle_tx = Some(lifecycle_tx);
+        engine.execution_port = Some(Arc::new(MockExecutionPort::default()));
+
+        let resp = engine.handle_command(ControlCommand::SubscribeFeed { symbol: "AAPL".to_string() });
+        assert!(matches!(resp, ControlResponse::Ok));
+
+        let params = StrategyParams {
+            prediction_staleness_ns: 42_000_000_000,
+            long_entry_threshold: 0.6,
+            short_entry_threshold: -0.6,
+            exit_threshold: 0.0,
+            confidence_minimum: 0.5,
+            hysteresis_deadband: 0.15,
+            entry_cooldown_ms: 5000,
+            exit_cooldown_ms: 2000,
+            allow_short: true,
+            max_long_units: 100.0,
+            max_short_units: 100.0,
+            trade_intent_ttl_ns: 30_000_000_000,
+            urgency_aggressive_threshold: 0.85,
+            urgency_normal_threshold: 0.5,
+        };
+
+        let resp = engine.handle_command(ControlCommand::SwapStrategy {
+            symbol: "AAPL".to_string(),
+            strategy_type: "hysteresis".to_string(),
+            params: Some(params),
+        });
+        assert!(matches!(resp, ControlResponse::Ok));
+
+        let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+        let updated = pipeline.prediction_staleness_ns.load(Ordering::Relaxed);
+        assert_eq!(
+            updated, 42_000_000_000,
+            "Expected prediction_staleness_ns=42_000_000_000, got {updated}"
+        );
+
+        let resp = engine.handle_command(ControlCommand::SwapStrategy {
+            symbol: "AAPL".to_string(),
+            strategy_type: "conservative".to_string(),
+            params: None,
+        });
+        assert!(matches!(resp, ControlResponse::Ok));
+
+        let pipeline = engine.asset_pipelines.get("AAPL").unwrap();
+        let reverted = pipeline.prediction_staleness_ns.load(Ordering::Relaxed);
+        assert_eq!(
+            reverted, 200_000_000,
+            "Expected conservative default prediction_staleness_ns=200_000_000, got {reverted}"
+        );
     }
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -115,7 +115,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         risk_backpressure_policy: BackpressurePolicy::DropNewest,
         kill_switch: Arc::clone(&kill_switch),
         metrics: Arc::clone(&metrics),
-        prediction_staleness_ns: 1_000_000_000,
+        prediction_staleness_ns: Arc::new(AtomicU64::new(1_000_000_000)),
         default_order_quantity: 1.0,
         tick_processing_budget_us: 500,
         heartbeat: None,
