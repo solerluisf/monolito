@@ -54,6 +54,7 @@ fn make_tick(symbol_id: SymbolId, ts: u64) -> RawTick {
         last_size: 1,
         exchange: "TEST".to_string(),
         trace_id: ts,
+        symbol_name: None,
     }
 }
 

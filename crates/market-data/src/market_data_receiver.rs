@@ -86,6 +86,7 @@ mod tests {
                 last_size: 50,
                 exchange: "IEX".to_string(),
                 trace_id: i as u64,
+                symbol_name: None,
             })
             .unwrap();
         }
@@ -114,6 +115,7 @@ mod tests {
                 last_size: 50,
                 exchange: "IEX".to_string(),
                 trace_id: i as u64,
+                symbol_name: None,
             })
             .unwrap();
         }

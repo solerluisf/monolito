@@ -24,6 +24,9 @@ pub struct RawTick {
     /// Unique trace ID for causal tracing across the pipeline.
     /// Generated at tick ingestion and propagated through all subsequent stages.
     pub trace_id: u64,
+    /// Raw symbol name from the feed (e.g. from self.S in Alpaca).
+    /// Used by TickReactor as a fallback for symbol_id resolution.
+    pub symbol_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +235,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 1,
+            symbol_name: None,
         };
         let (normalized, _gap) = norm.process(raw).unwrap();
         assert_eq!(normalized.symbol_id, symbol_id);
@@ -257,6 +261,7 @@ mod tests {
             last_size: 10,
             exchange: "IEX".to_string(),
             trace_id: 2,
+            symbol_name: None,
         };
         let (normalized, _gap) = norm.process(raw).unwrap();
         assert!((normalized.spread_bps - 1.0).abs() < 0.01);
@@ -279,6 +284,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 3,
+            symbol_name: None,
         }).unwrap();
         assert!(norm.check_sequence(2).is_none());
         assert!(norm.check_sequence(5).is_some());
@@ -301,6 +307,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 4,
+            symbol_name: None,
         }).unwrap();
         assert!(!norm.check_staleness(1_100_000_000, 200_000_000));
         assert!(norm.check_staleness(1_300_000_000, 200_000_000));
@@ -344,6 +351,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 5,
+            symbol_name: None,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -365,6 +373,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 6,
+            symbol_name: None,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -386,6 +395,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 7,
+            symbol_name: None,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -407,6 +417,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 8,
+            symbol_name: None,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -428,6 +439,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 9,
+            symbol_name: None,
         };
         assert!(norm.process(raw).is_none());
     }
@@ -449,6 +461,7 @@ mod tests {
             last_size: 50,
             exchange: "IEX".to_string(),
             trace_id: 10,
+            symbol_name: None,
         };
         let result = norm.process(raw);
         assert!(result.is_some());

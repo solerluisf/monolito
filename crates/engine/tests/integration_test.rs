@@ -75,6 +75,7 @@ fn make_raw_tick(symbol_id: SymbolId, symbol: &str, ts: u64, mid: f64, spread: f
         last_size: 50,
         exchange: "IEX".to_string(),
         trace_id: ts,
+        symbol_name: None,
     }
 }
 

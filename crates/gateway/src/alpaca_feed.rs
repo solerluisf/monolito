@@ -144,6 +144,7 @@ impl AlpacaTrade {
             last_size: self.s,
             exchange: self.x.clone(),
             trace_id: 0,
+            symbol_name: Some(self.S.clone()),
         })
     }
 }
@@ -163,6 +164,7 @@ impl AlpacaQuote {
             last_size: self.bs.min(self.as_size),
             exchange: self.bx.clone(),
             trace_id: 0,
+            symbol_name: Some(self.S.clone()),
         })
     }
 }
@@ -593,6 +595,7 @@ impl AlpacaWebSocketFeed {
                                         last_size: bar.v,
                                         exchange: "BAR".to_string(),
                                         trace_id: 0,
+                                        symbol_name: Some(bar.S.clone()),
                                     };
                                     self.buffer_tick(tick.clone());
                                     self.try_send_tick(tick);

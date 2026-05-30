@@ -160,7 +160,8 @@ impl TickReactor {
         for tick in batch.drain(..) {
             self.total_ticks.fetch_add(1, Ordering::Relaxed);
             let trace_id = next_trace_id();
-            let symbol = tick.symbol.clone();
+            let symbol_name = tick.symbol_name.clone().unwrap_or_default();
+            let symbol = if symbol_name.is_empty() { tick.symbol.clone() } else { symbol_name };
 
             let symbol_id = if tick.symbol_id.as_u16() == 0 {
                 self.registry.lookup(&symbol).unwrap_or(tick.symbol_id)
@@ -291,6 +292,7 @@ mod tests {
             last_size: 100,
             exchange: "V".to_string(),
             trace_id: 0,
+            symbol_name: None,
         };
 
         tick_tx.send(tick.clone()).unwrap();
@@ -329,6 +331,7 @@ mod tests {
             last_size: 100,
             exchange: "V".to_string(),
             trace_id: 0,
+            symbol_name: None,
         };
 
         tick_tx.send(tick).unwrap();
@@ -359,6 +362,7 @@ mod tests {
             last_size: 100,
             exchange: "V".to_string(),
             trace_id: 0,
+            symbol_name: None,
         };
 
         tick_tx.send(tick.clone()).unwrap();
