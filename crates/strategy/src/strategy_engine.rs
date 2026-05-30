@@ -455,6 +455,8 @@ mod tests {
             regime_strength: 0.5,
             computed_ns: now,
             trace_id: 0,
+            version: 0,
+            is_heuristic: false,
         }
     }
 
@@ -469,6 +471,8 @@ mod tests {
             regime_strength: 0.5,
             computed_ns: now,
             trace_id,
+            version: 0,
+            is_heuristic: false,
         }
     }
 

@@ -33,6 +33,8 @@ fn test_arc_swap_prediction_concurrent() {
                     regime_strength: 0.5,
                     computed_ns: unified_trading_core::clock::wall_time_ns(),
                     trace_id: 1,
+                    version: 0,
+                    is_heuristic: false,
                 };
                 pred.store(Arc::new(new_pred));
                 wc.fetch_add(1, Ordering::Relaxed);
@@ -136,6 +138,8 @@ fn test_arc_swap_strategy_hot_swap() {
                 regime_strength: 0.5,
                 computed_ns: 0,
                 trace_id: 1,
+                version: 0,
+                is_heuristic: false,
             };
             let s = strat.load_full();
             let _ = s.evaluate(&pred, &ctx);

@@ -98,6 +98,7 @@ pub struct MetricsBatch {
     pub dropped_intents: u64,
     pub stale_predictions: u64,
     pub model_fallback_activations: u64,
+    pub ticks_skipped: u64,
     pub orders_submitted: u64,
     pub orders_filled: u64,
     pub orders_cancelled: u64,
@@ -132,6 +133,7 @@ pub struct MetricsBatch {
     pub per_symbol_features: HashMap<String, u64>,
     pub per_symbol_intents_approved: HashMap<String, u64>,
     pub per_symbol_intents_rejected: HashMap<String, u64>,
+    pub per_symbol_ticks_skipped: HashMap<String, u64>,
 }
 
 impl MetricsBatch {
@@ -149,6 +151,7 @@ impl MetricsBatch {
         self.dropped_intents += other.dropped_intents;
         self.stale_predictions += other.stale_predictions;
         self.model_fallback_activations += other.model_fallback_activations;
+        self.ticks_skipped += other.ticks_skipped;
         self.orders_submitted += other.orders_submitted;
         self.orders_filled += other.orders_filled;
         self.orders_cancelled += other.orders_cancelled;
@@ -206,11 +209,12 @@ impl MetricsBatch {
         for (k, v) in &other.per_symbol_intents_rejected {
             *self.per_symbol_intents_rejected.entry(k.clone()).or_insert(0) += v;
         }
+        for (k, v) in &other.per_symbol_ticks_skipped {
+            *self.per_symbol_ticks_skipped.entry(k.clone()).or_insert(0) += v;
+        }
     }
 }
 
-/// Thread-local metrics accumulator that batches updates and flushes periodically.
-/// This reduces atomic contention on the hot path.
 pub struct ThreadLocalMetrics {
     batch: MetricsBatch,
     tick_count: u64,
@@ -415,6 +419,7 @@ impl MetricsAggregator {
         m.dropped_intents.fetch_add(batch.dropped_intents, Ordering::Relaxed);
         m.stale_predictions.fetch_add(batch.stale_predictions, Ordering::Relaxed);
         m.model_fallback_activations.fetch_add(batch.model_fallback_activations, Ordering::Relaxed);
+        m.ticks_skipped.fetch_add(batch.ticks_skipped, Ordering::Relaxed);
         m.orders_submitted.fetch_add(batch.orders_submitted, Ordering::Relaxed);
         m.orders_filled.fetch_add(batch.orders_filled, Ordering::Relaxed);
         m.orders_cancelled.fetch_add(batch.orders_cancelled, Ordering::Relaxed);
@@ -523,6 +528,14 @@ impl MetricsAggregator {
                     .fetch_add(*count, Ordering::Relaxed);
             }
         }
+        if !batch.per_symbol_ticks_skipped.is_empty() {
+            let mut map = m.per_symbol_ticks_skipped.lock();
+            for (symbol, count) in &batch.per_symbol_ticks_skipped {
+                map.entry(symbol.clone())
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(*count, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -536,6 +549,7 @@ pub struct GlobalMetrics {
     pub dropped_intents: CachePaddedAtomicU64,
     pub stale_predictions: CachePaddedAtomicU64,
     pub model_fallback_activations: CachePaddedAtomicU64,
+    pub ticks_skipped: CachePaddedAtomicU64,
     pub orders_submitted: CachePaddedAtomicU64,
     pub orders_filled: CachePaddedAtomicU64,
     pub orders_cancelled: CachePaddedAtomicU64,
@@ -570,6 +584,7 @@ pub struct GlobalMetrics {
     pub per_symbol_features: Mutex<HashMap<String, AtomicU64>>,
     pub per_symbol_intents_approved: Mutex<HashMap<String, AtomicU64>>,
     pub per_symbol_intents_rejected: Mutex<HashMap<String, AtomicU64>>,
+    pub per_symbol_ticks_skipped: Mutex<HashMap<String, AtomicU64>>,
 }
 
 impl GlobalMetrics {
@@ -584,6 +599,7 @@ impl GlobalMetrics {
             dropped_intents: CachePaddedAtomicU64::new(0),
             stale_predictions: CachePaddedAtomicU64::new(0),
             model_fallback_activations: CachePaddedAtomicU64::new(0),
+            ticks_skipped: CachePaddedAtomicU64::new(0),
             orders_submitted: CachePaddedAtomicU64::new(0),
             orders_filled: CachePaddedAtomicU64::new(0),
             orders_cancelled: CachePaddedAtomicU64::new(0),
@@ -614,6 +630,7 @@ impl GlobalMetrics {
             per_symbol_features: Mutex::new(HashMap::new()),
             per_symbol_intents_approved: Mutex::new(HashMap::new()),
             per_symbol_intents_rejected: Mutex::new(HashMap::new()),
+            per_symbol_ticks_skipped: Mutex::new(HashMap::new()),
         }
     }
 
@@ -627,6 +644,7 @@ impl GlobalMetrics {
         self.dropped_intents.store(0, Ordering::Relaxed);
         self.stale_predictions.store(0, Ordering::Relaxed);
         self.model_fallback_activations.store(0, Ordering::Relaxed);
+        self.ticks_skipped.store(0, Ordering::Relaxed);
         self.orders_submitted.store(0, Ordering::Relaxed);
         self.orders_filled.store(0, Ordering::Relaxed);
         self.orders_cancelled.store(0, Ordering::Relaxed);
@@ -657,6 +675,7 @@ impl GlobalMetrics {
         self.per_symbol_features.lock().clear();
         self.per_symbol_intents_approved.lock().clear();
         self.per_symbol_intents_rejected.lock().clear();
+        self.per_symbol_ticks_skipped.lock().clear();
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -684,6 +703,12 @@ impl GlobalMetrics {
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
         };
+        let per_symbol_ticks_skipped = {
+            let map = self.per_symbol_ticks_skipped.lock();
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
         MetricsSnapshot {
             ticks_processed: self.ticks_processed.load(Ordering::Relaxed),
             features_computed: self.features_computed.load(Ordering::Relaxed),
@@ -694,6 +719,7 @@ impl GlobalMetrics {
             dropped_intents: self.dropped_intents.load(Ordering::Relaxed),
             stale_predictions: self.stale_predictions.load(Ordering::Relaxed),
             model_fallback_activations: self.model_fallback_activations.load(Ordering::Relaxed),
+            ticks_skipped: self.ticks_skipped.load(Ordering::Relaxed),
             orders_submitted: self.orders_submitted.load(Ordering::Relaxed),
             orders_filled: self.orders_filled.load(Ordering::Relaxed),
             orders_cancelled: self.orders_cancelled.load(Ordering::Relaxed),
@@ -724,6 +750,7 @@ impl GlobalMetrics {
             per_symbol_features,
             per_symbol_intents_approved,
             per_symbol_intents_rejected,
+            per_symbol_ticks_skipped,
         }
     }
 
@@ -750,6 +777,13 @@ impl GlobalMetrics {
 
     pub fn increment_per_symbol_intent_rejected(&self, symbol: &str) {
         let mut map = self.per_symbol_intents_rejected.lock();
+        map.entry(symbol.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_per_symbol_tick_skipped(&self, symbol: &str) {
+        let mut map = self.per_symbol_ticks_skipped.lock();
         map.entry(symbol.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
@@ -795,6 +829,7 @@ pub struct MetricsSnapshot {
     pub dropped_intents: u64,
     pub stale_predictions: u64,
     pub model_fallback_activations: u64,
+    pub ticks_skipped: u64,
     pub orders_submitted: u64,
     pub orders_filled: u64,
     pub orders_cancelled: u64,
@@ -829,6 +864,7 @@ pub struct MetricsSnapshot {
     pub per_symbol_features: std::collections::HashMap<String, u64>,
     pub per_symbol_intents_approved: std::collections::HashMap<String, u64>,
     pub per_symbol_intents_rejected: std::collections::HashMap<String, u64>,
+    pub per_symbol_ticks_skipped: std::collections::HashMap<String, u64>,
 }
 
 impl Default for GlobalMetrics {

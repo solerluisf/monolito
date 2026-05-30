@@ -77,6 +77,8 @@ impl InferenceEngine {
             regime_strength,
             computed_ns: now,
             trace_id: features.trace_id,
+            version: 0,
+            is_heuristic: false,
         }
     }
 

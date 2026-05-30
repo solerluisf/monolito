@@ -43,6 +43,11 @@ pub struct Prediction {
     pub computed_ns: u64,
     /// Trace ID propagated from RawTick for causal tracing.
     pub trace_id: u64,
+    /// Monotonic version counter for ordering predictions.
+    /// Used by AssetProcessor to reject stale predictions.
+    pub version: u64,
+    /// True when this prediction was produced by heuristic fallback.
+    pub is_heuristic: bool,
 }
 
 impl Prediction {
@@ -61,6 +66,8 @@ impl Prediction {
             regime_strength: 0.0,
             computed_ns: 0,
             trace_id: 0,
+            version: 0,
+            is_heuristic: false,
         }
     }
 
@@ -82,12 +89,14 @@ impl Prediction {
             regime_strength,
             computed_ns: now,
             trace_id: features.trace_id,
+            version: 0,
+            is_heuristic: false,
         }
     }
 
     /// Create a heuristic prediction from raw features when the model is stale or unavailable.
     /// Uses MACD histogram as a simple trend-following signal with fixed confidence.
-    pub fn heuristic_from_features(features: &FeatureVector, symbol_id: SymbolId) -> Self {
+    pub fn heuristic_from_features(features: &FeatureVector, symbol_id: SymbolId, version: u64) -> Self {
         let now = wall_time_ns();
 
         let macd_hist = features.get(FeatureIndex::MacdHistogram);
@@ -103,7 +112,16 @@ impl Prediction {
             regime_strength: features.get(FeatureIndex::RegimeStrength),
             computed_ns: now,
             trace_id: features.trace_id,
+            version,
+            is_heuristic: true,
         }
+    }
+
+    /// Apply a version and heuristic flag, returning a new Prediction.
+    pub fn with_version(mut self, version: u64, is_heuristic: bool) -> Self {
+        self.version = version;
+        self.is_heuristic = is_heuristic;
+        self
     }
 }
 
@@ -365,14 +383,16 @@ mod tests {
     #[test]
     fn test_prediction_is_stale() {
         let pred = Prediction {
-            symbol_id: SymbolId::from_raw(0),
-            forecast: 0.5,
-            confidence: 0.8,
-            action_score: 0.3,
+            symbol_id: SymbolId::from_raw(42),
+            forecast: 0.0,
+            confidence: 0.5,
+            action_score: 0.0,
             regime_label: 0,
-            regime_strength: 0.5,
-            computed_ns: 0,
+            regime_strength: 0.0,
+            computed_ns: 100_000,
             trace_id: 1,
+            version: 0,
+            is_heuristic: false,
         };
         assert!(pred.is_stale(1000));
     }
@@ -381,14 +401,16 @@ mod tests {
     fn test_prediction_not_stale() {
         let now = unified_trading_core::clock::wall_time_ns();
         let pred = Prediction {
-            symbol_id: SymbolId::from_raw(0),
-            forecast: 0.5,
-            confidence: 0.8,
-            action_score: 0.3,
+            symbol_id: SymbolId::from_raw(42),
+            forecast: 0.0,
+            confidence: 0.5,
+            action_score: 0.0,
             regime_label: 0,
-            regime_strength: 0.5,
-            computed_ns: now,
-            trace_id: 2,
+            regime_strength: 0.0,
+            computed_ns: now - 10_000,
+            trace_id: 1,
+            version: 0,
+            is_heuristic: false,
         };
         assert!(!pred.is_stale(1_000_000_000));
     }
@@ -415,6 +437,8 @@ mod tests {
             regime_strength: 0.5,
             computed_ns: 1000,
             trace_id: 1,
+            version: 0,
+            is_heuristic: false,
         };
         let shadow = Prediction {
             symbol_id: SymbolId::from_raw(0),
@@ -425,6 +449,8 @@ mod tests {
             regime_strength: 0.5,
             computed_ns: 1000,
             trace_id: 1,
+            version: 0,
+            is_heuristic: false,
         };
         let dm = DivergenceMetrics::compute(&active, &shadow);
         assert!((dm.forecast_delta - 0.2).abs() < 1e-6);
@@ -445,11 +471,13 @@ mod tests {
             symbol_id: SymbolId::from_raw(0),
             forecast: 0.5, confidence: 0.8, action_score: 0.3,
             regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+            version: 0, is_heuristic: false,
         };
         let shadow = Prediction {
             symbol_id: SymbolId::from_raw(0),
             forecast: 0.45, confidence: 0.85, action_score: 0.32,
             regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+            version: 0, is_heuristic: false,
         };
         let dm = DivergenceMetrics::compute(&active, &shadow);
         assert!(dm.below_threshold(&config));
@@ -458,6 +486,7 @@ mod tests {
             symbol_id: SymbolId::from_raw(0),
             forecast: 0.9, confidence: 0.3, action_score: 0.9,
             regime_label: 0, regime_strength: 0.5, computed_ns: 1000, trace_id: 1,
+            version: 0, is_heuristic: false,
         };
         let dm2 = DivergenceMetrics::compute(&active, &divergent_shadow);
         assert!(!dm2.below_threshold(&config));
@@ -484,6 +513,8 @@ mod tests {
                 regime_strength: 0.5,
                 computed_ns: unified_trading_core::clock::wall_time_ns(),
                 trace_id: features.trace_id,
+                version: 0,
+                is_heuristic: false,
             }
         }, 0);
 

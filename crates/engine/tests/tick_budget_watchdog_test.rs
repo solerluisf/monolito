@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::bounded;
@@ -8,7 +8,7 @@ use crossbeam_channel::bounded;
 use unified_trading_engine::engine::{AssetProcessor, StrategySwapRef};
 use feature::{FeatureEngine, FeatureVector};
 use market_data::{Normalizer, RawTick, TickType};
-use model::Prediction;
+use model::{Prediction, InferenceEngine};
 use risk::RiskCheckRequest;
 use strategy::{SignalContext, Strategy, TradeIntent};
 use unified_trading_core::config::BackpressurePolicy;
@@ -69,17 +69,21 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         Box::new(SlowNoopStrategy { sleep_ms: 10 }) as Box<dyn strategy::Strategy>
     )));
 
-    let prediction = Arc::new(Prediction {
-        symbol_id,
-        forecast: 0.0,
-        confidence: 1.0,
-        action_score: 0.0,
-        regime_label: 0,
-        regime_strength: 0.0,
-        computed_ns: unified_trading_core::clock::wall_time_ns(),
-        trace_id: 1,
-    });
-    let latest_pred = Arc::new(ArcSwap::new(prediction));
+    let inference_engine = Arc::new(InferenceEngine::new(
+        6,   // feature_vector_size
+        0.3, // action_score_rsi_weight
+        0.3, // action_score_macd_weight
+        0.2, // action_score_volatility_weight
+        0.3, // atr_penalty_threshold
+        0.5, // atr_penalty_value
+        70.0, // rsi_overbought
+        30.0, // rsi_oversold
+        50.0, // rsi_neutral
+        0.5,  // forecast_momentum_weight
+        0.3,  // forecast_volume_weight
+        3.0,  // volume_ratio_clamp
+        1.5,  // volume_confirmation_threshold
+    ));
 
     let (md_tx, md_rx) = bounded::<RawTick>(16);
     let (feature_tx, feature_rx) = bounded::<FeatureVector>(16);
@@ -97,7 +101,7 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
             "SYNTH", 14, 14, 9, 20, 50, 20, 20, 1, 5, 20, 0.3, 0.02, 0.05, 0.5
         ),
         strategy,
-        latest_pred,
+        inference_engine,
         signal_ctx: SignalContext::new(symbol_id),
         coordinator_tx: risk_tx,
         coordinator_rx: risk_rx,
@@ -110,7 +114,8 @@ fn test_watchdog_triggers_and_batch_ticks_are_skipped() {
         prediction_staleness_ns: 1_000_000_000,
         default_order_quantity: 1.0,
         tick_processing_budget_us: 500,
-        heartbeat: None, // No heartbeat - test focuses on tick budget, not heartbeat watchdog
+        heartbeat: None,
+        current_prediction_version: 0,
     };
 
     let budget_breaches = Arc::new(AtomicUsize::new(0));

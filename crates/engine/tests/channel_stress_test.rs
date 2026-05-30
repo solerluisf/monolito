@@ -1,7 +1,7 @@
 //! Channel stress tests — verify back-pressure and correctness under high load.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crossbeam_channel::bounded;

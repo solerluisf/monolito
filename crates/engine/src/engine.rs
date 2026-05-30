@@ -24,7 +24,7 @@ use model::{Prediction, PredictionEngine, InferenceEngine};
 use strategy::{StrategyEngine, TradeIntent, SizeHint};
 use risk::{RiskCoordinator, RiskCheckRequest, RiskDecision};
 use execution::{ExecutionManager, OrderLifecycleEvent, OrderTracker, RateLimiter};
-use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide, FeedCommand};
+use gateway::{AlpacaFeedConfig, AlpacaWebSocketFeed, AlpacaExecutionPort, MockExecutionPort, IExecutionPort, CircuitBreaker, OpenOrderInfo, PositionInfo, OrderSide, OrderCommand, OrderType, TimeInForce, FeedCommand};
 
 use crate::tick_reactor::{spawn_reactor, ReactorCommand};
 
@@ -147,7 +147,6 @@ pub type StrategySwapRef = Arc<ArcSwap<Box<dyn strategy::Strategy>>>;
 /// `Prediction` is a plain data struct — all fields are `Copy`
 /// primitives. No interior mutability allowed.
 /// See the ARC-SWAP HOT-SWAP INVARIANT block above this module.
-type PredictionRef = Arc<ArcSwap<Prediction>>;
 
 pub struct AssetProcessor {
     pub symbol: String,
@@ -155,7 +154,7 @@ pub struct AssetProcessor {
     pub normalizer: Normalizer,
     pub feature_engine: FeatureEngine,
     pub strategy: StrategySwapRef,
-    pub latest_pred: PredictionRef,
+    pub inference_engine: Arc<InferenceEngine>,
     pub signal_ctx: strategy::SignalContext,
     pub coordinator_tx: Sender<RiskCheckRequest>,
     pub coordinator_rx: Receiver<RiskCheckRequest>,
@@ -169,6 +168,7 @@ pub struct AssetProcessor {
     pub feature_backpressure_policy: BackpressurePolicy,
     pub risk_backpressure_policy: BackpressurePolicy,
     pub heartbeat: Option<unified_trading_core::heartbeat::HeartbeatHandle>,
+    pub current_prediction_version: u64,
 }
 
 impl AssetProcessor {
@@ -205,6 +205,8 @@ impl AssetProcessor {
             let mut iter = batch.drain(..).peekable();
             while let Some(tick) = iter.next() {
                 let tick_start = std::time::Instant::now();
+
+                // Stage 1: Always normalize — updates Normalizer state (last_spread, etc.)
                 let (normalized, gap) = match self.normalizer.process(tick.clone()) {
                     Some(result) => result,
                     None => {
@@ -215,7 +217,60 @@ impl AssetProcessor {
                 if gap {
                     self.metrics.feed_gaps.fetch_add(1, Ordering::Relaxed);
                 }
+
+                // Stage 2: Always compute features — updates FeatureEngine state (EMA, ATR, RSI, etc.)
                 let features = self.feature_engine.compute(&normalized);
+
+                // Stage 3: Update signal context regardless of budget
+                self.signal_ctx.update_price(normalized.mid_price);
+                if normalized.mid_price > 0.0 {
+                    current_spread_bps = (normalized.ask - normalized.bid) / normalized.mid_price * 10000.0;
+                    self.signal_ctx.update_spread(current_spread_bps.max(0.0));
+                }
+
+                self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);
+                self.metrics.features_computed.fetch_add(1, Ordering::Relaxed);
+                self.metrics.increment_per_symbol_tick(&self.symbol);
+                self.metrics.increment_per_symbol_feature(&self.symbol);
+
+                // Record feed latency (tick timestamp to processing time)
+                let proc_ns = wall_time_ns();
+                let latency = proc_ns.saturating_sub(tick.timestamp_ns);
+                self.metrics.feed_latency.record(latency);
+
+                // Stage 4: Budget check — skip expensive stages (prediction, strategy) if exceeded
+                let elapsed_us = tick_start.elapsed().as_micros() as u64;
+                if elapsed_us > self.tick_processing_budget_us {
+                    // Feed remaining ticks through normalizer + feature engine to prevent indicator drift
+                    let mut skipped = 1u64;
+                    for remaining in &mut iter {
+                        if let Some((n, _)) = self.normalizer.process(remaining.clone()) {
+                            self.feature_engine.compute(&n);
+                        }
+                        self.metrics.increment_per_symbol_tick_skipped(&self.symbol);
+                        skipped += 1;
+                    }
+                    self.metrics.ticks_skipped.fetch_add(skipped, Ordering::Relaxed);
+                    tracing::warn!(
+                        symbol = %self.symbol,
+                        elapsed_us = elapsed_us,
+                        budget_us = self.tick_processing_budget_us,
+                        skipped_ticks = skipped,
+                        "Tick processing budget exceeded; skipping prediction/strategy for remaining ticks"
+                    );
+                    if let Some(cb) = on_budget_exceeded {
+                        cb(elapsed_us, self.tick_processing_budget_us, skipped as usize);
+                    }
+                    std::hint::spin_loop();
+                    break;
+                }
+
+                // Stage 5: Inline prediction — compute directly, no channel hop
+                let prediction = self.inference_engine.predict(&features);
+                self.current_prediction_version += 1;
+                let prediction = Arc::new(Prediction::with_version(prediction, self.current_prediction_version, false));
+
+                // Stage 6: Also send features to PredictionEngine for shadow model tracking
                 if send_with_policy(
                     &self.feature_tx,
                     Some(&self.feature_rx),
@@ -226,25 +281,7 @@ impl AssetProcessor {
                     self.metrics.feature_channel_depth.fetch_add(1, Ordering::Relaxed);
                 }
 
-                self.signal_ctx.update_price(normalized.mid_price);
-                if normalized.mid_price > 0.0 {
-                    current_spread_bps = (normalized.ask - normalized.bid) / normalized.mid_price * 10000.0;
-                    self.signal_ctx.update_spread(current_spread_bps.max(0.0));
-                }
-
-                // Read prediction from ArcSwap (set by PredictionEngine)
-                let prediction = self.latest_pred.load_full();
-
-                // If prediction is stale, fall back to a heuristic based on raw features
-                let prediction = if prediction.is_stale(self.prediction_staleness_ns) {
-                    self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(symbol = %self.symbol, "Model prediction stale; using heuristic fallback");
-                    Arc::new(Prediction::heuristic_from_features(&features, self.signal_ctx.symbol_id))
-                } else {
-                    prediction
-                };
-                
-                // Fast precheck before channel send
+                // Fast precheck before strategy evaluation
                 if !self.fast_precheck(&prediction) {
                     continue;
                 }
@@ -272,33 +309,6 @@ impl AssetProcessor {
                             self.kill_switch.activate();
                         }
                     }
-                }
-
-                self.metrics.ticks_processed.fetch_add(1, Ordering::Relaxed);
-                self.metrics.features_computed.fetch_add(1, Ordering::Relaxed);
-                self.metrics.increment_per_symbol_tick(&self.symbol);
-                self.metrics.increment_per_symbol_feature(&self.symbol);
-
-                // Record feed latency (tick timestamp to processing time)
-                let proc_ns = wall_time_ns();
-                let latency = proc_ns.saturating_sub(tick.timestamp_ns);
-                self.metrics.feed_latency.record(latency);
-
-                let elapsed_us = tick_start.elapsed().as_micros() as u64;
-                if elapsed_us > self.tick_processing_budget_us {
-                    let skipped = iter.count();
-                    tracing::warn!(
-                        symbol = %self.symbol,
-                        elapsed_us = elapsed_us,
-                        budget_us = self.tick_processing_budget_us,
-                        skipped_ticks = skipped,
-                        "Tick processing budget exceeded; skipping remaining ticks in batch"
-                    );
-                    if let Some(cb) = on_budget_exceeded {
-                        cb(elapsed_us, self.tick_processing_budget_us, skipped);
-                    }
-                    std::hint::spin_loop();
-                    break;
                 }
             }
         }
@@ -749,35 +759,93 @@ impl UnifiedEngine {
             }
         }
 
-        // 3. Replay journal to recover idempotency keys and fill state
+        // 3. Replay journal to recover idempotency keys, fill state, and retry Pending orders
         if let Some(ref journal) = self.journal {
             let mut replayed_orders: u64 = 0;
             let mut replayed_fills: u64 = 0;
+            let mut pending_retried: u64 = 0;
+            let mut submitted_marked: u64 = 0;
             let result = journal.replay(|entry| {
                 match entry {
                     JournalEntry::Order { symbol, timestamp_ns, data } => {
-                        // Parse idempotency key from data if present
-                        if let Some(key_start) = data.find("decision=") {
-                            let key = format!("{}-{}", symbol, &data[key_start + 9..]);
-                            if let Some(state) = prebuilt_states.get(symbol) {
-                                state.idempotency_store.mark_processed(key, "replayed".to_string());
+                        // Parse intent_id and status from data
+                        let mut intent_id: u64 = 0;
+                        let mut status: &str = "";
+                        let mut side_str: &str = "";
+                        let mut qty: f64 = 0.0;
+                        let mut order_id: &str = "";
+                        for part in data.split(',') {
+                            if let Some(val) = part.strip_prefix("intent_id=") {
+                                intent_id = val.parse().unwrap_or(0);
+                            } else if let Some(val) = part.strip_prefix("status=") {
+                                status = val;
+                            } else if let Some(val) = part.strip_prefix("side=") {
+                                side_str = val;
+                            } else if let Some(val) = part.strip_prefix("qty=") {
+                                qty = val.parse().unwrap_or(0.0);
+                            } else if let Some(val) = part.strip_prefix("order_id=") {
+                                order_id = val;
                             }
+                        }
+
+                        match status {
+                            "Pending" => {
+                                // Retry submission: reconstruct OrderCommand and submit
+                                if let Some(state) = prebuilt_states.get(symbol) {
+                                    let side = match side_str {
+                                        "Buy" => OrderSide::Buy,
+                                        _ => OrderSide::Sell,
+                                    };
+                                    let cmd = OrderCommand {
+                                        order_id: order_id.to_string(),
+                                        symbol: symbol.clone(),
+                                        side,
+                                        quantity: qty,
+                                        order_type: OrderType::Market,
+                                        limit_price: None,
+                                        stop_price: None,
+                                        time_in_force: TimeInForce::Day,
+                                        correlation_id: intent_id.to_string(),
+                                        trace_id: intent_id,
+                                    };
+                                    match execution_port.submit_order(&cmd) {
+                                        Ok(execution_id) => {
+                                            let key = format!("intent-{}", intent_id);
+                                            state.idempotency_store.mark_processed(key, execution_id);
+                                            pending_retried += 1;
+                                            tracing::info!(symbol = %symbol, intent_id = intent_id, "Retried Pending journal order on recovery");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(symbol = %symbol, intent_id = intent_id, error = %e, "Failed to retry Pending journal order on recovery");
+                                        }
+                                    }
+                                }
+                            }
+                            "Submitted" => {
+                                // Mark idempotency so it's not replayed again
+                                if let Some(state) = prebuilt_states.get(symbol) {
+                                    let key = format!("intent-{}", intent_id);
+                                    state.idempotency_store.mark_processed(key, "recovered".to_string());
+                                    submitted_marked += 1;
+                                }
+                            }
+                            _ => {}
                         }
                         replayed_orders += 1;
                     }
                     JournalEntry::Fill { symbol, timestamp_ns, data } => {
                         // Try to parse fill price and qty from data
                         let mut price: f64 = 0.0;
-                        let mut qty: f64 = 0.0;
+                        let mut fill_qty: f64 = 0.0;
                         for part in data.split(',') {
                             if let Some(val) = part.strip_prefix("price=") {
                                 price = val.parse().unwrap_or(0.0);
                             }
                             if let Some(val) = part.strip_prefix("qty=") {
-                                qty = val.parse().unwrap_or(0.0);
+                                fill_qty = val.parse().unwrap_or(0.0);
                             }
                         }
-                        if price > 0.0 && qty > 0.0 {
+                        if price > 0.0 && fill_qty > 0.0 {
                             // We don't know side from the fill entry alone, so we
                             // approximate by looking at the net position change.
                             // For exact recovery, broker positions take precedence.
@@ -793,6 +861,8 @@ impl UnifiedEngine {
                         entries = %count,
                         orders = %replayed_orders,
                         fills = %replayed_fills,
+                        pending_retried = %pending_retried,
+                        submitted_marked = %submitted_marked,
                         "Journal replay complete"
                     );
                 }
@@ -945,9 +1015,25 @@ impl UnifiedEngine {
 
         // Create prediction engine first to get the ArcSwap
         let pred_engine = PredictionEngine::new(feature_rx.clone(), symbol_id);
-        let latest_pred = Arc::clone(&pred_engine.latest_pred);
+        let _latest_pred = Arc::clone(&pred_engine.latest_pred);
 
         let hb_processor = self.heartbeat_monitor.as_ref().map(|m| m.register_thread(&format!("asset-{}", symbol)));
+
+        let inference_engine = Arc::new(InferenceEngine::new(
+            config.model_config.feature_vector_size,
+            config.model_config.action_score_rsi_weight,
+            config.model_config.action_score_macd_weight,
+            config.model_config.action_score_volatility_weight,
+            config.model_config.atr_penalty_threshold,
+            config.model_config.atr_penalty_value,
+            config.model_config.rsi_overbought,
+            config.model_config.rsi_oversold,
+            config.model_config.rsi_neutral,
+            config.model_config.forecast_momentum_weight,
+            config.model_config.forecast_volume_weight,
+            config.feature_config.volume_ratio_clamp,
+            config.model_config.volume_confirmation_threshold,
+        ));
 
         let processor = AssetProcessor {
             symbol: symbol.to_string(),
@@ -971,7 +1057,7 @@ impl UnifiedEngine {
                 config.feature_config.regime_trending_threshold,
             ),
             strategy: strategy_arc.clone(),
-            latest_pred,
+            inference_engine: Arc::clone(&inference_engine),
             signal_ctx,
             coordinator_tx: risk_tx,
             coordinator_rx: risk_rx.clone(),
@@ -985,28 +1071,16 @@ impl UnifiedEngine {
             feature_backpressure_policy: config.channel_config.feature_backpressure_policy.clone(),
             risk_backpressure_policy: config.channel_config.risk_backpressure_policy.clone(),
             heartbeat: hb_processor,
+            current_prediction_version: 0,
         };
 
-        // Create inference, risk, exec managers as before
-
-        let inference_engine = InferenceEngine::new(
-            config.model_config.feature_vector_size,
-            config.model_config.action_score_rsi_weight,
-            config.model_config.action_score_macd_weight,
-            config.model_config.action_score_volatility_weight,
-            config.model_config.atr_penalty_threshold,
-            config.model_config.atr_penalty_value,
-            config.model_config.rsi_overbought,
-            config.model_config.rsi_oversold,
-            config.model_config.rsi_neutral,
-            config.model_config.forecast_momentum_weight,
-            config.model_config.forecast_volume_weight,
-            config.feature_config.volume_ratio_clamp,
-            config.model_config.volume_confirmation_threshold,
-        );
-        let pred_handle = pred_engine.start(move |features| {
-            inference_engine.predict(features)
-        }, pred_core_id);
+        let infer_fn = {
+            let inference_engine = Arc::clone(&inference_engine);
+            move |features: &FeatureVector| -> Prediction {
+                inference_engine.predict(features)
+            }
+        };
+        let pred_handle = pred_engine.start(infer_fn, pred_core_id);
 
         let risk_coordinator = RiskCoordinator::new(
             risk_rx,
