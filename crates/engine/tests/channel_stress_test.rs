@@ -145,6 +145,7 @@ fn test_pipeline_with_500k_ticks() {
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
+        None,
     );
     let _exec_handle = exec_manager.start(0);
 

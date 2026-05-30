@@ -127,7 +127,7 @@ mod tests {
         RiskCheckRequest {
             request_id: unified_trading_core::symbol_registry::next_request_id(),
             symbol_id,
-            intent_id: unified_trading_core::symbol_registry::next_intent_id(),
+            intent_id: unified_trading_core::symbol_registry::derive_intent_id(1),
             side: 1u8, // Buy
             quantity: 10.0,
             price: 150.0,

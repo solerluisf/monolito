@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use unified_trading_core::clock::{Clock, WallClock};
 use unified_trading_core::kill_switch::KillSwitch;
 use unified_trading_core::metrics::GlobalMetrics;
-use unified_trading_core::journal::{JournalWriter, JournalEntry};
+use unified_trading_core::journal::{JournalCommand, JournalEntry};
 use unified_trading_core::validator::RequestValidator;
 use unified_trading_core::idempotency::IdempotencyStore;
 use unified_trading_core::portfolio_manager::PortfolioManager;
@@ -28,7 +28,7 @@ pub struct ExecutionManager {
     pub idempotency_store: Arc<IdempotencyStore>,
     pub portfolio_manager: Arc<PortfolioManager>,
     pub metrics: Arc<GlobalMetrics>,
-    pub journal: Option<Arc<JournalWriter>>,
+    pub journal: Option<crossbeam_channel::Sender<JournalCommand>>,
     pub kill_switch: Arc<KillSwitch>,
     pub validator: RequestValidator,
     running: Arc<AtomicBool>,
@@ -50,6 +50,7 @@ impl ExecutionManager {
         circuit_breaker: Arc<CircuitBreaker>,
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
+        journal: Option<crossbeam_channel::Sender<JournalCommand>>,
     ) -> Self {
         Self::with_clock(
             decision_rx,
@@ -66,6 +67,7 @@ impl ExecutionManager {
             idempotency_store,
             validator,
             Arc::new(WallClock::new()),
+            journal,
         )
     }
 
@@ -84,6 +86,7 @@ impl ExecutionManager {
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
         clock: Arc<dyn Clock>,
+        journal: Option<crossbeam_channel::Sender<JournalCommand>>,
     ) -> Self {
         Self {
             decision_rx,
@@ -95,7 +98,7 @@ impl ExecutionManager {
             idempotency_store,
             portfolio_manager,
             metrics,
-            journal: None,
+            journal,
             kill_switch,
             validator,
             running: Arc::new(AtomicBool::new(true)),
@@ -160,7 +163,8 @@ impl ExecutionManager {
             }
         }
 
-        let idempotency_key = format!("{:?}-{}", symbol_id, decision.request_id);
+        let intent_id = decision.request.intent_id;
+        let idempotency_key = format!("intent-{}", intent_id);
         if self.idempotency_store.is_processed(&idempotency_key) {
             tracing::warn!(idempotency_key = %idempotency_key, "Duplicate order detected");
             return;
@@ -179,6 +183,20 @@ impl ExecutionManager {
 
         let quantity = decision.request.quantity;
 
+        // Write Pending journal entry BEFORE submitting to broker
+        // On crash recovery, all Pending entries are replayed/retried.
+        if let Some(ref journal) = self.journal {
+            let entry = JournalEntry::Order {
+                symbol: symbol_key.clone(),
+                timestamp_ns: now,
+                data: format!(
+                    "intent_id={},order_id={},side={:?},qty={},request_id={},status=Pending",
+                    intent_id, order_id, side, quantity, decision.request_id
+                ),
+            };
+            let _ = journal.try_send(JournalCommand::Write(entry));
+        }
+
         let cmd = OrderCommand {
             order_id: order_id.clone(),
             symbol: symbol_key.clone(),
@@ -191,21 +209,6 @@ impl ExecutionManager {
             correlation_id: decision.request_id.to_string(),
             trace_id: decision.trace_id,
         };
-
-        // Persist to journal BEFORE submitting to broker for critical commands
-        // This ensures we can replay/recover if needed
-        if let Some(ref journal) = self.journal {
-            let entry = JournalEntry::Order {
-                symbol: symbol_key.clone(),
-                timestamp_ns: now,
-                data: format!("order_id={},side={:?},qty={},decision={}", order_id, side, quantity, decision.request_id),
-            };
-            
-            // Hot path is non-blocking: drop if journal queue is full/slow.
-            if let Err(e) = journal.try_write(entry) {
-                tracing::warn!("Non-blocking journal write dropped/failed: {}", e);
-            }
-        }
 
         let broker_start = self.clock.now_monotonic_ns();
 
@@ -228,26 +231,43 @@ impl ExecutionManager {
                 .with_status("submitted".to_string())
                 .with_trace_id(decision.trace_id);
 
+                self.idempotency_store.mark_processed(idempotency_key, execution_id.clone());
+
+                // Mark as Submitted in journal (allows recovery to skip this intent)
+                if let Some(ref journal) = self.journal {
+                    let entry = JournalEntry::Order {
+                        symbol: symbol_key.clone(),
+                        timestamp_ns: now,
+                        data: format!(
+                            "intent_id={},order_id={},side={:?},qty={},request_id={},status=Submitted,execution_id={}",
+                            intent_id, order_id, side, quantity, decision.request_id, execution_id
+                        ),
+                    };
+                    let _ = journal.try_send(JournalCommand::Write(entry));
+                }
+
                 self.metrics.lifecycle_channel_depth.fetch_add(1, Ordering::Relaxed);
                 let _ = self.lifecycle_tx.send(lifecycle_event);
 
                 tracing::info!(order_id = %execution_id, symbol = %symbol_key, "Order submitted to broker");
 
-                self.idempotency_store.mark_processed(idempotency_key, execution_id);
                 self.circuit_breaker.record_success();
             }
             Err(e) => {
                 self.metrics.orders_rejected.fetch_add(1, Ordering::Relaxed);
                 self.circuit_breaker.record_failure();
                 tracing::warn!(symbol = %symbol_key, error = %e, "Order submission failed");
-                
-                // Write failure to journal
+
                 if let Some(ref journal) = self.journal {
-                    let _ = journal.write(JournalEntry::Event {
+                    let entry = JournalEntry::Event {
                         event_type: "ORDER_FAILED".to_string(),
                         timestamp_ns: now,
-                        data: format!("symbol={},error={}", symbol_key, e),
-                    });
+                        data: format!(
+                            "intent_id={},symbol={},error={},status=Failed",
+                            intent_id, symbol_key, e
+                        ),
+                    };
+                    let _ = journal.try_send(JournalCommand::Write(entry));
                 }
             }
         }
@@ -352,7 +372,7 @@ use unified_trading_core::symbol_registry::SymbolId;
         let request = risk::RiskCheckRequest {
             request_id: unified_trading_core::symbol_registry::next_request_id(),
             symbol_id: SymbolId::from_raw(0),
-            intent_id: unified_trading_core::symbol_registry::next_intent_id(),
+            intent_id: unified_trading_core::symbol_registry::derive_intent_id(1),
             side: 1u8, // Buy
             quantity: 10.0,
             price: 150.0,
@@ -400,6 +420,7 @@ use unified_trading_core::symbol_registry::SymbolId;
             circuit_breaker,
             idempotency_store,
             RequestValidator::default(),
+            None,
         )
     }
 

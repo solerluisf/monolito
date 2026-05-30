@@ -1038,6 +1038,7 @@ impl UnifiedEngine {
             Arc::clone(&exec_shared.circuit_breaker),
             Arc::clone(&exec_shared.idempotency_store),
             unified_trading_core::validator::RequestValidator::new(config.validator_config.clone()),
+            self.journal.as_ref().map(|j| j.tx.clone()),
         );
         let exec_handle = exec_manager.start(exec_core_id);
 
@@ -1356,6 +1357,17 @@ impl UnifiedEngine {
                 cfg.model_config.inference_threads = update.inference_threads;
                 cfg.model_config.max_inference_latency_ms = update.max_inference_latency_ms;
                 cfg.model_config.feature_vector_size = update.feature_vector_size;
+                cfg.model_config.rsi_overbought = update.inference_rsi_bearish_threshold as f64;
+                cfg.model_config.rsi_oversold = update.inference_rsi_bullish_threshold as f64;
+                cfg.model_config.rsi_neutral = update.inference_rsi_center as f64;
+                cfg.model_config.atr_penalty_threshold = update.inference_atr_penalty_threshold as f64;
+                cfg.model_config.volume_confirmation_threshold = update.inference_volume_confirmation_threshold as f64;
+                cfg.model_config.action_score_rsi_weight = update.action_score_rsi_weight as f64;
+                cfg.model_config.action_score_macd_weight = update.action_score_macd_weight as f64;
+                cfg.model_config.action_score_volatility_weight = update.action_score_volatility_weight as f64;
+                cfg.model_config.confidence_rsi_weight = update.confidence_rsi_weight as f64;
+                cfg.model_config.confidence_macd_weight = update.confidence_macd_weight as f64;
+                cfg.model_config.confidence_regime_weight = update.confidence_regime_weight as f64;
                 tracing::info!("Model parameters updated via API");
                 ControlResponse::Ok
             }

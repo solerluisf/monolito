@@ -186,6 +186,7 @@ fn test_full_pipeline_tick_to_intent() {
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
+        None,
     );
     let _exec_handle = exec_manager.start(0);
 
@@ -267,6 +268,7 @@ fn test_pipeline_with_burst_ticks() {
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
+        None,
     );
     let _exec_handle = exec_manager.start(0);
 
@@ -348,6 +350,7 @@ fn test_kill_switch_stops_pipeline() {
         Arc::new(gateway::CircuitBreaker::new(5, 30_000)),
         Arc::new(unified_trading_core::IdempotencyStore::new()),
         unified_trading_core::validator::RequestValidator::default(),
+        None,
     );
     let _exec_handle = exec_manager.start(0);
 
@@ -474,6 +477,7 @@ impl PipelineFixture {
             Arc::new(gateway::CircuitBreaker::new(999, 30_000)),
             Arc::new(unified_trading_core::IdempotencyStore::new()),
             unified_trading_core::validator::RequestValidator::default(),
+            None,
         );
         let exec_handle = exec_manager.start(0);
 

@@ -280,14 +280,14 @@ impl RiskEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unified_trading_core::symbol_registry::{next_intent_id, next_request_id, SymbolId};
+    use unified_trading_core::symbol_registry::{derive_intent_id, next_request_id, SymbolId};
 
     fn make_request(symbol_id: SymbolId, quantity: f64, price: f64) -> RiskCheckRequest {
         let now = wall_time_ns();
         RiskCheckRequest {
             request_id: next_request_id(),
             symbol_id,
-            intent_id: next_intent_id(),
+            intent_id: derive_intent_id(now),
             side: 1,
             quantity,
             price,
@@ -303,7 +303,7 @@ mod tests {
         RiskCheckRequest {
             request_id: next_request_id(),
             symbol_id,
-            intent_id: next_intent_id(),
+            intent_id: derive_intent_id(trace_id),
             side: 1,
             quantity,
             price,

@@ -28,12 +28,27 @@ impl fmt::Display for SymbolId {
     }
 }
 
-static INTENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static INTENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
-pub fn next_intent_id() -> u64 {
-    INTENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+/// Derives a deterministic intent_id from trace_id and a per-intent nonce.
+/// Same (trace_id, nonce) always produces the same intent_id, enabling
+/// idempotent retries. Uses splitmix64-style mixing.
+fn mix_intent_id(trace_id: u64, nonce: u32) -> u64 {
+    let mut h = trace_id.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= nonce as u64;
+    h = h.wrapping_mul(0x9e3779b97f4a7c15);
+    h ^= h >> 31;
+    h.wrapping_mul(0x9e3779b97f4a7c15)
+}
+
+/// Generates a deterministic intent_id from the given trace_id.
+/// Uses an atomically incrementing nonce so multiple intents from the same
+/// trace get different IDs, but retries of the same intent reuse the ID.
+pub fn derive_intent_id(trace_id: u64) -> u64 {
+    let nonce = INTENT_NONCE.fetch_add(1, Ordering::Relaxed) as u32;
+    mix_intent_id(trace_id, nonce)
 }
 
 pub fn next_request_id() -> u64 {

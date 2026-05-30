@@ -5,7 +5,7 @@ use std::sync::Arc;
 use model::Prediction;
 use unified_trading_core::clock::{Clock, WallClock};
 use unified_trading_core::symbol_registry::SymbolId;
-use unified_trading_core::symbol_registry::next_intent_id;
+use unified_trading_core::symbol_registry::derive_intent_id;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SignalSide {
@@ -93,7 +93,7 @@ impl TradeIntent {
         let now = clock.now_ns();
 
         Self {
-            intent_id: next_intent_id(),
+            intent_id: derive_intent_id(trace_id),
             symbol_id,
             side,
             size_hint,
