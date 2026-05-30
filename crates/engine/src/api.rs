@@ -845,6 +845,10 @@ async fn prometheus_handler(State(state): State<ApiState>) -> Response<String> {
     output.push_str("# TYPE journal_channel_depth gauge\n");
     output.push_str(&format!("journal_channel_depth {}\n", snap.journal_channel_depth));
 
+    output.push_str("# HELP dropped_ticks Total feed ticks dropped (channel full)\n");
+    output.push_str("# TYPE dropped_ticks counter\n");
+    output.push_str(&format!("dropped_ticks {}\n", snap.dropped_ticks));
+
     output.push_str("# HELP feed_gaps Total feed gaps detected (>1s between ticks)\n");
     output.push_str("# TYPE feed_gaps counter\n");
     output.push_str(&format!("feed_gaps {}\n", snap.feed_gaps));

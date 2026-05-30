@@ -111,6 +111,7 @@ pub struct MetricsBatch {
     pub heartbeat_misses: u64,
     pub errors: u64,
     pub feed_gaps: u64,
+    pub dropped_ticks: u64,
     // Latency histogram buckets (counts per bucket)
     pub tick_to_intent_latency: [u64; 6],
     pub risk_check_latency: [u64; 6],
@@ -164,6 +165,7 @@ impl MetricsBatch {
         self.heartbeat_misses += other.heartbeat_misses;
         self.errors += other.errors;
         self.feed_gaps += other.feed_gaps;
+        self.dropped_ticks += other.dropped_ticks;
 
         for (i, &v) in other.tick_to_intent_latency.iter().enumerate() {
             self.tick_to_intent_latency[i] += v;
@@ -432,6 +434,7 @@ impl MetricsAggregator {
         m.heartbeat_misses.fetch_add(batch.heartbeat_misses, Ordering::Relaxed);
         m.errors.fetch_add(batch.errors, Ordering::Relaxed);
         m.feed_gaps.fetch_add(batch.feed_gaps, Ordering::Relaxed);
+        m.dropped_ticks.fetch_add(batch.dropped_ticks, Ordering::Relaxed);
 
         // Apply histogram buckets
         for (i, &v) in batch.tick_to_intent_latency.iter().enumerate() {
@@ -562,6 +565,7 @@ pub struct GlobalMetrics {
     pub heartbeat_misses: CachePaddedAtomicU64,
     pub errors: CachePaddedAtomicU64,
     pub feed_gaps: CachePaddedAtomicU64,
+    pub dropped_ticks: CachePaddedAtomicU64,
     // Latency histograms
     pub tick_to_intent_latency: LatencyHistogram,
     pub risk_check_latency: LatencyHistogram,
@@ -612,6 +616,7 @@ impl GlobalMetrics {
             heartbeat_misses: CachePaddedAtomicU64::new(0),
             errors: CachePaddedAtomicU64::new(0),
             feed_gaps: CachePaddedAtomicU64::new(0),
+            dropped_ticks: CachePaddedAtomicU64::new(0),
             tick_to_intent_latency: LatencyHistogram::new(),
             risk_check_latency: LatencyHistogram::new(),
             journal_flush_latency: LatencyHistogram::new(),
@@ -657,6 +662,7 @@ impl GlobalMetrics {
         self.heartbeat_misses.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         self.feed_gaps.store(0, Ordering::Relaxed);
+        self.dropped_ticks.store(0, Ordering::Relaxed);
         self.tick_to_intent_latency.reset();
         self.risk_check_latency.reset();
         self.journal_flush_latency.reset();
@@ -732,6 +738,7 @@ impl GlobalMetrics {
             heartbeat_misses: self.heartbeat_misses.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             feed_gaps: self.feed_gaps.load(Ordering::Relaxed),
+            dropped_ticks: self.dropped_ticks.load(Ordering::Relaxed),
             tick_to_intent_latency: self.tick_to_intent_latency.snapshot(),
             risk_check_latency: self.risk_check_latency.snapshot(),
             journal_flush_latency: self.journal_flush_latency.snapshot(),
@@ -842,6 +849,7 @@ pub struct MetricsSnapshot {
     pub heartbeat_misses: u64,
     pub errors: u64,
     pub feed_gaps: u64,
+    pub dropped_ticks: u64,
     // Latency histograms (buckets: <1us, <10us, <100us, <1ms, <10ms, >10ms)
     pub tick_to_intent_latency: [u64; 6],
     pub risk_check_latency: [u64; 6],

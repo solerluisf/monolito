@@ -7,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 
 use market_data::{RawTick, TickType};
 use unified_trading_core::symbol_registry::SymbolId;
+use unified_trading_core::GlobalMetrics;
 
 #[derive(Debug, Clone)]
 pub enum FeedCommand {
@@ -212,6 +213,7 @@ impl AlpacaFeedConfig {
 pub struct AlpacaWebSocketFeed {
     pub config: AlpacaFeedConfig,
     pub tick_tx: crossbeam_channel::Sender<RawTick>,
+    pub metrics: Arc<GlobalMetrics>,
     pub running: Arc<AtomicBool>,
     pub connected: Arc<AtomicBool>,
     pub reconnect_delay_ms: u64,
@@ -230,6 +232,7 @@ impl AlpacaWebSocketFeed {
     pub fn new(
         config: AlpacaFeedConfig,
         tick_tx: crossbeam_channel::Sender<RawTick>,
+        metrics: Arc<GlobalMetrics>,
     ) -> (Self, crossbeam_channel::Receiver<FeedCommand>) {
         let (sub_tx, sub_rx) = crossbeam_channel::bounded(64);
         let max_bytes = config.replay_buffer_max_bytes.max(1024);
@@ -237,6 +240,7 @@ impl AlpacaWebSocketFeed {
         (Self {
             config,
             tick_tx,
+            metrics,
             running: Arc::new(AtomicBool::new(false)),
             connected: Arc::new(AtomicBool::new(false)),
             reconnect_delay_ms: 1000,
@@ -524,6 +528,7 @@ impl AlpacaWebSocketFeed {
 
     fn try_send_tick(&self, tick: RawTick) {
         if self.tick_tx.try_send(tick.clone()).is_err() {
+            self.metrics.dropped_ticks.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 symbol = %tick.symbol,
                 tick_type = ?tick.tick_type,
@@ -607,6 +612,7 @@ impl AlpacaWebSocketFeed {
         let feed = Self {
             config: self.config.clone(),
             tick_tx: self.tick_tx.clone(),
+            metrics: Arc::clone(&self.metrics),
             running: Arc::clone(&self.running),
             connected: Arc::clone(&self.connected),
             reconnect_delay_ms: self.reconnect_delay_ms,
@@ -771,7 +777,8 @@ mod tests {
         };
 
         let (tick_tx, _tick_rx) = crossbeam_channel::unbounded();
-        let (feed, _sub_rx) = AlpacaWebSocketFeed::new(config, tick_tx);
+        let metrics = Arc::new(unified_trading_core::GlobalMetrics::new());
+        let (feed, _sub_rx) = AlpacaWebSocketFeed::new(config, tick_tx, metrics);
 
         // Create a message that's larger than 100 bytes
         let oversized_message = "x".repeat(150);

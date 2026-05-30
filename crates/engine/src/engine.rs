@@ -509,7 +509,7 @@ impl UnifiedEngine {
             max_message_size_bytes: 1024 * 1024,
         };
 
-        let (feed, sub_rx) = AlpacaWebSocketFeed::new(feed_config, feed_tx);
+        let (feed, sub_rx) = AlpacaWebSocketFeed::new(feed_config, feed_tx, Arc::clone(&self.metrics));
         self.feed_subscription_tx = Some(feed.subscription_cmd_tx.clone());
 
         let ks = Arc::clone(&self.kill_switch);
