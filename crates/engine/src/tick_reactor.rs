@@ -305,6 +305,41 @@ mod tests {
     }
 
     #[test]
+    fn test_reactor_symbol_name_fallback() {
+        let (tick_tx, tick_rx) = bounded::<RawTick>(1000);
+
+        let (mut reactor, _control_tx) = make_reactor(tick_rx);
+
+        let (handler_tx, handler_rx) = bounded::<RawTick>(100);
+        reactor.subscribe("AAPL".to_string(), handler_tx);
+        let expected_id = reactor.registry.lookup("AAPL").unwrap();
+
+        let tick = RawTick {
+            symbol_id: SymbolId::from_raw(0),
+            symbol: "AAPL".to_string(),
+            symbol_name: Some("AAPL".to_string()),
+            tick_type: TickType::Quote,
+            timestamp_ns: 0,
+            bid: 150.0,
+            ask: 150.01,
+            bid_size: 100,
+            ask_size: 100,
+            last_price: 150.0,
+            last_size: 100,
+            exchange: "V".to_string(),
+            trace_id: 0,
+        };
+
+        tick_tx.send(tick).unwrap();
+        reactor.process_tick_batch();
+
+        let received = handler_rx.try_recv().unwrap();
+        assert_eq!(received.symbol_id, expected_id,
+            "symbol_id=0 with symbol_name=Some('AAPL') should resolve via registry");
+        assert!(received.trace_id > 0);
+    }
+
+    #[test]
     fn test_reactor_unsubscribe() {
         let (tick_tx, tick_rx) = bounded::<RawTick>(1000);
 

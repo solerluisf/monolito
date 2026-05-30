@@ -33,6 +33,8 @@ pub struct ExecutionManager {
     pub validator: RequestValidator,
     running: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
+    max_retries: u32,
+    retry_backoff_ms: u64,
 }
 
 impl ExecutionManager {
@@ -51,6 +53,8 @@ impl ExecutionManager {
         idempotency_store: Arc<IdempotencyStore>,
         validator: RequestValidator,
         journal: Option<crossbeam_channel::Sender<JournalCommand>>,
+        max_retries: u32,
+        retry_backoff_ms: u64,
     ) -> Self {
         Self::with_clock(
             decision_rx,
@@ -68,6 +72,8 @@ impl ExecutionManager {
             validator,
             Arc::new(WallClock::new()),
             journal,
+            max_retries,
+            retry_backoff_ms,
         )
     }
 
@@ -87,6 +93,8 @@ impl ExecutionManager {
         validator: RequestValidator,
         clock: Arc<dyn Clock>,
         journal: Option<crossbeam_channel::Sender<JournalCommand>>,
+        max_retries: u32,
+        retry_backoff_ms: u64,
     ) -> Self {
         Self {
             decision_rx,
@@ -103,6 +111,8 @@ impl ExecutionManager {
             validator,
             running: Arc::new(AtomicBool::new(true)),
             clock,
+            max_retries,
+            retry_backoff_ms,
         }
     }
 
@@ -155,8 +165,8 @@ impl ExecutionManager {
         decision: &RiskDecision,
         now: u64,
     ) -> Result<String, BrokerError> {
-        let max_retries: u64 = 3;
-        let base_delay_ms: u64 = 100;
+        let max_retries = self.max_retries;
+        let base_delay_ms = self.retry_backoff_ms;
 
         for attempt in 0..max_retries {
             let result = self.execution_port.submit_order(cmd);
@@ -479,6 +489,8 @@ use unified_trading_core::symbol_registry::SymbolId;
             idempotency_store,
             RequestValidator::default(),
             None,
+            3,
+            100,
         )
     }
 
