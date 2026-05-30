@@ -266,9 +266,24 @@ impl AssetProcessor {
                 }
 
                 // Stage 5: Inline prediction — compute directly, no channel hop
-                let prediction = self.inference_engine.predict(&features);
+                // Falls back to heuristic if inference produces invalid output (NaN/Inf).
                 self.current_prediction_version += 1;
-                let prediction = Arc::new(Prediction::with_version(prediction, self.current_prediction_version, false));
+                let model_pred = self.inference_engine.predict(&features);
+                let prediction = if model_pred.is_valid() {
+                    Arc::new(Prediction::with_version(model_pred, self.current_prediction_version, false))
+                } else {
+                    tracing::warn!(
+                        symbol = %self.symbol,
+                        version = self.current_prediction_version,
+                        "Inference produced invalid prediction; using heuristic fallback"
+                    );
+                    self.metrics.model_fallback_activations.fetch_add(1, Ordering::Relaxed);
+                    Arc::new(Prediction::heuristic_from_features(
+                        &features,
+                        self.symbol_id,
+                        self.current_prediction_version,
+                    ))
+                };
 
                 // Stage 6: Also send features to PredictionEngine for shadow model tracking
                 if send_with_policy(
@@ -1745,6 +1760,9 @@ mod tests {
     use unified_trading_core::command_channel::ControlCommand;
     use crossbeam_channel::bounded;
     use crate::tick_reactor::ReactorCommand;
+    use model::InferenceEngine;
+    use feature::{FeatureVector, FeatureIndex};
+    use unified_trading_core::symbol_registry::SymbolId;
 
     #[test]
     fn test_dynamic_subscribe_unsubscribe() {
@@ -1924,5 +1942,125 @@ mod tests {
         let mut engine = UnifiedEngine::new(EngineConfig::default());
         let result = engine.cancel_staged_rollout("no-op");
         assert!(result.is_err(), "cancelling without active rollout should error");
+    }
+
+    #[test]
+    fn test_heuristic_fallback_on_invalid_prediction() {
+        // Set MacdHistogram to NaN — propagates through InferenceEngine compute
+        // functions as NaN (clamp does not sanitize NaN), triggering is_valid()=false.
+        let ie = InferenceEngine::new(
+            128, 0.4, 0.4, 0.2, 2.0, -0.2,
+            70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+        );
+
+        let mut fv = FeatureVector::new(SymbolId::from_raw(42), 1000, 1);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::Rsi14, 55.0);
+        fv.set(FeatureIndex::MacdHistogram, f32::NAN);
+        fv.set(FeatureIndex::Atr14, 0.5);
+        fv.set(FeatureIndex::VolumeRatio, 1.2);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.6);
+        fv.set(FeatureIndex::Confidence, 0.7);
+
+        let model_pred = ie.predict(&fv);
+        assert!(!model_pred.is_valid(),
+            "Model prediction should be invalid when MacdHistogram=NaN");
+
+        // Now simulate what Stage 5 does: fall back to heuristic
+        let version: u64 = 5;
+        let fallback = Prediction::heuristic_from_features(
+            &fv,
+            SymbolId::from_raw(42),
+            version,
+        );
+
+        assert!(fallback.is_valid(), "Heuristic fallback must produce valid prediction");
+        assert!(fallback.is_heuristic, "Fallback must be marked as heuristic");
+        assert_eq!(fallback.version, version, "Version must be preserved");
+        assert_eq!(fallback.trace_id, 1, "Trace ID must propagate");
+        assert!(fallback.action_score.is_finite(), "Action score must be finite");
+    }
+
+    #[test]
+    fn test_prediction_version_monotonicity_with_fallback() {
+        // Simulate 10 ticks where every other tick produces NaN (alternating model/heuristic).
+        // Verify version monotonicity, is_heuristic flag, and oscillation prevention.
+        let ie = InferenceEngine::new(
+            128, 0.4, 0.4, 0.2, 2.0, -0.2,
+            70.0, 30.0, 50.0, 0.3, 0.2, 0.3, 1.2,
+        );
+
+        let mut fv_nan = FeatureVector::new(SymbolId::from_raw(42), 1000, 1);
+        fv_nan.set(FeatureIndex::MidPrice, 150.0);
+        fv_nan.set(FeatureIndex::Rsi14, 55.0);
+        fv_nan.set(FeatureIndex::MacdHistogram, f32::NAN);
+        fv_nan.set(FeatureIndex::Atr14, 0.5);
+        fv_nan.set(FeatureIndex::VolumeRatio, 1.2);
+        fv_nan.set(FeatureIndex::Regime, 1.0);
+        fv_nan.set(FeatureIndex::RegimeStrength, 0.6);
+        fv_nan.set(FeatureIndex::Confidence, 0.7);
+
+        let mut fv_normal = FeatureVector::new(SymbolId::from_raw(42), 1000, 2);
+        fv_normal.set(FeatureIndex::MidPrice, 150.0);
+        fv_normal.set(FeatureIndex::Rsi14, 55.0);
+        fv_normal.set(FeatureIndex::MacdHistogram, 0.4);
+        fv_normal.set(FeatureIndex::Atr14, 0.5);
+        fv_normal.set(FeatureIndex::VolumeRatio, 1.2);
+        fv_normal.set(FeatureIndex::Regime, 1.0);
+        fv_normal.set(FeatureIndex::RegimeStrength, 0.6);
+        fv_normal.set(FeatureIndex::Confidence, 0.7);
+
+        let mut current_version = 0u64;
+        let mut position_changes = 0u64;
+        let mut prev_position: i32 = 0; // 0=neutral, 1=long, -1=short
+
+        for i in 0..10 {
+            current_version += 1;
+
+            // Even ticks: NaN features → fallback; odd ticks: normal features → model
+            let fv = if i % 2 == 0 { &fv_nan } else { &fv_normal };
+            let model_pred = ie.predict(fv);
+
+            let prediction = if model_pred.is_valid() {
+                Prediction::with_version(model_pred, current_version, false)
+            } else {
+                Prediction::heuristic_from_features(fv, SymbolId::from_raw(42), current_version)
+            };
+
+            assert_eq!(prediction.version, current_version,
+                "Version must be monotonic and match current_version");
+
+            if i % 2 == 0 {
+                assert!(prediction.is_heuristic,
+                    "Even tick {} should be heuristic", i);
+            } else {
+                assert!(!prediction.is_heuristic,
+                    "Odd tick {} should be model-based", i);
+            }
+
+            // Determine position from action_score with hysteresis logic
+            // (same thresholds as default: long_entry=0.6, short_entry=-0.6)
+            let new_position = if prediction.action_score > 0.6 {
+                1i32
+            } else if prediction.action_score < -0.6 {
+                -1i32
+            } else {
+                // Apply deadband — stay in previous position if within neutral zone
+                prev_position
+            };
+
+            if new_position != prev_position && new_position != 0 {
+                position_changes += 1;
+            }
+            prev_position = new_position;
+        }
+
+        // The key assertion: alternating prediction sources should not cause
+        // excessive position changes (≤ 2 in 10 ticks).
+        assert!(position_changes <= 2,
+            "Position changes {} should be ≤ 2 with alternating fallback; \
+             heuristic fallback must not cause flip-flop oscillation",
+            position_changes);
     }
 }

@@ -96,20 +96,22 @@ impl Prediction {
 
     /// Create a heuristic prediction from raw features when the model is stale or unavailable.
     /// Uses MACD histogram as a simple trend-following signal with fixed confidence.
+    /// All numeric fields are clamped to finite values to ensure the heuristic always
+    /// produces a valid Prediction, even if the input features contain NaN/Inf.
     pub fn heuristic_from_features(features: &FeatureVector, symbol_id: SymbolId, version: u64) -> Self {
         let now = wall_time_ns();
 
-        let macd_hist = features.get(FeatureIndex::MacdHistogram);
+        let macd_hist = Self::finify(features.get(FeatureIndex::MacdHistogram));
         let action_score = macd_hist;
         let confidence = 0.6f32; // Fixed heuristic confidence above typical minimums
 
         Self {
             symbol_id,
-            forecast: features.get(FeatureIndex::MidPrice),
+            forecast: Self::finify(features.get(FeatureIndex::MidPrice)),
             confidence,
             action_score,
             regime_label: features.get(FeatureIndex::Regime) as i32,
-            regime_strength: features.get(FeatureIndex::RegimeStrength),
+            regime_strength: Self::finify(features.get(FeatureIndex::RegimeStrength)),
             computed_ns: now,
             trace_id: features.trace_id,
             version,
@@ -117,11 +119,24 @@ impl Prediction {
         }
     }
 
+    /// Replace NaN/Inf with 0.0 so the heuristic always yields finite values.
+    fn finify(v: f32) -> f32 {
+        if v.is_finite() { v } else { 0.0 }
+    }
+
     /// Apply a version and heuristic flag, returning a new Prediction.
     pub fn with_version(mut self, version: u64, is_heuristic: bool) -> Self {
         self.version = version;
         self.is_heuristic = is_heuristic;
         self
+    }
+
+    /// Returns true if all numeric fields are finite (not NaN, not Inf).
+    pub fn is_valid(&self) -> bool {
+        self.forecast.is_finite()
+            && self.confidence.is_finite()
+            && self.action_score.is_finite()
+            && self.regime_strength.is_finite()
     }
 }
 
@@ -525,5 +540,55 @@ mod tests {
         let pred = engine.get_prediction();
         assert!((pred.forecast - 150.0).abs() < 0.01);
         assert_eq!(pred.trace_id, 42);
+    }
+
+    #[test]
+    fn test_prediction_is_valid_rejects_nan() {
+        let valid_pred = Prediction {
+            symbol_id: SymbolId::from_raw(1),
+            forecast: 0.5, confidence: 0.8, action_score: 0.3,
+            regime_label: 0, regime_strength: 0.5,
+            computed_ns: 1000, trace_id: 1,
+            version: 0, is_heuristic: false,
+        };
+        assert!(valid_pred.is_valid());
+
+        let nan_pred = Prediction {
+            forecast: f32::NAN, confidence: 0.8, action_score: 0.3,
+            ..valid_pred
+        };
+        assert!(!nan_pred.is_valid());
+
+        let inf_pred = Prediction {
+            forecast: 0.5, confidence: f32::INFINITY, action_score: 0.3,
+            ..valid_pred
+        };
+        assert!(!inf_pred.is_valid());
+    }
+
+    #[test]
+    fn test_heuristic_from_features_sets_is_heuristic_and_version() {
+        let mut fv = FeatureVector::new(SymbolId::from_raw(1), 1000, 42);
+        fv.set(FeatureIndex::MidPrice, 150.0);
+        fv.set(FeatureIndex::MacdHistogram, 0.3);
+        fv.set(FeatureIndex::Regime, 1.0);
+        fv.set(FeatureIndex::RegimeStrength, 0.6);
+
+        let pred = Prediction::heuristic_from_features(&fv, SymbolId::from_raw(1), 7);
+
+        assert!(pred.is_heuristic, "heuristic_from_features must set is_heuristic=true");
+        assert_eq!(pred.version, 7, "version must match the provided version");
+        assert!(pred.is_valid(), "heuristic prediction must be valid");
+        assert_eq!(pred.trace_id, 42, "trace_id must be propagated");
+    }
+
+    #[test]
+    fn test_with_version_preserves_fields() {
+        let pred = Prediction::new_default(SymbolId::from_raw(1));
+        let updated = Prediction::with_version(pred, 5, true);
+
+        assert_eq!(updated.version, 5);
+        assert!(updated.is_heuristic);
+        assert_eq!(updated.symbol_id, SymbolId::from_raw(1));
     }
 }
