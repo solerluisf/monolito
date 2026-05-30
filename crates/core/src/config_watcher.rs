@@ -2,11 +2,13 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crossbeam_channel::Sender;
 use notify::{Watcher, RecursiveMode, RecommendedWatcher, event::EventKind};
 use parking_lot::RwLock;
 use tracing::{info, warn, error};
 
 use crate::config::{EngineConfig, ConfigValidationError};
+use crate::command_channel::ControlCommand;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigWatcherError {
@@ -38,6 +40,9 @@ pub struct ConfigWatcher {
     reload_count: Arc<AtomicU64>,
     /// Number of reload attempts that were rejected by validation.
     rejected_count: Arc<AtomicU64>,
+    /// Optional sender to route reload events through the command channel
+    /// so they follow the same propagation path as API-triggered config changes.
+    command_tx: Option<Sender<ControlCommand>>,
 }
 
 impl ConfigWatcher {
@@ -48,7 +53,12 @@ impl ConfigWatcher {
             running: Arc::new(AtomicBool::new(true)),
             reload_count: Arc::new(AtomicU64::new(0)),
             rejected_count: Arc::new(AtomicU64::new(0)),
+            command_tx: None,
         }
+    }
+
+    pub fn set_command_channel(&mut self, tx: Sender<ControlCommand>) {
+        self.command_tx = Some(tx);
     }
 
     #[tracing::instrument(skip(self), fields(path = %path))]
@@ -57,6 +67,7 @@ impl ConfigWatcher {
         let running = Arc::clone(&self.running);
         let reload_count = Arc::clone(&self.reload_count);
         let rejected_count = Arc::clone(&self.rejected_count);
+        let command_tx = self.command_tx.clone();
 
         let path_buf = std::path::PathBuf::from(path);
         if !path_buf.exists() {
@@ -76,6 +87,14 @@ impl ConfigWatcher {
                         match Self::reload_config(&config, &event.paths) {
                             Ok(_) => {
                                 reload_count.fetch_add(1, Ordering::Relaxed);
+                                // Route through command channel so hot-swappable
+                                // params are propagated to live components
+                                // (same path as API-triggered config changes).
+                                if let Some(ref tx) = command_tx {
+                                    if let Err(e) = tx.try_send(ControlCommand::ReloadConfig) {
+                                        warn!(error = %e, "Failed to send ReloadConfig to command channel");
+                                    }
+                                }
                                 info!("Config reloaded successfully");
                             }
                             Err(e) => {

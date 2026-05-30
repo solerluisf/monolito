@@ -405,6 +405,9 @@ impl AssetProcessor {
     next_asset_core: usize,
     /// When `Some(..)`, a config rollout is in progress (canary → global).
     pub staged_rollout: Option<StagedRolloutState>,
+    /// Snapshot of the config before the most recent reload, used to detect
+    /// non-hot-swappable changes and warn the operator.
+    last_config: Arc<parking_lot::RwLock<Option<EngineConfig>>>,
 }
 
 impl UnifiedEngine {
@@ -442,6 +445,7 @@ impl UnifiedEngine {
             feed_subscription_tx: None,
             next_asset_core: 1,
             staged_rollout: None,
+            last_config: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -1267,6 +1271,54 @@ impl UnifiedEngine {
         }
     }
 
+    /// Compares old and new config, logging warnings for any non-hot-swappable
+    /// parameter changes that will not take effect until the pipeline is rebuilt
+    /// (e.g. on next subscribe/unsubscribe or engine restart).
+    fn check_non_hot_swappable_config_changes(old: &EngineConfig, new: &EngineConfig) {
+        // FeatureConfig — requires FeatureEngine rebuild
+        if format!("{:?}", old.feature_config) != format!("{:?}", new.feature_config) {
+            tracing::warn!(
+                "Non-hot-swappable feature_config changed: restart or pipeline rebuild required. \
+                 FeatureEngine will continue using old values until rebuilt."
+            );
+        }
+        // ModelConfig — requires InferenceEngine rebuild
+        if format!("{:?}", old.model_config) != format!("{:?}", new.model_config) {
+            tracing::warn!(
+                "Non-hot-swappable model_config changed: restart or pipeline rebuild required. \
+                 InferenceEngine will continue using old values until rebuilt."
+            );
+        }
+        // AssetConfigs — symbol list / tick size changes need feed re-subscribe
+        if format!("{:?}", old.asset_configs) != format!("{:?}", new.asset_configs) {
+            tracing::warn!(
+                "Non-hot-swappable asset_configs changed: subscribe/unsubscribe required. \
+                 Active pipelines will continue with old symbol list."
+            );
+        }
+        // ThreadingConfig — core assignments, budgets
+        if format!("{:?}", old.threading_config) != format!("{:?}", new.threading_config) {
+            tracing::warn!(
+                "Non-hot-swappable threading_config changed: restart required. \
+                 Core assignments and budgets will not take effect until restart."
+            );
+        }
+        // ChannelConfig — channel capacities and backpressure policies
+        if format!("{:?}", old.channel_config) != format!("{:?}", new.channel_config) {
+            tracing::warn!(
+                "Non-hot-swappable channel_config changed: restart required. \
+                 Channel capacities will not take effect until restart."
+            );
+        }
+        // BrokerConfig — broker URLs, credentials
+        if format!("{:?}", old.broker_config) != format!("{:?}", new.broker_config) {
+            tracing::warn!(
+                "Non-hot-swappable broker_config changed: restart required. \
+                 Broker connection parameters will not take effect until restart."
+            );
+        }
+    }
+
     fn start_config_watcher(&mut self) {
         let config_path = std::env::var("TRADING_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
         if !std::path::Path::new(&config_path).exists() {
@@ -1275,6 +1327,9 @@ impl UnifiedEngine {
             return;
         }
         let mut watcher = ConfigWatcher::new(Arc::clone(&self.config));
+        watcher.set_command_channel(self.command_channel.tx.clone());
+        // Snapshot initial config for change detection on future reloads.
+        *self.last_config.write() = Some(self.config.read().clone());
         if let Err(e) = watcher.start(&config_path) {
             tracing::warn!("Failed to start config watcher: {}", e);
             self.config_watcher = None;
@@ -1552,11 +1607,43 @@ impl UnifiedEngine {
                 ControlResponse::Ok
             }
             ControlCommand::ReloadConfig => {
-                // Attempt staged rollout if engine has assets; otherwise do nothing
-                // (filesystem watcher handles live reload independently).
+                let cfg = self.config.read().clone();
+
+                // 1. Warn about non-hot-swappable params that changed
+                let old = self.last_config.read().clone();
+                if let Some(ref old_cfg) = old {
+                    Self::check_non_hot_swappable_config_changes(old_cfg, &cfg);
+                }
+
+                // 2. Apply hot-swappable params to live components
+                //    (circuit breaker, rate limits, strategy thresholds)
+                if !self.execution_states.is_empty() {
+                    // Circuit breaker params
+                    for (_, exec_state) in self.execution_states.iter() {
+                        exec_state.circuit_breaker.set_failure_threshold(
+                            cfg.circuit_breaker_config.failure_threshold,
+                        );
+                        exec_state.circuit_breaker.set_cooldown_ms(
+                            cfg.circuit_breaker_config.cooldown_ms,
+                        );
+                    }
+                    // Rate limits
+                    for (_, exec_state) in self.execution_states.iter() {
+                        let mut rl = exec_state.rate_limiter.lock();
+                        rl.set_global_rate(cfg.execution_defaults.default_order_quantity);
+                        rl.set_default_per_symbol_rate(
+                            cfg.execution_defaults.execution_per_symbol_rate_divisor,
+                        );
+                    }
+                    tracing::info!(
+                        "Hot-swappable params propagated to {} execution states",
+                        self.execution_states.len(),
+                    );
+                }
+
+                // 3. Staged rollout for full config validation + canary promotion
                 if !self.asset_pipelines.is_empty() {
-                    let pending = self.config.read().clone();
-                    match self.begin_staged_rollout(pending, Some(30)) {
+                    match self.begin_staged_rollout(cfg.clone(), Some(30)) {
                         Ok(()) => {
                             tracing::info!("Staged config reload initiated (30 s monitoring window)");
                         }
@@ -1565,6 +1652,10 @@ impl UnifiedEngine {
                         }
                     }
                 }
+
+                // 4. Store snapshot for next reload
+                *self.last_config.write() = Some(cfg);
+
                 ControlResponse::Ok
             }
             ControlCommand::FlushJournal => {
